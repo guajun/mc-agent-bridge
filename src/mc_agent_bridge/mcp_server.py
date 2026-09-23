@@ -11,6 +11,7 @@ Requires the optional dependency: ``pip install "mc-agent-bridge[mcp]"``.
 
 from __future__ import annotations
 
+import asyncio
 import os
 from typing import Any
 
@@ -123,6 +124,28 @@ def build_server() -> Any:
     async def mc_command(command: str) -> Any:
         """Run a command as the player, without the leading slash."""
         return await call("command", {"command": command})
+
+    @mcp.tool()
+    async def mc_command_output(command: str, wait: float = 2.0) -> Any:
+        """Run a command and return what it answered.
+
+        Preferred over ``mc_command`` whenever the answer matters: the reply to
+        a command arrives as game/chat messages, not as the command's own
+        return value. This sends the command and collects the feedback it
+        produced, so ``data get entity <name> Motion`` and friends come back as
+        data instead of disappearing into the chat log.
+        """
+        backlog = await call("events", {"limit": 1})
+        cursor = max((event["seq"] for event in backlog["events"]), default=0)
+        ack = await call("command", {"command": command})
+        await asyncio.sleep(max(0.1, wait))
+        events = await call("events", {"since": cursor, "limit": 100})
+        output = [
+            str(event.get("text") or "")
+            for event in events.get("events", [])
+            if event.get("category") in ("game", "chat")
+        ]
+        return {"command": ack.get("detail", command), "output": output}
 
     @mcp.tool()
     async def mc_chat(message: str) -> Any:

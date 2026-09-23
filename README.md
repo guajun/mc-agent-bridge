@@ -123,8 +123,13 @@ mc-bridge mcp --transport streamable-http
 ```
 
 Tools: `mc_status`, `mc_capabilities`, `mc_state`, `mc_entities`, `mc_command`,
-`mc_chat`, `mc_record_start`, `mc_record_stop`, `mc_wait`, `mc_screen`,
-`mc_mark`, `mc_connect`, `mc_events`.
+`mc_command_output`, `mc_chat`, `mc_record_start`, `mc_record_stop`, `mc_wait`,
+`mc_screen`, `mc_mark`, `mc_connect`, `mc_world`, `mc_lan`, `mc_events`.
+
+`mc_command` and `mc_command_output` exist because a command's *answer* is chat,
+not a return value: the first one just sends it, the second sends it and collects
+the feedback. Anything that reports data - `data get entity <name> Motion`,
+`player <name> ...`, mod commands - should use the second.
 
 Verified against `mcp` 2.x (where the SDK renamed `FastMCP` to `MCPServer`) and
 1.x; the front-end picks whichever class the installed SDK provides.
