@@ -111,7 +111,7 @@ class BridgeDaemon:
     async def run(self) -> None:
         await self.server.start()
         self._running = True
-        print(f"[mc-agent-bridge] local API on {self.api_host}:{self.server.port}")
+        print(f"[mc-agent-bridge] local API on {self.api_host}:{self.server.port}", flush=True)
         while self._running:
             self.mod_port, self.port_source = resolve_mod_port(self.explicit_port, self.port_file)
             client = ModClient(self.host, self.mod_port, on_event=self._record_event)
@@ -122,7 +122,7 @@ class BridgeDaemon:
                 self.last_error = (
                     f"cannot reach interface mod on {self.host}:{self.mod_port}: {error}"
                 )
-                print(f"[mc-agent-bridge] {self.last_error}; retrying")
+                print(f"[mc-agent-bridge] {self.last_error}; retrying", flush=True)
                 await self._sleep_or_stop(self.reconnect_delay)
                 continue
 
@@ -130,7 +130,10 @@ class BridgeDaemon:
             self.hello = hello
             self.connected = True
             self.last_error = None
-            print(f"[mc-agent-bridge] connected to interface mod on port {self.mod_port}")
+            print(
+                f"[mc-agent-bridge] connected to interface mod on port {self.mod_port}",
+                flush=True,
+            )
             # ModClient already forwards the hello frame to on_event, so it is
             # in the buffer and in front of every later event by now.
             await client.wait_closed()
