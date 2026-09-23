@@ -36,6 +36,14 @@ SKIP_NAMES = frozenset(
     {"session.lock", "playerdata", "players", "stats", "advancements", "logs"}
 )
 
+#: Entity storage in a modern world lives beside the block data
+#: (``dimensions/<namespace>/<dimension>/entities/*.mca``; older layouts had a
+#: top-level ``entities/``). A fork splits the world deliberately: the copy owns
+#: blocks, the snapshot owns entities. Copying both would give a lab the copied
+#: entities *and* the restored ones, and clearing them in game only lasts until
+#: the chunks reload.
+ENTITY_DIR_NAME = "entities"
+
 
 class SnapshotError(ValueError):
     """A snapshot directory is missing, unreadable, or not protocol v1.
@@ -185,12 +193,16 @@ def copy_world(
     files = 0
     total = 0
     skipped: list[str] = []
+    stripped: list[str] = []
 
     for root, dirs, names in os.walk(source):
         relative_root = os.path.relpath(root, source)
         dirs[:] = sorted(name for name in dirs if not _skip(name, relative_root, skipped))
         for name in sorted(names):
             if _skip(name, relative_root, skipped):
+                continue
+            if _is_entity_storage(relative_root, name):
+                stripped.append(_relative(relative_root, name))
                 continue
             path = os.path.join(root, name)
             if os.path.islink(path):
@@ -204,7 +216,12 @@ def copy_world(
             files += 1
             total += os.path.getsize(path)
 
-    return {"files": files, "bytes": total, "skipped": sorted(skipped)}
+    return {
+        "files": files,
+        "bytes": total,
+        "skipped": sorted(skipped),
+        "stripped": sorted(stripped),
+    }
 
 
 def summon_commands(entities: Iterable[dict[str, Any]]) -> list[str]:
@@ -259,3 +276,11 @@ def _relative(relative_root: str, name: str) -> str:
     if relative_root in ("", "."):
         return name
     return f"{relative_root.replace(os.sep, '/')}/{name}"
+
+
+def _is_entity_storage(relative_root: str, name: str) -> bool:
+    """Whether this file is entity storage rather than block data."""
+    if not name.endswith(".mca"):
+        return False
+    parts = relative_root.replace(os.sep, "/").split("/")
+    return ENTITY_DIR_NAME in parts

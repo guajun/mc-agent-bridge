@@ -64,12 +64,18 @@ WORLD_FILES = {
     "datapacks/keep/keep.mcfunction": b"say hi",
     "dimensions/minecraft/overworld/region/r.0.0.mca": b"r" * 4096,
     "dimensions/minecraft/overworld/region/r.0.-1.mca": b"s" * 1024,
-    "dimensions/minecraft/overworld/entities/r.0.0.mca": b"e" * 64,
     "dimensions/minecraft/overworld/poi/r.0.0.mca": b"p" * 32,
     "dimensions/minecraft/the_nether/region/r.0.0.mca": b"n" * 512,
     "dimensions/minecraft/the_end/region/r.0.0.mca": b"o" * 256,
     "scripts/main.mcfunction": b"say world",
     "levelname.txt": b"Live World",
+}
+
+#: Entity storage lives next to the block data, and a fork must leave it behind:
+#: the recorded snapshot is the only source of entities, or a lab would start with
+#: the copied ones as well and clearing them in game would not last.
+ENTITY_FILES = {
+    "dimensions/minecraft/overworld/entities/r.0.0.mca": b"e" * 64,
 }
 
 SKIP_FILES = {
@@ -102,7 +108,7 @@ def write_snapshot(
 
 
 def write_world(directory: str) -> None:
-    for relative, content in {**WORLD_FILES, **SKIP_FILES}.items():
+    for relative, content in {**WORLD_FILES, **ENTITY_FILES, **SKIP_FILES}.items():
         path = os.path.join(directory, *relative.split("/"))
         os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, "wb") as handle:
@@ -230,6 +236,10 @@ class CopyWorldTests(unittest.TestCase):
             copied = tree(os.path.join(target, "world"))
 
             self.assertEqual(copied, set(WORLD_FILES))
+            self.assertEqual(
+                manifest["stripped"], ["dimensions/minecraft/overworld/entities/r.0.0.mca"]
+            )
+            self.assertNotIn("dimensions/minecraft/overworld/entities/r.0.0.mca", copied)
             self.assertEqual(manifest["files"], len(WORLD_FILES))
             self.assertEqual(manifest["bytes"], sum(len(c) for c in WORLD_FILES.values()))
             self.assertEqual(
@@ -274,7 +284,7 @@ class CopyWorldTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as source, tempfile.TemporaryDirectory() as target:
             manifest = fork.copy_world(source, os.path.join(target, "world"))
             self.assertTrue(os.path.isdir(os.path.join(target, "world")))
-            self.assertEqual(manifest, {"files": 0, "bytes": 0, "skipped": []})
+            self.assertEqual(manifest, {"files": 0, "bytes": 0, "skipped": [], "stripped": []})
 
 
 class SummonCommandTests(unittest.TestCase):
