@@ -81,3 +81,13 @@ class ModClientTests(unittest.IsolatedAsyncioTestCase):
         payload = json.loads(json.dumps(await client.request("STATE")))
         self.assertEqual(payload["tick"], 1)
         await client.close()
+
+    async def test_replies_bigger_than_asyncio_default_line_limit(self) -> None:
+        """A busy world answers with hundreds of kilobytes on one line."""
+        client = ModClient("127.0.0.1", self.mod.port)
+        await client.connect(retry=False)
+        reply = await client.request("BIG", timeout=20)
+        self.assertEqual(reply["type"], "entities")
+        self.assertGreater(len(json.dumps(reply)), 64 * 1024)
+        self.assertTrue(client.connected, "the connection must survive a large reply")
+        await client.close()

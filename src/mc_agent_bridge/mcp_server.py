@@ -25,6 +25,36 @@ def api_port() -> int:
     return int(os.environ.get("MC_AGENT_API_PORT", "8765"))
 
 
+def _distance_squared(entity: dict[str, Any], origin: tuple[Any, Any, Any]) -> float:
+    try:
+        return float(
+            (entity["x"] - origin[0]) ** 2
+            + (entity["y"] - origin[1]) ** 2
+            + (entity["z"] - origin[2]) ** 2
+        )
+    except (KeyError, TypeError, ValueError):
+        return float("inf")
+
+
+def _compact(entity: dict[str, Any], origin: tuple[Any, Any, Any]) -> dict[str, Any]:
+    """Trim a raw entity record down to what a model actually needs."""
+    compact: dict[str, Any] = {
+        "id": entity.get("id"),
+        "type": entity.get("type"),
+        "pos": [round(float(entity.get(axis, 0.0)), 2) for axis in ("x", "y", "z")],
+        "vel": [round(float(entity.get(axis, 0.0)), 3) for axis in ("vx", "vy", "vz")],
+    }
+    distance = _distance_squared(entity, origin)
+    if distance != float("inf"):
+        compact["distance"] = round(distance**0.5, 2)
+    if entity.get("alive") is False:
+        compact["alive"] = False
+    for key in ("health", "fuse", "primed", "vehicle", "passengers", "bodyItem", "bodyCount"):
+        if key in entity:
+            compact[key] = entity[key]
+    return compact
+
+
 async def call(method: str, params: dict[str, Any] | None = None, timeout: float = 60.0) -> Any:
     """One-shot call against the running bridge daemon."""
     client = LocalApiClient(api_host(), api_port())
@@ -55,9 +85,39 @@ def build_server() -> Any:
         return await call("state")
 
     @mcp.tool()
-    async def mc_entities(radius: float = 64.0) -> Any:
-        """Entities near the player (0 or less means every tracked entity)."""
-        return await call("entities", {"radius": radius})
+    async def mc_entities(radius: float = 64.0, limit: int = 40, types: str = "") -> Any:
+        """Entities near the player, summarised.
+
+        Returns counts by type plus the ``limit`` closest entities, because a
+        busy world answers with hundreds of kilobytes of raw JSON - far more
+        than a model can usefully read. Pass ``types`` (comma separated, e.g.
+        "sulfur_cube,minecart") to filter, or raise ``limit`` for more detail.
+        """
+        state = await call("state")
+        payload = await call("entities", {"radius": radius}, timeout=120.0)
+        entities = list(payload.get("entities") or [])
+
+        wanted = [part.strip().lower() for part in types.split(",") if part.strip()]
+        if wanted:
+            entities = [e for e in entities if any(w in e.get("type", "").lower() for w in wanted)]
+
+        counts: dict[str, int] = {}
+        for entity in entities:
+            key = entity.get("type", "unknown")
+            counts[key] = counts.get(key, 0) + 1
+
+        origin = (state.get("x"), state.get("y"), state.get("z"))
+        if None not in origin:
+            entities.sort(key=lambda e: _distance_squared(e, origin))
+
+        shown = [_compact(e, origin) for e in entities[: max(0, limit)]]
+        return {
+            "radius": payload.get("radius"),
+            "total": len(entities),
+            "counts": dict(sorted(counts.items(), key=lambda kv: -kv[1])),
+            "shown": shown,
+            "truncated": max(0, len(entities) - len(shown)),
+        }
 
     @mcp.tool()
     async def mc_command(command: str) -> Any:
@@ -100,6 +160,11 @@ def build_server() -> Any:
     async def mc_connect(address: str) -> Any:
         """Join a server, e.g. '127.0.0.1:25565'."""
         return await call("connect", {"address": address})
+
+    @mcp.tool()
+    async def mc_world(level: str) -> Any:
+        """Open a single-player world by its folder name (the client must be idle)."""
+        return await call("world", {"level": level})
 
     @mcp.tool()
     async def mc_events(since: int = 0, limit: int = 200, category: str = "") -> Any:

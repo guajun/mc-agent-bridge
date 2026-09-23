@@ -102,6 +102,7 @@ to subscribed connections.
 | `screen` | - | `SCREEN` |
 | `mark` | `text` | `MARK <text>` |
 | `connect` | `address` | `CONNECT <address>` |
+| `world` | `level` | `WORLD <level>` (open a single-player save) |
 | `events` | `since`, `limit`, `category` | replay from the buffer |
 | `stop` | - | shut the daemon down |
 

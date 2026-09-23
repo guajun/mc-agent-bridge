@@ -240,7 +240,8 @@ class BridgeDaemon:
     async def _m_entities(self, params: dict[str, Any]) -> dict[str, Any]:
         radius = params.get("radius")
         line = "ENTITIES" if radius in (None, "") else f"ENTITIES {float(radius)}"
-        return await self._call_mod(line)
+        # A world with thousands of entities produces a big reply; give it room.
+        return await self._call_mod(line, timeout=60.0)
 
     async def _m_command(self, params: dict[str, Any]) -> dict[str, Any]:
         command = str(params.get("command") or "").strip()
@@ -257,6 +258,12 @@ class BridgeDaemon:
     async def _m_connect(self, params: dict[str, Any]) -> dict[str, Any]:
         address = _one_line(str(params.get("address") or "")).strip()
         return await self._call_mod(f"CONNECT {address}")
+
+    async def _m_world(self, params: dict[str, Any]) -> dict[str, Any]:
+        level = _one_line(str(params.get("level") or "")).strip()
+        if not level:
+            raise ValueError("world needs a level name")
+        return await self._call_mod(f"WORLD {level}")
 
     async def _m_record_start(self, params: dict[str, Any]) -> dict[str, Any]:
         ticks = int(params.get("ticks") or 200)

@@ -87,6 +87,15 @@ class FakeMod:
             return {"type": "capabilities", "protocol": 1}
         if upper.startswith("ENTITIES"):
             return {"type": "entities", "entities": []}
+        if upper.startswith("BIG"):
+            # >64 KiB of JSON, like an entity snapshot of a busy world.
+            return {
+                "type": "entities",
+                "entities": [
+                    {"id": index, "type": "minecraft:tnt", "x": index * 1.5, "z": index * -0.25}
+                    for index in range(4000)
+                ],
+            }
         if upper.startswith("CHAT "):
             return {"type": "chat_ack", "detail": line[5:]}
         if upper.startswith("CMD "):

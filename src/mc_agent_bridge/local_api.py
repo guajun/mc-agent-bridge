@@ -10,6 +10,9 @@ from typing import Any
 
 Handler = Callable[[str, dict[str, Any]], Awaitable[Any]]
 
+#: Payloads can be large (an entity snapshot of a busy world). See protocol.py.
+MAX_LINE_BYTES = 16 * 1024 * 1024
+
 
 class LocalApiServer:
     def __init__(self, host: str, port: int, handler: Handler) -> None:
@@ -77,6 +80,8 @@ class LocalClient:
                 await self._handle(request)
         except (ConnectionError, OSError):
             pass
+        except Exception as error:  # noqa: BLE001 - keep the daemon alive
+            print(f"[mc-agent-bridge] client read loop stopped: {error!r}")
         finally:
             self.writer.close()
             try:
@@ -136,7 +141,9 @@ class LocalApiClient:
     async def connect(self, retry: bool = True) -> None:
         while True:
             try:
-                self.reader, self.writer = await asyncio.open_connection(self.host, self.port)
+                self.reader, self.writer = await asyncio.open_connection(
+                    self.host, self.port, limit=MAX_LINE_BYTES
+                )
                 self._reader_task = asyncio.create_task(self._read_loop())
                 return
             except OSError:
@@ -183,6 +190,8 @@ class LocalApiClient:
                             future.set_exception(RuntimeError(message.get("error") or "bridge error"))
         except (ConnectionError, OSError):
             pass
+        except Exception as error:  # noqa: BLE001
+            print(f"[mc-agent-bridge] local API read loop stopped: {error!r}")
 
     async def close(self) -> None:
         if self.writer is not None:

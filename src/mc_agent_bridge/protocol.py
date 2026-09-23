@@ -18,6 +18,11 @@ EVENT_TYPES = {
     "sample_done",
 }
 
+#: One entity snapshot of a busy world is hundreds of kilobytes of JSON, and
+#: asyncio's default line limit is 64 KiB: without this, readline() raises and
+#: the connection silently dies mid-request.
+MAX_LINE_BYTES = 16 * 1024 * 1024
+
 
 def is_event(message: dict[str, Any]) -> bool:
     """Decide whether a mod line is a push event rather than a request reply.
@@ -66,7 +71,9 @@ class ModClient:
     async def connect(self, retry: bool = True) -> dict[str, Any]:
         while True:
             try:
-                self.reader, self.writer = await asyncio.open_connection(self.host, self.port)
+                self.reader, self.writer = await asyncio.open_connection(
+                    self.host, self.port, limit=MAX_LINE_BYTES
+                )
                 self.hello = None
                 self._closed.clear()
                 self._reader_task = asyncio.create_task(self._read_loop())
@@ -114,6 +121,8 @@ class ModClient:
                     await self._responses.put(message)
         except (ConnectionError, OSError):
             pass
+        except Exception as error:  # noqa: BLE001 - a broken line must not kill the link
+            print(f"[mc-agent-bridge] mod read loop stopped: {error!r}")
         finally:
             self._closed.set()
 
