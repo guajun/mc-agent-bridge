@@ -103,6 +103,7 @@ to subscribed connections.
 | `mark` | `text` | `MARK <text>` |
 | `connect` | `address` | `CONNECT <address>` |
 | `world` | `level` | `WORLD <level>` (open a single-player save) |
+| `lan` | `port`, `mode` | `LAN [port] [online\|offline]` (publish the world to the LAN) |
 | `events` | `since`, `limit`, `category` | replay from the buffer |
 | `stop` | - | shut the daemon down |
 

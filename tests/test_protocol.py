@@ -23,6 +23,14 @@ class IsEventTests(unittest.TestCase):
         self.assertFalse(is_event({"type": "state"}))
         self.assertFalse(is_event({}))
 
+    def test_unknown_types_are_events_so_replies_cannot_shift(self) -> None:
+        # A new event type must never be mistaken for the answer to a request.
+        self.assertTrue(is_event({"type": "lan", "text": "port=25577"}))
+        self.assertTrue(is_event({"type": "something_invented_later"}))
+        self.assertTrue(is_event({"type": "whatever", "event": True}))
+        self.assertFalse(is_event({"type": "world_ack"}))
+        self.assertFalse(is_event({"type": "sample_start_ack"}))
+
 
 class PortFileTests(unittest.TestCase):
     def test_reads_trimmed_integer(self) -> None:
@@ -90,4 +98,17 @@ class ModClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(reply["type"], "entities")
         self.assertGreater(len(json.dumps(reply)), 64 * 1024)
         self.assertTrue(client.connected, "the connection must survive a large reply")
+        await client.close()
+
+    async def test_an_unknown_event_does_not_shift_the_reply_stream(self) -> None:
+        """The live bug: a new event type landed in the reply queue and offset every later reply."""
+        client = ModClient("127.0.0.1", self.mod.port, on_event=self.events.append)
+        await client.connect(retry=False)
+        await self.mod.push({"type": "lan", "text": "port=25577"})
+        for _ in range(50):
+            if any(event.get("type") == "lan" for event in self.events):
+                break
+            await asyncio.sleep(0.02)
+        reply = await client.request("STATE")
+        self.assertEqual(reply["type"], "state", "the reply queue must still be aligned")
         await client.close()

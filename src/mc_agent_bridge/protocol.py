@@ -8,6 +8,14 @@ import json
 from collections.abc import Awaitable, Callable
 from typing import Any
 
+#: Everything the mod can answer a request with. Replies are a *closed* set:
+#: they all come from one place in the mod. Events are open-ended (new ones get
+#: added as the mod grows), so routing must not depend on knowing every event
+#: name - getting that backwards silently shifts the whole request/response
+#: stream by one, which is exactly what happened when the mod grew a "lan" event.
+REPLY_TYPES = {"state", "entities", "screen", "capabilities", "error", "pong"}
+
+#: Kept for readability and for mod builds that predate the event marker.
 EVENT_TYPES = {
     "hello",
     "chat",
@@ -16,6 +24,9 @@ EVENT_TYPES = {
     "sample_start",
     "sample_progress",
     "sample_done",
+    "lan",
+    "auto_connect",
+    "world_failed",
 }
 
 #: One entity snapshot of a busy world is hundreds of kilobytes of JSON, and
@@ -27,15 +38,18 @@ MAX_LINE_BYTES = 16 * 1024 * 1024
 def is_event(message: dict[str, Any]) -> bool:
     """Decide whether a mod line is a push event rather than a request reply.
 
-    The mod emits two families of unsolicited lines: the documented events and
-    diagnostic lines such as ``task_error`` / ``portfile_error``. Both must
-    bypass the request/response queue, otherwise a stray diagnostic could be
-    mistaken for the answer to an in-flight request.
+    Newer mod builds mark events with ``"event": true``; anything that is not a
+    known reply type and not an ``*_ack`` counts as an event as well, so an event
+    type this bridge has never heard of cannot corrupt the reply stream.
     """
+    if message.get("event") is True:
+        return True
     kind = message.get("type")
     if not isinstance(kind, str):
         return False
-    return kind in EVENT_TYPES or (kind.endswith("_error") and kind != "error")
+    if kind in REPLY_TYPES or kind.endswith("_ack"):
+        return False
+    return True
 
 
 async def _maybe_await(value: Any) -> Any:

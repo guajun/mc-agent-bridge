@@ -265,6 +265,16 @@ class BridgeDaemon:
             raise ValueError("world needs a level name")
         return await self._call_mod(f"WORLD {level}")
 
+    async def _m_lan(self, params: dict[str, Any]) -> dict[str, Any]:
+        port = int(params.get("port") or 0)
+        mode = str(params.get("mode") or "").strip().lower()
+        if mode not in ("", "online", "offline"):
+            raise ValueError("lan mode must be online or offline")
+        if port <= 0 and not mode:
+            return await self._call_mod("LAN")
+        line = f"LAN {max(0, port)}" + (f" {mode}" if mode else "")
+        return await self._call_mod(line.strip())
+
     async def _m_record_start(self, params: dict[str, Any]) -> dict[str, Any]:
         ticks = int(params.get("ticks") or 200)
         radius = float(params.get("radius") or 64.0)

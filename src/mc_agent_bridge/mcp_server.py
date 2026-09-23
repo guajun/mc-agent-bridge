@@ -167,6 +167,21 @@ def build_server() -> Any:
         return await call("world", {"level": level})
 
     @mcp.tool()
+    async def mc_lan(port: int = 0, mode: str = "") -> Any:
+        """Open the single-player world to the LAN and report the port to dial.
+
+        This is the "Open to LAN" button without the button: after it, another
+        client (the agent's own player) can join, so the agent has an identity
+        separate from yours. Calling it again while published just reports the
+        current port.
+
+        ``mode="offline"`` stops the host from checking Mojang sessions, which is
+        what lets a spare client with no account (the agent) join. Use it only on
+        a LAN you trust.
+        """
+        return await call("lan", {"port": port, "mode": mode})
+
+    @mcp.tool()
     async def mc_events(since: int = 0, limit: int = 200, category: str = "") -> Any:
         """Replay buffered events (chat, game, mark, sample, error) after a cursor.
 
