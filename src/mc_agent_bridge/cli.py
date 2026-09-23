@@ -86,17 +86,43 @@ def _cmd_mcp(args: argparse.Namespace) -> int:
     return 0
 
 
+def _add_api_options(parser: argparse.ArgumentParser) -> None:
+    """Loopback API options, accepted before or after the sub-command.
+
+    The sub-parsers use SUPPRESS for their defaults so that omitting the option
+    there cannot overwrite a value that was already given before the
+    sub-command, e.g. ``mc-bridge --api-port 8799 call status``.
+    """
+    suppress = len(parser.prog.split()) > 1
+    parser.add_argument(
+        "--api-host",
+        default=argparse.SUPPRESS if suppress else "127.0.0.1",
+        help="loopback API host",
+    )
+    parser.add_argument(
+        "--api-port",
+        type=int,
+        default=argparse.SUPPRESS if suppress else DEFAULT_API_PORT,
+        help="loopback API port",
+    )
+    parser.add_argument(
+        "--timeout",
+        type=float,
+        default=argparse.SUPPRESS if suppress else 60.0,
+        help="request timeout in seconds",
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="mc-bridge",
         description="Agent-agnostic bridge between an agent runtime and Minecraft.",
     )
-    parser.add_argument("--api-host", default="127.0.0.1", help="loopback API host")
-    parser.add_argument("--api-port", type=int, default=DEFAULT_API_PORT, help="loopback API port")
-    parser.add_argument("--timeout", type=float, default=60.0, help="request timeout in seconds")
+    _add_api_options(parser)
     sub = parser.add_subparsers(dest="command", required=True)
 
     run = sub.add_parser("run", help="run the bridge daemon in the foreground")
+    _add_api_options(run)
     run.add_argument("--mod-host", default="127.0.0.1")
     run.add_argument(
         "--mod-port",
@@ -110,17 +136,20 @@ def build_parser() -> argparse.ArgumentParser:
     run.set_defaults(func=_cmd_run)
 
     call = sub.add_parser("call", help="call one bridge method")
+    _add_api_options(call)
     call.add_argument("method")
     call.add_argument("params", nargs="?", help="JSON object of parameters")
     call.set_defaults(func=_cmd_call)
 
     watch = sub.add_parser("watch", help="stream events as JSON lines")
+    _add_api_options(watch)
     watch.add_argument("--events", default="*", help="comma separated: chat,game,mark,sample,error,*")
     watch.add_argument("--since", type=int, default=None, help="replay buffered events after a cursor")
     watch.add_argument("--limit", type=int, default=200)
     watch.set_defaults(func=_cmd_watch)
 
     mcp = sub.add_parser("mcp", help="serve the bridge over MCP (stdio by default)")
+    _add_api_options(mcp)
     mcp.add_argument("--transport", default="stdio")
     mcp.set_defaults(func=_cmd_mcp)
 
