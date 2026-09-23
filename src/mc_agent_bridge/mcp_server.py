@@ -215,6 +215,109 @@ def build_server() -> Any:
             {"since": since or None, "limit": limit, "category": category or None},
         )
 
+    @mcp.tool()
+    async def mc_snapshot(radius: float = 0.0, name: str = "") -> Any:
+        """Write the entity set, **in tick order**, to a snapshot on the instance.
+
+        The part of a world that never reaches disk: a save file has blocks and
+        entity NBT but rebuilds the tick order at load time, and that order
+        decides the result of anything computed entity by entity (pushes,
+        cramming, explosions). The reply carries ``orderHash``, the one value
+        that proves a later restore reproduced the order, and ``dir``, where
+        ``entities.jsonl`` and ``meta.json`` were written.
+
+        ``radius`` is in blocks; 0 (the default) means every entity the level
+        ticks. ``name`` chooses the directory; asking for an existing name
+        overwrites it. Use ``mc_fork`` instead when you also need the blocks.
+        """
+        return await call(
+            "snapshot",
+            {"radius": radius or None, "name": name or None},
+            timeout=120.0,
+        )
+
+    @mcp.tool()
+    async def mc_snapshots() -> Any:
+        """List the snapshots already on the instance (name, dir, hash, tick).
+
+        Cheap and read-only: use it to see what can be restored or compared
+        before taking another snapshot.
+        """
+        return await call("snapshots")
+
+    @mcp.tool()
+    async def mc_fork(
+        name: str,
+        radius: float = 0.0,
+        regions: bool = True,
+        world_dir: str = "",
+        freeze: bool = True,
+    ) -> Any:
+        """Fork the live world: freeze it, snapshot the entities, copy the world files, resume.
+
+        Use it before an experiment you cannot repeat - an explosion, a farm
+        test, anything the tick order decides - so the exact state can be
+        restored into an isolated lab instance later. It runs ``/tick freeze``,
+        ``/save-all flush``, then ``SNAPSHOT`` (entities plus order), then
+        copies the instance's world directory into ``<snapshotDir>/world``, then
+        ``/tick unfreeze``. The world stays frozen for the whole copy and is
+        unfrozen even when a step fails, so a failed fork cannot leave the game
+        stopped.
+
+        ``world_dir`` overrides where the world is (otherwise the instance's
+        ``STATE`` field ``worldDir`` is used). ``regions=False`` takes the
+        entity-only fork: no world files, so ``forkDir``/``manifest`` come back
+        null. ``freeze=False`` skips the tick commands for a world you already
+        stopped yourself. Returns ``snapshotDir``, ``forkDir``, ``manifest``
+        (files, bytes, skipped), ``orderHash`` and the entity count.
+        """
+        return await call(
+            "fork",
+            {
+                "name": name,
+                "radius": radius or None,
+                "regions": regions,
+                "world_dir": world_dir or None,
+                "freeze": freeze,
+            },
+            timeout=600.0,
+        )
+
+    @mcp.tool()
+    async def mc_restore(directory: str, dry_run: bool = True, target: str = "") -> Any:
+        """Recreate a fork's entities with ``/summon``, in the recorded order.
+
+        One command per entity, in file order, because the order the entities
+        are created in is the order they will tick in. Always run it dry first:
+        the dry run returns every command without sending one, so you can check
+        the count and the destination before touching a world. Then call it with
+        ``dry_run=False`` against the lab instance (its own bridge, pointed at
+        the client or server that loaded the copied ``world`` directory).
+
+        ``target`` labels the instance you are restoring into; this bridge talks
+        to one mod connection, so it is carried through for the record rather
+        than used for routing. Verify with ``mc_order`` afterwards.
+        """
+        return await call(
+            "restore",
+            {"directory": directory, "dry_run": dry_run, "target": target or None},
+            timeout=600.0,
+        )
+
+    @mcp.tool()
+    async def mc_order(directory: str, target: str = "") -> Any:
+        """Check whether a world now ticks its entities in the same order as a fork.
+
+        Takes a throwaway snapshot of the connected instance and compares its
+        ``orderHash`` with the one recorded in ``directory``: ``match: true``
+        means the restore reproduced the tick order, which is the acceptance
+        test for a fork/restore round trip. Run it in the lab after
+        ``mc_restore``; use ``target`` to label which instance it re-snapshotted.
+        """
+        return await call(
+            "order", {"directory": directory, "target": target or None}, timeout=120.0
+        )
+
     return mcp
 
 

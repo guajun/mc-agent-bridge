@@ -13,7 +13,22 @@ from typing import Any
 #: added as the mod grows), so routing must not depend on knowing every event
 #: name - getting that backwards silently shifts the whole request/response
 #: stream by one, which is exactly what happened when the mod grew a "lan" event.
-REPLY_TYPES = {"state", "entities", "screen", "capabilities", "error", "pong"}
+#: The snapshot protocol (docs/protocol-snapshot.md in the mc-agent meta
+#: repository) adds two: SNAPSHOT answers ``snapshot_ack`` (which the ``*_ack``
+#: rule below already covers) and SNAPSHOTS answers ``snapshots`` - a name that
+#: does not end in ``_ack``, so it has to be listed here or the listing would be
+#: routed to the event stream and the caller would wait for a reply that had
+#: already arrived.
+REPLY_TYPES = {
+    "state",
+    "entities",
+    "screen",
+    "capabilities",
+    "error",
+    "pong",
+    "snapshot_ack",
+    "snapshots",
+}
 
 #: Kept for readability and for mod builds that predate the event marker.
 EVENT_TYPES = {

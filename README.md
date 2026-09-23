@@ -104,6 +104,11 @@ to subscribed connections.
 | `connect` | `address` | `CONNECT <address>` |
 | `world` | `level` | `WORLD <level>` (open a single-player save) |
 | `lan` | `port`, `mode` | `LAN [port] [online\|offline]` (publish the world to the LAN) |
+| `snapshot` | `radius`, `name` | `SNAPSHOT [radius] [name]` (entities + tick order, on the instance's disk) |
+| `snapshots` | - | `SNAPSHOTS` (what is already on the instance) |
+| `fork` | `name`, `radius`, `regions`, `world_dir`, `freeze` | freeze → `save-all flush` → `SNAPSHOT` → copy the world → unfreeze |
+| `restore` | `directory`, `dry_run`, `target` | `/summon` per entity, in recorded order (dry run by default) |
+| `order` | `directory`, `target` | re-snapshot and compare `orderHash` with a fork |
 | `events` | `since`, `limit`, `category` | replay from the buffer |
 | `stop` | - | shut the daemon down |
 
@@ -124,7 +129,8 @@ mc-bridge mcp --transport streamable-http
 
 Tools: `mc_status`, `mc_capabilities`, `mc_state`, `mc_entities`, `mc_command`,
 `mc_command_output`, `mc_chat`, `mc_record_start`, `mc_record_stop`, `mc_wait`,
-`mc_screen`, `mc_mark`, `mc_connect`, `mc_world`, `mc_lan`, `mc_events`.
+`mc_screen`, `mc_mark`, `mc_connect`, `mc_world`, `mc_lan`, `mc_events`,
+`mc_snapshot`, `mc_snapshots`, `mc_fork`, `mc_restore`, `mc_order`.
 
 `mc_command` and `mc_command_output` exist because a command's *answer* is chat,
 not a return value: the first one just sends it, the second sends it and collects
@@ -137,6 +143,54 @@ Verified against `mcp` 2.x (where the SDK renamed `FastMCP` to `MCPServer`) and
 The equivalent of the older `mc-codex-bridge` design was one special-purpose
 daemon per agent. Here the daemon is neutral and each agent attaches however it
 likes: MCP, the JSON-lines API, or a loop built on this package.
+
+## Forking a live world
+
+A save file has the blocks and the entity NBT, but not the **tick order**:
+entities are appended to the level's tick list as chunks load, and that order
+decides the result of anything computed entity by entity - pushes, cramming,
+explosions. `fork` therefore freezes the game, asks the mod for the order, and
+copies the world files; `restore` puts the entities back in that order.
+
+```bash
+# 1. What has already been snapshotted on this instance?
+mc-bridge call snapshots
+
+# 2. Fork: freeze -> save-all flush -> SNAPSHOT -> copy the world -> unfreeze
+mc-bridge call fork '{"name": "before-fight", "radius": 64}'
+# {
+#   "snapshotDir": "C:/mc-agent/snapshots/before-fight",
+#   "forkDir":     "C:/mc-agent/snapshots/before-fight/world",
+#   "worldDir":    "C:/.../saves/量子硫方怪",
+#   "manifest":    {"files": 42, "bytes": 88123456, "skipped": ["advancements", "logs", ...]},
+#   "orderHash":   "9f2c0a1b2c3d4e5f",
+#   "entities":    521
+# }
+
+# 3. Move forkDir into the lab instance's saves/, launch it with the mod, and
+#    point a bridge at that instance (here on a second API port):
+mc-bridge --api-port 8799 call restore '{"directory": "C:/mc-agent/snapshots/before-fight"}'
+mc-bridge --api-port 8799 call restore '{"directory": "C:/mc-agent/snapshots/before-fight", "dry_run": false}'
+
+# 4. The acceptance test: the re-snapshot must report the same order.
+mc-bridge --api-port 8799 call order '{"directory": "C:/mc-agent/snapshots/before-fight"}'
+# {"match": true, "expected": "9f2c0a1b2c3d4e5f", "actual": "9f2c0a1b2c3d4e5f", "entities": 521}
+```
+
+`restore` is a dry run until you say otherwise: it returns the commands it would
+send, which is the cheap way to check the count and the destination first. Both
+`restore` and `order` take a `target` label naming the lab instance they are
+pointed at; a bridge owns one mod connection, so the label is carried through
+for the record rather than used for routing.
+
+The copy is the instance's whole world directory minus the things a lab must not
+inherit - `session.lock`, the player data (`playerdata/` before 1.21, `players/`
+in 26.2), `stats/`, `advancements/`, `logs/` - so a fork keeps `level.dat`, the
+world's `data/` and `datapacks/`, and every dimension's region, entity and POI
+files (26.2 keeps those under `dimensions/<namespace>/<dimension>/`). The
+returned manifest says how many files and bytes landed where. The live world is
+unfrozen even when a step fails, so a failed fork cannot leave the game stopped;
+if only the entities are interesting, pass `"regions": false`.
 
 ## Configuration
 

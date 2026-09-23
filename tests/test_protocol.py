@@ -31,6 +31,11 @@ class IsEventTests(unittest.TestCase):
         self.assertFalse(is_event({"type": "world_ack"}))
         self.assertFalse(is_event({"type": "sample_start_ack"}))
 
+    def test_snapshot_replies_are_replies(self) -> None:
+        """SNAPSHOTS does not end in _ack, so it must be listed explicitly."""
+        self.assertFalse(is_event({"type": "snapshot_ack", "dir": "/snapshots/before"}))
+        self.assertFalse(is_event({"type": "snapshots", "snapshots": []}))
+
 
 class PortFileTests(unittest.TestCase):
     def test_reads_trimmed_integer(self) -> None:

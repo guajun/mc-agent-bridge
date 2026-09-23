@@ -16,11 +16,16 @@ import time
 from collections import deque
 from typing import Any
 
+from . import fork
 from .local_api import LocalApiServer
 from .protocol import ModClient, read_port_file
 
 DEFAULT_MOD_PORT = 25580
 DEFAULT_API_PORT = 8765
+
+#: A snapshot writes one JSON record per entity to the instance's disk, which can
+#: take far longer than a plain request.
+SNAPSHOT_TIMEOUT = 120.0
 
 _EVENT_CATEGORIES = {
     "hello": "hello",
@@ -289,6 +294,169 @@ class BridgeDaemon:
         # The mod answers once the wait elapses, so the timeout must outlive it.
         return await self._call_mod(f"WAIT {ticks}", timeout=ticks / 20.0 + 20.0)
 
+    # ------------------------------------------------------- snapshot and forks
+
+    async def _m_snapshot(self, params: dict[str, Any]) -> dict[str, Any]:
+        """`SNAPSHOT [radius] [name]`: the entity set, in tick order, on the mod's disk."""
+        name = _snapshot_name(params.get("name")) or None
+        return await self._call_mod(
+            fork.snapshot_line(params.get("radius"), name), timeout=SNAPSHOT_TIMEOUT
+        )
+
+    async def _m_snapshots(self, _params: dict[str, Any]) -> dict[str, Any]:
+        """`SNAPSHOTS`: pass through what is already on the instance's disk."""
+        return await self._call_mod("SNAPSHOTS")
+
+    async def _m_fork(self, params: dict[str, Any]) -> dict[str, Any]:
+        """Freeze, save, snapshot the entities, copy the world, unfreeze.
+
+        The order matters: `/save-all flush` is what turns a frozen world into
+        chunks on disk, and the copy happens while the game is still frozen so
+        the region files cannot move underneath it. The unfreeze is not optional
+        - a fork that fails halfway must never leave the live world frozen.
+        """
+        # A name is optional: without one the mod picks its own directory name,
+        # which the ack reports back as "id"/"dir".
+        name = _snapshot_name(params.get("name")) or None
+        radius = params.get("radius")
+        regions = _as_bool(params.get("regions"), default=True)
+        freeze = _as_bool(params.get("freeze"), default=True)
+        world_dir = str(params.get("world_dir") or "").strip() or None
+
+        try:
+            if freeze:
+                await self._call_mod("CMD /tick freeze")
+            await self._call_mod("CMD /save-all flush")
+            ack = await self._call_mod(fork.snapshot_line(radius, name), timeout=SNAPSHOT_TIMEOUT)
+            snapshot_dir = str(ack.get("dir") or "").strip()
+            if not snapshot_dir:
+                raise RuntimeError(f"SNAPSHOT {name!r} answered without a dir: {ack!r}")
+
+            fork_dir: str | None = None
+            manifest: dict[str, Any] | None = None
+            source: str | None = None
+            if regions:
+                source = await self._world_dir(world_dir)
+                fork_dir = os.path.join(snapshot_dir, "world")
+                manifest = await asyncio.to_thread(fork.copy_world, source, fork_dir)
+
+            outcome = {
+                "snapshotDir": snapshot_dir,
+                "forkDir": fork_dir,
+                "worldDir": source,
+                "manifest": manifest,
+                "orderHash": ack.get("orderHash"),
+                "entities": ack.get("entities"),
+                "tick": ack.get("tick"),
+                "dimension": ack.get("dimension"),
+                "name": name or ack.get("id"),
+                "replaced": bool(ack.get("replaced")),
+            }
+        except BaseException:
+            # Unfreezing is best effort here: it must happen, but it must not
+            # hide the failure that got us here.
+            if freeze:
+                await self._unfreeze_best_effort()
+            raise
+        else:
+            # Nothing failed, so an unfreeze failure is real news: the caller is
+            # told the world may still be frozen instead of getting a "success".
+            if freeze:
+                await self._call_mod("CMD /tick unfreeze")
+            return outcome
+
+    async def _m_restore(self, params: dict[str, Any]) -> dict[str, Any]:
+        """Summon the snapshot's entities back, in recorded order (dry run by default).
+
+        The commands are the whole restore: vanilla appends each summoned entity
+        to the level's tick list as it is created, so issuing them in file order
+        is what reproduces the order the fork was taken from.
+        """
+        directory = str(params.get("directory") or params.get("dir") or "").strip()
+        if not directory:
+            raise ValueError("restore needs a directory: the snapshot mc_fork returned")
+        dry_run = _as_bool(params.get("dry_run"), default=True)
+        target = str(params.get("target") or "").strip() or None
+
+        meta, entities = fork.read_snapshot(directory)
+        commands = fork.summon_commands(entities)
+        result: dict[str, Any] = {
+            "directory": directory,
+            "target": target,
+            "orderHash": meta.get("orderHash"),
+            "count": len(commands),
+        }
+        if dry_run:
+            result["dryRun"] = True
+            result["commands"] = commands
+            return result
+
+        issued = 0
+        for command in commands:
+            await self._call_mod(f"CMD {_one_line(command)}")
+            issued += 1
+        result["dryRun"] = False
+        result["issued"] = issued
+        return result
+
+    async def _m_order(self, params: dict[str, Any]) -> dict[str, Any]:
+        """Re-snapshot the connected instance and compare its order hash with a fork.
+
+        The hash is the acceptance test for the whole track: equal hashes mean
+        the entities tick in the same order the fork recorded, which is the part
+        a save file cannot preserve.
+        """
+        directory = str(params.get("directory") or params.get("dir") or "").strip()
+        if not directory:
+            raise ValueError("order needs a directory: the snapshot to compare against")
+        target = str(params.get("target") or "").strip() or None
+
+        expected = str(fork.read_meta(directory).get("orderHash") or "")
+        if not expected:
+            raise fork.SnapshotError(f"{directory}: meta.json has no orderHash to compare with")
+
+        name = fork.order_check_name(target)
+        ack = await self._call_mod(fork.snapshot_line(None, name), timeout=SNAPSHOT_TIMEOUT)
+        snapshot_dir = str(ack.get("dir") or "").strip()
+        if not snapshot_dir:
+            raise RuntimeError(f"SNAPSHOT {name!r} answered without a dir: {ack!r}")
+        # Read the fresh hash off disk rather than trusting the ack: the file is
+        # what a later restore would actually consume.
+        fresh = fork.read_meta(snapshot_dir)
+        actual = str(fresh.get("orderHash") or "")
+        entities = fresh.get("entities")
+        if not isinstance(entities, int):
+            entities = len(fork.read_entities(snapshot_dir))
+        return {
+            "match": bool(actual) and actual == expected,
+            "expected": expected,
+            "actual": actual or None,
+            "entities": entities,
+            "directory": directory,
+            "snapshotDir": snapshot_dir,
+            "target": target,
+        }
+
+    async def _world_dir(self, explicit: str | None) -> str:
+        """Where the instance keeps the world we are about to copy."""
+        if explicit:
+            return explicit
+        state = await self._call_mod("STATE")
+        found = str(state.get("worldDir") or "").strip()
+        if not found:
+            raise RuntimeError(
+                "cannot resolve the world directory to copy: the instance reported no "
+                'STATE "worldDir" (the mod fills it only when the server vantage has a '
+                "world loaded); pass world_dir=<path> to fork a world it cannot see"
+            )
+        return found
+
+    async def _unfreeze_best_effort(self) -> None:
+        try:
+            await self._call_mod("CMD /tick unfreeze")
+        except Exception as error:  # noqa: BLE001 - the original failure matters more
+            print(f"[mc-agent-bridge] warning: could not /tick unfreeze: {error}", flush=True)
+
     async def _m_events(self, params: dict[str, Any]) -> dict[str, Any]:
         return self.recent_events(
             since=params.get("since"),
@@ -305,3 +473,25 @@ class BridgeDaemon:
 def _one_line(text: str) -> str:
     """The mod protocol is line based, so collapse anything that could break framing."""
     return text.replace("\r", " ").replace("\n", " ")
+
+
+def _snapshot_name(value: Any) -> str:
+    """Snapshot names become directory names on the instance, so keep them one token."""
+    name = _one_line(str(value or "")).strip()
+    if any(character.isspace() for character in name):
+        raise ValueError(f"snapshot names cannot contain spaces: {name!r}")
+    return name
+
+
+def _as_bool(value: Any, default: bool) -> bool:
+    """JSON callers send real booleans, CLI callers send "true"/"false"."""
+    if value is None or value == "":
+        return default
+    if isinstance(value, bool):
+        return value
+    text = str(value).strip().lower()
+    if text in ("true", "1", "yes", "on"):
+        return True
+    if text in ("false", "0", "no", "off"):
+        return False
+    raise ValueError(f"expected a boolean, got {value!r}")

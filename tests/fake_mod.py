@@ -8,16 +8,51 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
+import time
 from typing import Any
+
+from mc_agent_bridge.fork import order_hash
 
 
 class FakeMod:
-    def __init__(self, port: int = 0) -> None:
+    """One connection, the same line protocol, and the files the real mod writes.
+
+    The snapshot primitives are real enough to be useful: ``SNAPSHOT`` writes
+    ``entities.jsonl`` and ``meta.json`` under ``snapshots_dir`` and answers with
+    the on-disk order hash, so the bridge's fork path is exercised end to end
+    without a game.
+    """
+
+    def __init__(
+        self,
+        port: int = 0,
+        world_dir: str | os.PathLike[str] | None = None,
+        snapshots_dir: str | os.PathLike[str] | None = None,
+        entities: list[dict[str, Any]] | None = None,
+        tick: int = 1,
+    ) -> None:
         self.query_port = port
         self.port: int | None = None
         self.server: asyncio.AbstractServer | None = None
         self.lines: list[str] = []
         self._writers: list[asyncio.StreamWriter] = []
+        #: What STATE reports as "worldDir": only the server vantage knows it.
+        self.world_dir = os.fspath(world_dir) if world_dir is not None else None
+        #: Where SNAPSHOT writes, mirroring <mcagent.dir>/snapshots.
+        self.snapshots_dir = os.fspath(snapshots_dir) if snapshots_dir is not None else None
+        #: Entity records, in tick order, that SNAPSHOT writes out.
+        self.entity_records = list(entities or [])
+        self.tick = tick
+        #: Set to make SNAPSHOT answer with an error, for failure-path tests.
+        self.snapshot_error: str | None = None
+        #: The mod may name the listing reply either way; the bridge must take both.
+        self.snapshots_reply_type = "snapshots"
+
+    @property
+    def commands(self) -> list[str]:
+        """The commands the bridge ran, in order, with the leading slash."""
+        return [line[4:].strip() for line in self.lines if line.upper().startswith("CMD ")]
 
     async def start(self) -> int:
         self.server = await asyncio.start_server(self._on_client, "127.0.0.1", self.query_port)
@@ -82,11 +117,27 @@ class FakeMod:
     def reply_for(self, line: str) -> dict[str, Any]:
         upper = line.upper()
         if upper == "STATE":
-            return {"type": "state", "tick": 1, "inWorld": True, "name": "Bot"}
+            state: dict[str, Any] = {
+                "type": "state",
+                "tick": self.tick,
+                "inWorld": True,
+                "name": "Bot",
+                "instance": "server",
+                "entities": len(self.entity_records),
+            }
+            if self.world_dir is not None:
+                state["worldDir"] = self.world_dir
+            return state
         if upper == "CAPS":
             return {"type": "capabilities", "protocol": 1}
         if upper.startswith("ENTITIES"):
             return {"type": "entities", "entities": []}
+        if upper == "SNAPSHOT" or upper.startswith("SNAPSHOT "):
+            if self.snapshot_error is not None:
+                return {"type": "error", "message": self.snapshot_error}
+            return self.take_snapshot(line[len("SNAPSHOT") :].strip())
+        if upper == "SNAPSHOTS":
+            return {"type": self.snapshots_reply_type, "snapshots": self.list_snapshots()}
         if upper.startswith("BIG"):
             # >64 KiB of JSON, like an entity snapshot of a busy world.
             return {
@@ -107,3 +158,76 @@ class FakeMod:
         if upper.startswith("WAIT "):
             return {"type": "wait_ack", "detail": line[5:]}
         return {"type": "error", "message": f"unknown command: {line}"}
+
+    # ------------------------------------------------------------- snapshots
+
+    def take_snapshot(self, arguments: str) -> dict[str, Any]:
+        """`SNAPSHOT [radius] [name]`: write the files the real mod would write."""
+        if not self.snapshots_dir:
+            return {"type": "error", "message": "SNAPSHOT is not enabled on this fake"}
+        radius: float | None = None
+        tokens = arguments.split()
+        if tokens and _is_number(tokens[0]):
+            radius = float(tokens.pop(0))
+        name = tokens[0] if tokens else "snapshot"
+        directory = os.path.join(self.snapshots_dir, name)
+        os.makedirs(directory, exist_ok=True)
+        replaced = os.path.isfile(os.path.join(directory, "meta.json"))
+
+        entities_path = os.path.join(directory, "entities.jsonl")
+        with open(entities_path, "w", encoding="utf-8") as handle:
+            for record in self.entity_records:
+                handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+        hash_value = order_hash(str(record.get("uuid") or "") for record in self.entity_records)
+        meta = {
+            "protocol": 1,
+            "mod": "mc-agent-interface",
+            "modVersion": "0.1.0",
+            "minecraft": "test",
+            "tick": self.tick,
+            "dimension": "minecraft:overworld",
+            "radius": radius,
+            "entities": len(self.entity_records),
+            "orderHash": hash_value,
+            "createdAt": int(time.time() * 1000),
+            "frozen": True,
+            "worldDir": self.world_dir,
+            "instance": "server",
+        }
+        with open(os.path.join(directory, "meta.json"), "w", encoding="utf-8") as handle:
+            json.dump(meta, handle, ensure_ascii=False)
+
+        return {
+            "type": "snapshot_ack",
+            "id": name,
+            "dir": directory,
+            "entities": len(self.entity_records),
+            "orderHash": hash_value,
+            "tick": self.tick,
+            "dimension": "minecraft:overworld",
+            "bytes": os.path.getsize(entities_path),
+            "replaced": replaced,
+        }
+
+    def list_snapshots(self) -> list[dict[str, Any]]:
+        found: list[dict[str, Any]] = []
+        if not self.snapshots_dir or not os.path.isdir(self.snapshots_dir):
+            return found
+        for name in sorted(os.listdir(self.snapshots_dir)):
+            directory = os.path.join(self.snapshots_dir, name)
+            try:
+                with open(os.path.join(directory, "meta.json"), encoding="utf-8") as handle:
+                    meta = json.load(handle)
+            except (OSError, ValueError):
+                continue
+            found.append({"name": name, "dir": directory, **meta})
+        return found
+
+
+def _is_number(token: str) -> bool:
+    try:
+        float(token)
+    except ValueError:
+        return False
+    return True
