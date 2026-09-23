@@ -1,5 +1,7 @@
 # mc-agent-bridge
 
+📖 Part of **mc-agent**; the guide lives at <https://guajun.github.io/mc-agent/>.
+
 An agent-agnostic bridge between a Minecraft client and **any** agent runtime.
 
 The bridge does not contain an agent, and it does not know anything about what
