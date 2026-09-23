@@ -1,0 +1,20 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+build/
+dist/
+
+# runtime artefacts: may contain chat logs, player names, server addresses
+*.jsonl
+*.log
+*.pid
+port.txt
+mc-agent/
+samples/
+
+.pytest_cache/
+.mypy_cache/
+.idea/
+.vscode/
