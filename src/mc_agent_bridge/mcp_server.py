@@ -36,14 +36,8 @@ async def call(method: str, params: dict[str, Any] | None = None, timeout: float
 
 
 def build_server() -> Any:
-    try:
-        from mcp.server.fastmcp import FastMCP
-    except ImportError as error:  # pragma: no cover - depends on optional extra
-        raise SystemExit(
-            'the MCP front-end needs the optional dependency: pip install "mc-agent-bridge[mcp]"'
-        ) from error
-
-    mcp = FastMCP("mc-agent-bridge")
+    server_class = _server_class()
+    mcp = server_class("mc-agent-bridge")
 
     @mcp.tool()
     async def mc_status() -> Any:
@@ -119,6 +113,29 @@ def build_server() -> Any:
         )
 
     return mcp
+
+
+def _server_class() -> Any:
+    """The MCP server class, across SDK generations.
+
+    The Python SDK renamed ``FastMCP`` to ``MCPServer`` in 2.0; the v1 module
+    still exists in 2.x but raises a pointer to the migration guide, so a plain
+    import attempt is enough to pick the right one.
+    """
+    try:
+        from mcp.server.fastmcp import FastMCP  # mcp < 2
+
+        return FastMCP
+    except ModuleNotFoundError:
+        pass
+    try:
+        from mcp.server.mcpserver import MCPServer  # mcp >= 2
+
+        return MCPServer
+    except ModuleNotFoundError as error:  # pragma: no cover - depends on the extra
+        raise SystemExit(
+            'the MCP front-end needs the optional dependency: pip install "mc-agent-bridge[mcp]"'
+        ) from error
 
 
 def main(transport: str = "stdio") -> None:

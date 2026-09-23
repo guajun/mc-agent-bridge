@@ -124,6 +124,9 @@ Tools: `mc_status`, `mc_capabilities`, `mc_state`, `mc_entities`, `mc_command`,
 `mc_chat`, `mc_record_start`, `mc_record_stop`, `mc_wait`, `mc_screen`,
 `mc_mark`, `mc_connect`, `mc_events`.
 
+Verified against `mcp` 2.x (where the SDK renamed `FastMCP` to `MCPServer`) and
+1.x; the front-end picks whichever class the installed SDK provides.
+
 The equivalent of the older `mc-codex-bridge` design was one special-purpose
 daemon per agent. Here the daemon is neutral and each agent attaches however it
 likes: MCP, the JSON-lines API, or a loop built on this package.
