@@ -283,8 +283,10 @@ class ForwarderTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.wait_for(self.task, timeout=3)
         await self.mod.stop()
 
-    def receiver(self, statuses: list[int] | None = None, delay: float = 0.0) -> FakeWebhookReceiver:
-        receiver = FakeWebhookReceiver(statuses=statuses, delay=delay).start()
+    def receiver(
+        self, actions: list[int | str] | None = None, delay: float = 0.0
+    ) -> FakeWebhookReceiver:
+        receiver = FakeWebhookReceiver(actions=actions, delay=delay).start()
         self.receivers.append(receiver)
         return receiver
 
@@ -348,7 +350,7 @@ class ForwarderTests(unittest.IsolatedAsyncioTestCase):
         )
 
     async def test_retries_reuse_the_event_id_and_resign_each_attempt(self) -> None:
-        receiver = self.receiver(statuses=[500, 503, 200])
+        receiver = self.receiver(actions=[500, 503, 200])
         secret = "retry-secret"
         forwarder = await self.forward(make_config(url=receiver.url, secret=secret))
 
@@ -382,7 +384,7 @@ class ForwarderTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(status["lastEventId"], event_ids.pop())
 
     async def test_permanent_4xx_is_not_retried_and_logs_stay_secret_free(self) -> None:
-        receiver = self.receiver(statuses=[404])
+        receiver = self.receiver(actions=[404])
         secret = "never-print-me"
         forwarder = await self.forward(make_config(url=receiver.url, secret=secret))
 
@@ -396,6 +398,53 @@ class ForwarderTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(secret, log_text)
         self.assertNotIn("/hook", log_text)
         self.assertNotIn(secret, json.dumps(forwarder.status()))
+
+    async def test_a_truncated_response_does_not_stop_later_delivery(self) -> None:
+        receiver = self.receiver(actions=["truncate"])
+        secret = "truncate-secret"
+        forwarder = await self.forward(make_config(url=receiver.url, secret=secret))
+
+        await self.mod.push({"type": "chat", "text": "first", "sender": "A"})
+        await self.mod.push({"type": "chat", "text": "second", "sender": "B"})
+        await wait_for(lambda: forwarder.status()["delivered"] == 2)
+
+        records = receiver.snapshot()
+        # First event: truncated attempt + successful retry; second event: one POST.
+        self.assertEqual(len(records), 3)
+        first_ids = {self.headers(record)[EVENT_ID_HEADER.lower()] for record in records[:2]}
+        self.assertEqual(len(first_ids), 1)
+        self.assertEqual(self.headers(records[0])[ATTEMPT_HEADER.lower()], "1")
+        self.assertEqual(self.headers(records[1])[ATTEMPT_HEADER.lower()], "2")
+        self.assertNotEqual(
+            self.headers(records[1])[EVENT_ID_HEADER.lower()],
+            self.headers(records[2])[EVENT_ID_HEADER.lower()],
+        )
+
+        status = forwarder.status()
+        self.assertEqual(status["failed"], 0)
+        self.assertEqual(status["retries"], 1)
+        self.assertTrue(status["running"])
+
+    async def test_redirects_are_not_followed_and_do_not_count_as_delivery(self) -> None:
+        receiver = self.receiver(actions=[302])
+        secret = "redirect-secret"
+        forwarder = await self.forward(make_config(url=receiver.url, secret=secret))
+
+        await self.mod.push({"type": "chat", "text": "redirected", "sender": "A"})
+        await wait_for(lambda: forwarder.status()["failed"] == 1)
+
+        records = receiver.snapshot()
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["method"], "POST")
+        self.assertEqual(records[0]["path"], "/hook")
+        self.assertFalse(any(record["method"] == "GET" for record in records))
+        status = forwarder.status()
+        self.assertEqual(status["delivered"], 0)
+        self.assertEqual(status["retries"], 0)
+        self.assertEqual(status["lastEventId"], self.headers(records[0])[EVENT_ID_HEADER.lower()])
+        log_text = "\n".join(self.logs)
+        self.assertIn("redirect", log_text)
+        self.assertNotIn(secret, log_text)
 
     async def test_queue_overflow_is_counted_and_logged(self) -> None:
         receiver = self.receiver(delay=0.3)

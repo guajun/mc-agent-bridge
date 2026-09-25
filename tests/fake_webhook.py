@@ -1,8 +1,9 @@
 """A local fake webhook receiver for the forwarder tests.
 
 It records every request (headers + body), can answer with a scripted list of
-statuses to exercise retries, and verifies the HMAC-SHA256 signature with the
-same receiver-side scheme the README documents.
+actions - a status code, or ``"truncate"`` for a lying Content-Length - and
+verifies the HMAC-SHA256 signature with the same receiver-side scheme the
+README documents.
 """
 
 from __future__ import annotations
@@ -47,7 +48,23 @@ class _Handler(BaseHTTPRequestHandler):
             owner.requests.append(record)
         if owner.delay:
             time.sleep(owner.delay)
-        self.send_response(owner.next_status())
+
+        action = owner.next_action()
+        if action == "truncate":
+            # HTTP 200 with a lying Content-Length: once the connection closes,
+            # the client's read() raises http.client.IncompleteRead.
+            self.send_response(200)
+            self.send_header("Content-Length", "100")
+            self.end_headers()
+            self.wfile.write(b"{")
+            self.wfile.flush()
+            self.close_connection = True
+            return
+
+        status = int(action)
+        self.send_response(status)
+        if 300 <= status < 400:
+            self.send_header("Location", "/landing")
         self.send_header("Content-Length", "0")
         self.end_headers()
 
@@ -56,10 +73,14 @@ class _Handler(BaseHTTPRequestHandler):
 
 
 class FakeWebhookReceiver:
-    """A threaded HTTP server on 127.0.0.1 that stands in for a receiver."""
+    """A threaded HTTP server on 127.0.0.1 that stands in for a receiver.
 
-    def __init__(self, statuses: list[int] | None = None, delay: float = 0.0) -> None:
-        self.statuses = list(statuses or [])
+    ``actions`` is consumed in order; each entry is an HTTP status code or the
+    string ``"truncate"``. When it runs out the receiver answers 200.
+    """
+
+    def __init__(self, actions: list[int | str] | None = None, delay: float = 0.0) -> None:
+        self.actions: list[int | str] = list(actions or [])
         self.delay = delay
         self.requests: list[dict[str, Any]] = []
         self.lock = threading.Lock()
@@ -88,10 +109,10 @@ class FakeWebhookReceiver:
             self.thread.join(timeout=5)
             self.thread = None
 
-    def next_status(self) -> int:
+    def next_action(self) -> int | str:
         with self.lock:
-            if self.statuses:
-                return self.statuses.pop(0)
+            if self.actions:
+                return self.actions.pop(0)
         return 200
 
     def snapshot(self) -> list[dict[str, Any]]:

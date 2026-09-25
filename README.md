@@ -213,10 +213,13 @@ def verify(secret, header_timestamp, raw_body, signature, window=300):
 
 ### Retries and status
 
-Network failures, HTTP 5xx, 408, 425 and 429 are retried with bounded
-exponential backoff (default 1s base, 30s cap, 5 attempts); other statuses are
-reported as permanent and not retried. A retry re-signs with a fresh timestamp
-but reuses the same body and `eventId`. The forwarder logs every failure,
+Network failures, truncated or malformed HTTP responses, HTTP 5xx, 408, 425
+and 429 are retried with bounded exponential backoff (default 1s base, 30s
+cap, 5 attempts); other statuses are reported as permanent and not retried.
+Redirects are never followed - following one would turn the signed POST into
+a GET and drop the body - so point the forwarder at the final receiver URL;
+a 3xx is a permanent failure. A retry re-signs with a fresh timestamp but
+reuses the same body and `eventId`. The forwarder logs every failure,
 permanent rejection and queue overflow, and `WebhookForwarder.status()` exposes
 `queued`, `delivered`, `retries`, `failed`, `dropped`, `lastEventId` and a
 sanitized `lastError`. Logs never contain the shared secret or the full

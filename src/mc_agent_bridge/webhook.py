@@ -24,6 +24,7 @@ import contextlib
 import dataclasses
 import hashlib
 import hmac
+import http.client
 import json
 import os
 import random
@@ -358,6 +359,13 @@ class _TransientDeliveryError(Exception):
     """A transport failure that is worth retrying."""
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Refuse redirects: urllib would drop the signed POST body on a 30x."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # type: ignore[override]
+        return None
+
+
 @dataclasses.dataclass
 class ForwarderStats:
     delivered: int = 0
@@ -393,6 +401,9 @@ class WebhookForwarder:
         self.stats = ForwarderStats()
         self._logger = logger or _print_log
         self._rng = rng or random.Random()
+        #: Redirects stay disabled so the signed POST body can never be
+        #: silently converted into a GET for another destination.
+        self._opener = urllib.request.build_opener(_NoRedirect())
         self._queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue(maxsize=config.queue_size)
         self._stop = asyncio.Event()
         self._running = False
@@ -446,6 +457,7 @@ class WebhookForwarder:
         self._client = client
         pump: asyncio.Task[None] | None = None
         worker: asyncio.Task[None] | None = None
+        closed: asyncio.Task[None] | None = None
         try:
             await client.call("subscribe", {"events": list(self.config.events)})
             self._connected = True
@@ -453,17 +465,32 @@ class WebhookForwarder:
             source = await client.events()
             worker = asyncio.create_task(self._deliver_loop())
             pump = asyncio.create_task(self._pump(source))
-            await client.wait_closed()
-            self._log("bridge API connection closed; reconnecting")
+            closed = asyncio.create_task(client.wait_closed())
+            # A worker or pump that stops is as fatal as a lost connection:
+            # either way forwarding is broken until we reconnect, and waiting
+            # only on the socket would hide a silently dead worker.
+            done, _ = await asyncio.wait(
+                {worker, pump, closed}, return_when=asyncio.FIRST_COMPLETED
+            )
+            for task in done:
+                if task is closed:
+                    self._log("bridge API connection closed; reconnecting")
+                elif task.cancelled():
+                    continue
+                else:
+                    error = task.exception()
+                    detail = f": {error!r}" if error else ""
+                    self._log(f"webhook forwarder task stopped unexpectedly{detail}; reconnecting")
         except (ConnectionError, OSError, RuntimeError) as error:
             self._log(f"bridge API connection failed: {error}")
         finally:
             self._connected = False
             self._client = None
-            for task in (pump, worker):
-                if task is not None:
+            tasks = (pump, worker, closed)
+            for task in tasks:
+                if task is not None and not task.done():
                     task.cancel()
-            for task in (pump, worker):
+            for task in tasks:
                 if task is not None:
                     with contextlib.suppress(asyncio.CancelledError, Exception):
                         await task
@@ -505,6 +532,15 @@ class WebhookForwarder:
             event = await self._queue.get()
             try:
                 await self._deliver(event)
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:  # noqa: BLE001 - keep the worker alive
+                # _deliver handles its own known failures; this last-resort
+                # guard makes sure an unexpected one cannot silently stop
+                # forwarding every later event.
+                self.stats.failed += 1
+                self.stats.last_error = self._sanitize(f"unexpected delivery error: {error!r}")
+                self._log(f"webhook delivery crashed; continuing: {self.stats.last_error}")
             finally:
                 self._queue.task_done()
 
@@ -537,7 +573,7 @@ class WebhookForwarder:
             except _TransientDeliveryError as error:
                 last_error = str(error)
             else:
-                if 200 <= status < 400:
+                if 200 <= status < 300:
                     self.stats.delivered += 1
                     self.stats.last_event_id = event_id
                     self.stats.last_delivered_at = int(time.time() * 1000)
@@ -546,11 +582,16 @@ class WebhookForwarder:
                 if status >= 500 or status in RETRY_STATUSES:
                     last_error = f"HTTP {status}"
                 else:
+                    permanent = (
+                        f"HTTP {status} redirect was not followed"
+                        if 300 <= status < 400
+                        else f"HTTP {status}"
+                    )
                     self.stats.failed += 1
                     self.stats.last_event_id = event_id
-                    self.stats.last_error = self._sanitize(f"HTTP {status}")
+                    self.stats.last_error = self._sanitize(permanent)
                     self._log(
-                        f"webhook rejected event {event_id} permanently: HTTP {status}; not retrying"
+                        f"webhook rejected event {event_id} permanently: {permanent}; not retrying"
                     )
                     return False
             if attempt < self.config.max_attempts:
@@ -578,7 +619,7 @@ class WebhookForwarder:
             self.config.url, data=payload, headers=headers, method="POST"
         )
         try:
-            with urllib.request.urlopen(request, timeout=self.config.timeout) as response:
+            with self._opener.open(request, timeout=self.config.timeout) as response:
                 response.read()
                 return int(response.status)
         except urllib.error.HTTPError as error:
@@ -589,7 +630,14 @@ class WebhookForwarder:
             with contextlib.suppress(Exception):
                 error.close()
             return int(error.code)
-        except (urllib.error.URLError, TimeoutError, OSError) as error:
+        except (
+            urllib.error.URLError,
+            TimeoutError,
+            OSError,
+            http.client.HTTPException,
+        ) as error:
+            # A truncated response raises http.client.IncompleteRead, which is
+            # a plain HTTPException; treat it like any other transport failure.
             reason = getattr(error, "reason", error)
             raise _TransientDeliveryError(f"network error: {reason}") from error
 
