@@ -103,8 +103,9 @@ class Operation:
     description: str
     #: Canonical capability names; every one must be advertised.
     requires: tuple[str, ...] = ()
-    #: Where the gap comes from when ``requires`` is unmet, if it is not the
-    #: released mod - i.e. a still-open mod issue.
+    #: Where the gap comes from when ``requires`` is unmet, if it is not just the
+    #: connected mod's capability set (for example the mod-side issue that
+    #: introduced the capability).
     dependency: str | None = None
     dependency_label: str | None = None
 

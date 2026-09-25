@@ -167,6 +167,27 @@ class AdapterDaemonTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result["player"]["view"]["block"], "minecraft:stone")
 
+    async def test_missing_or_non_dict_view_is_not_invented(self) -> None:
+        """A reply without a usable ray keeps the player object as the mod sent it."""
+        api = await self.start(
+            SERVER_CAPABILITIES + ["player_context"], player_reply=PLAYER_REPLY_SPLIT_VIEW
+        )
+
+        for bad_view in ("not a dict", None, [1, 2], 7):
+            self.mod.player_reply = {**PLAYER_REPLY_SPLIT_VIEW, "view": bad_view}
+            result = await api.call("player", {"player": "Alice"})
+            self.assertTrue(result["found"])
+            self.assertEqual(result["name"], "Alice")
+            self.assertNotIn("view", result["player"])
+
+        without_view = {
+            key: value for key, value in PLAYER_REPLY_SPLIT_VIEW.items() if key != "view"
+        }
+        self.mod.player_reply = without_view
+        result = await api.call("player", {"player": "Alice"})
+        self.assertTrue(result["found"])
+        self.assertNotIn("view", result["player"])
+
     async def test_unknown_player_stays_a_structured_answer(self) -> None:
         api = await self.start(
             SERVER_CAPABILITIES + ["player_context"],

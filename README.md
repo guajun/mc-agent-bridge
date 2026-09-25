@@ -151,11 +151,11 @@ to subscribed connections.
 
 Methods are checked against the connected mod's CAPS before anything is sent. A
 client-only method on a server-vantage connection (or a server-only method on a
-client connection) returns a structured error naming the missing capability -
-and, for the two adaptive operations, the still-open mod issue it depends on.
-`player` and `context` are the boundaries for mc-agent-interface-mod#1
-(server-side player context) and #2 (chat context bundles); they light up as
-soon as the connected mod advertises the capability, with no code change here.
+client connection) returns a structured error naming the missing capability; for
+`player` and `context` it also names the mod issue they originated from. Both
+capabilities ship in mc-agent-interface-mod 0.6.0 (issues #1 and #2 for
+server-side player context and chat context bundles); they appear as soon as
+the connected mod advertises them, with no code change here.
 
 Every client connection can also call `subscribe` / `unsubscribe` with a list of
 event categories: `hello`, `chat`, `game`, `mark`, `sample`, `error`, `other`,
