@@ -145,9 +145,12 @@ class BridgeDaemon:
 
             self.client = client
             self.hello = hello
-            self.instance = hello.get("instance") or None
-            self.connected = True
             self.last_error = None
+            # Negotiate before publishing readiness: while ``client`` is set but
+            # ``connected`` is false, game operations are refused instead of
+            # being let through as an unknown legacy mod and sent once the CAPS
+            # request releases ModClient's lock.
+            instance = hello.get("instance") or None
             # CAPS is the authority for the surface; fall back to the hello
             # frame, then to "unknown" (a legacy mod the bridge cannot filter).
             advertised: object = hello.get("capabilities")
@@ -159,8 +162,10 @@ class BridgeDaemon:
                 if isinstance(caps_reply.get("capabilities"), (list, tuple)):
                     advertised = caps_reply["capabilities"]
                 if caps_reply.get("instance"):
-                    self.instance = str(caps_reply["instance"])
+                    instance = str(caps_reply["instance"])
+            self.instance = instance
             self.mod_capabilities = normalize_capabilities(advertised)
+            self.connected = True
             described = (
                 f"{len(self.mod_capabilities)} capabilities"
                 if self.mod_capabilities is not None
@@ -263,6 +268,10 @@ class BridgeDaemon:
 
     async def _call_mod(self, line: str, timeout: float = 15.0) -> dict[str, Any]:
         client = self.client
+        if client is not None and not self.connected:
+            raise RuntimeError(
+                "the bridge is still negotiating capabilities with the interface mod; retry shortly"
+            )
         if client is None or not self.connected:
             raise RuntimeError(
                 f"interface mod is not connected (last error: {self.last_error or 'none'})"

@@ -439,3 +439,25 @@ class ServerVantageDaemonTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(any(line.startswith("SNAPSHOT") for line in self.mod.lines))
         finally:
             await api.close()
+
+    async def test_operations_are_refused_while_capability_negotiation_is_pending(self) -> None:
+        self.mod.caps_delay = 0.6
+        daemon = await self.start_daemon()
+        # The hello frame has arrived and the CAPS request is in flight, but
+        # readiness is not published yet: no game operation may slip through
+        # ungated and be answered after CAPS completes.
+        await wait_for(lambda: daemon.client is not None and not daemon.connected)
+        api = await self.client()
+        try:
+            with self.assertRaises(RuntimeError) as pending:
+                await api.call("chat", {"message": "should-be-blocked"})
+            self.assertIn("negotiating", str(pending.exception))
+            self.assertFalse(any(line.startswith("CHAT ") for line in self.mod.lines))
+
+            await wait_for(lambda: daemon.connected and daemon.mod_capabilities is not None)
+            with self.assertRaises(RuntimeError) as gated:
+                await api.call("chat", {"message": "still-blocked"})
+            self.assertIn("not available", str(gated.exception))
+            self.assertFalse(any(line.startswith("CHAT ") for line in self.mod.lines))
+        finally:
+            await api.close()

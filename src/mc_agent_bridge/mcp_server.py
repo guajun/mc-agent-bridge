@@ -18,8 +18,10 @@ Requires the optional dependency: ``pip install "mc-agent-bridge[mcp]"``.
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import functools
 import os
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from typing import Any
 
 from .local_api import LocalApiClient
@@ -424,29 +426,147 @@ def tool_names(surface: dict[str, Any] | None = None, vantage: str = SERVER_VANT
     return [name for name, operation, _func in TOOLS if operation in supported]
 
 
-def build_server(surface: dict[str, Any] | None = None, vantage: str = SERVER_VANTAGE) -> Any:
+class ToolkitRegistry:
+    """Keeps one MCP server's tool list aligned with the live capability surface.
+
+    The daemon is a separate long-lived process, so the MCP front-end can start
+    before the game and can outlive a game restart. The registry starts from the
+    surface the daemon reported at startup (or the documented default if the
+    daemon was down), then refreshes in two ways:
+
+    * ``mc_capabilities`` observes its own reply - the call that just learned
+      the live surface immediately aligns the registry with it; and
+    * a background poll runs for as long as the MCP session lives, so a late
+      connection or a capability change is picked up even when the Harness only
+      ever calls ``tools/list``.
+
+    A failed probe keeps the last known surface instead of emptying the tool
+    list while the daemon restarts.
+    """
+
+    def __init__(
+        self,
+        vantage: str = SERVER_VANTAGE,
+        probe: Callable[[], Awaitable[dict[str, Any] | None]] | None = None,
+        refresh_interval: float = 5.0,
+    ) -> None:
+        self.vantage = vantage
+        self.probe = probe or probe_surface_async
+        self.refresh_interval = refresh_interval
+        self.mcp: Any = None
+        self.registered: set[str] = set()
+
+    def bind(self, mcp: Any) -> None:
+        self.mcp = mcp
+
+    @contextlib.asynccontextmanager
+    async def lifespan(self, _server: Any):
+        """Poll the daemon while this MCP session is alive."""
+        task = asyncio.create_task(self.watch())
+        try:
+            yield {}
+        finally:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+
+    async def watch(self) -> None:
+        while True:
+            await self.refresh()
+            await asyncio.sleep(self.refresh_interval)
+
+    async def refresh(self) -> set[str]:
+        try:
+            surface = await self.probe()
+        except Exception:  # noqa: BLE001 - a polling loop must survive a daemon restart
+            surface = None
+        if surface is None:
+            return set(self.registered)
+        return self.sync(surface)
+
+    def supported_tools(self, surface: dict[str, Any] | None = None) -> set[str]:
+        operations = enabled_operations(surface, self.vantage) | ALWAYS_REGISTERED
+        return {name for name, operation, _func in TOOLS if operation in operations}
+
+    def sync(self, surface: dict[str, Any] | None = None) -> set[str]:
+        """Add tools the surface supports and remove tools it no longer does."""
+        desired = self.supported_tools(surface)
+        for name in sorted(self.registered - desired):
+            self._remove(name)
+        for name, _operation, func in TOOLS:
+            if name in desired and name not in self.registered:
+                self._add(name, func)
+        self.registered = desired
+        return set(desired)
+
+    def _add(self, name: str, func: Callable[..., Any]) -> None:
+        tool = self._observed(name, func)
+        add_tool = getattr(self.mcp, "add_tool", None)
+        if add_tool is not None:
+            add_tool(tool, name=name)
+        else:  # very old FastMCP builds only had the decorator
+            self.mcp.tool(name=name)(tool)
+
+    def _remove(self, name: str) -> None:
+        remove_tool = getattr(self.mcp, "remove_tool", None)
+        if remove_tool is not None:
+            remove_tool(name)
+
+    def _observed(self, name: str, func: Callable[..., Any]) -> Callable[..., Any]:
+        """Wrap ``mc_capabilities`` so a fresh CAPS answer updates the registry."""
+        if name != "mc_capabilities":
+            return func
+
+        # functools.wraps preserves the signature (via __wrapped__), so the SDK
+        # still derives an empty input schema instead of advertising *args and
+        # **kwargs as arguments the model must supply.
+        @functools.wraps(func)
+        async def observed(*args: Any, **kwargs: Any) -> Any:
+            result = await func(*args, **kwargs)
+            if isinstance(result, dict):
+                self.sync(result)
+            return result
+
+        return observed
+
+
+def build_server(
+    surface: dict[str, Any] | None = None,
+    vantage: str = SERVER_VANTAGE,
+    registry: ToolkitRegistry | None = None,
+) -> Any:
     server_class = _server_class()
-    mcp = server_class("mc-agent-bridge")
-    supported = enabled_operations(surface, vantage) | ALWAYS_REGISTERED
-    for name, operation, func in TOOLS:
-        if operation in supported:
-            mcp.tool(name=name)(func)
+    registry = registry if registry is not None else ToolkitRegistry(vantage)
+    registry.vantage = vantage
+    try:
+        mcp = server_class("mc-agent-bridge", lifespan=registry.lifespan)
+    except TypeError as error:
+        if "lifespan" not in str(error):
+            raise
+        # Older MCP SDKs without a lifespan parameter still get the
+        # mc_capabilities-triggered refresh, just not the background poll.
+        mcp = server_class("mc-agent-bridge")
+    registry.bind(mcp)
+    registry.sync(surface)
     return mcp
 
 
-def _probe_surface(timeout: float = 5.0) -> dict[str, Any] | None:
+async def probe_surface_async(timeout: float = 5.0) -> dict[str, Any] | None:
     """Ask a running daemon for its filtered surface, or ``None`` if it is down."""
-
-    async def probe() -> Any:
-        client = LocalApiClient(api_host(), api_port())
-        try:
-            await client.connect(retry=False)
-            return await client.call("capabilities", timeout=timeout)
-        finally:
-            await client.close()
-
+    client = LocalApiClient(api_host(), api_port())
     try:
-        return asyncio.run(probe())
+        await client.connect(retry=False)
+        return await client.call("capabilities", timeout=timeout)
+    except (OSError, RuntimeError, TimeoutError, ConnectionError):
+        return None
+    finally:
+        await client.close()
+
+
+def probe_surface(timeout: float = 5.0) -> dict[str, Any] | None:
+    """Synchronous probe for startup, before the MCP SDK's loop exists."""
+    try:
+        return asyncio.run(probe_surface_async(timeout))
     except (OSError, RuntimeError, TimeoutError, ConnectionError):
         return None
 
@@ -475,4 +595,4 @@ def _server_class() -> Any:
 
 
 def main(transport: str = "stdio", vantage: str = SERVER_VANTAGE) -> None:
-    build_server(_probe_surface(), vantage=vantage).run(transport=transport)
+    build_server(probe_surface(), vantage=vantage).run(transport=transport)

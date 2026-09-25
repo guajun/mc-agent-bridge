@@ -56,6 +56,7 @@ class FakeMod:
         player_reply: dict[str, Any] | None = None,
         context_reply: dict[str, Any] | None = None,
         cmd_output: list[str] | None = None,
+        caps_delay: float = 0.0,
     ) -> None:
         self.query_port = port
         self.port: int | None = None
@@ -73,6 +74,8 @@ class FakeMod:
         self.context_reply = context_reply
         #: When set, CMD acks carry the output array the server vantage sends.
         self.cmd_output = list(cmd_output) if cmd_output is not None else None
+        #: Seconds to hold the CAPS reply, to exercise the negotiation window.
+        self.caps_delay = caps_delay
         #: What STATE reports as "worldDir": only the server vantage knows it.
         self.world_dir = os.fspath(world_dir) if world_dir is not None else None
         #: Where SNAPSHOT writes, mirroring <mcagent.dir>/snapshots.
@@ -144,6 +147,8 @@ class FakeMod:
                 if not line:
                     continue
                 self.lines.append(line)
+                if self.caps_delay and line.upper() == "CAPS":
+                    await asyncio.sleep(self.caps_delay)
                 reply = self.reply_for(line)
                 writer.write((json.dumps(reply, ensure_ascii=False) + "\n").encode("utf-8"))
                 await writer.drain()

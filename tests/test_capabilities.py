@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+import asyncio
+import contextlib
+import inspect
 import unittest
+from unittest import mock
 
 from mc_agent_bridge import mcp_server, toolkit
 from mc_agent_bridge.daemon import BridgeDaemon
@@ -141,9 +145,10 @@ class SurfaceTests(unittest.TestCase):
 class RecordingServer:
     """Minimal stand-in for the MCP SDK server class used by build_server."""
 
-    def __init__(self, name: str) -> None:
+    def __init__(self, name: str, **kwargs: object) -> None:
         self.name = name
         self.tools: dict[str, object] = {}
+        self.lifespan = kwargs.get("lifespan")
 
     def tool(self, name: str | None = None, **_kwargs: object):
         def decorator(func):
@@ -152,21 +157,41 @@ class RecordingServer:
 
         return decorator
 
+    def add_tool(self, func, name: str | None = None, **_kwargs: object) -> None:
+        self.tools[name or func.__name__] = func
+
+    def remove_tool(self, name: str) -> None:
+        self.tools.pop(name, None)
+
     def run(self, transport: str = "stdio") -> None:  # pragma: no cover - not called
         self.transport = transport
 
 
-class McpToolRegistrationTests(unittest.TestCase):
+class RecordingServerMixin:
+    """Build one RecordingServer per SDK server, like the real class would."""
+
+    server: RecordingServer
+
     def setUp(self) -> None:
-        self.server = RecordingServer("mc-agent-bridge")
         self.original = mcp_server._server_class
-        mcp_server._server_class = lambda: (lambda name: self.server)
+
+        def factory():
+            def build(name: str, **kwargs: object) -> RecordingServer:
+                self.server = RecordingServer(name, **kwargs)
+                return self.server
+
+            return build
+
+        mcp_server._server_class = factory
 
     def tearDown(self) -> None:
         mcp_server._server_class = self.original
 
+
+class McpToolRegistrationTests(RecordingServerMixin, unittest.TestCase):
     def test_without_a_daemon_the_default_server_surface_hides_client_tools(self) -> None:
         mcp_server.build_server(surface=None, vantage=SERVER_VANTAGE)
+        self.assertIsNotNone(self.server.lifespan, "the SDK lifespan drives background refresh")
         self.assertIn("mc_status", self.server.tools)
         self.assertIn("mc_capabilities", self.server.tools)
         self.assertIn("mc_state", self.server.tools)
@@ -222,6 +247,120 @@ class McpToolRegistrationTests(unittest.TestCase):
         entry = operation_support(operation, normalize_capabilities(["state"]), instance="server")
         self.assertFalse(entry["supported"])
         self.assertNotIn("dependency", entry)
+
+
+LIVE_SERVER_SURFACE = surface(
+    instance="server",
+    capabilities=list(SERVER_CAPABILITIES) + ["player_context", "context_bundle"],
+    vantage=SERVER_VANTAGE,
+)
+LIVE_CLIENT_SURFACE = surface(
+    instance="client", capabilities=CLIENT_CAPABILITIES, vantage=CLIENT_VANTAGE
+)
+
+
+def capabilities_reply(entry: dict) -> dict:
+    """The shape the daemon's capabilities method returns."""
+    return {
+        "type": "capabilities",
+        "instance": entry["instance"],
+        "modCapabilities": entry["modCapabilities"],
+        "surface": entry,
+    }
+
+
+class ToolkitRegistryRefreshTests(RecordingServerMixin, unittest.IsolatedAsyncioTestCase):
+    """One MCP server reused across a late connection and a capability change."""
+
+    def build(self, entry: dict | None = None) -> mcp_server.ToolkitRegistry:
+        registry = mcp_server.ToolkitRegistry(vantage=SERVER_VANTAGE)
+        mcp_server.build_server(surface=entry, vantage=SERVER_VANTAGE, registry=registry)
+        return registry
+
+    async def test_a_capabilities_call_after_a_late_connection_registers_adaptive_tools(self) -> None:
+        self.build(None)
+        self.assertNotIn("mc_player", self.server.tools)
+        reply = capabilities_reply(LIVE_SERVER_SURFACE)
+
+        async def fake_call(method, params=None, timeout=60.0):
+            self.assertEqual(method, "capabilities")
+            return reply
+
+        with mock.patch.object(mcp_server, "call", fake_call):
+            result = await self.server.tools["mc_capabilities"]()  # type: ignore[operator]
+
+        self.assertEqual(result, reply)
+        self.assertIn("mc_player", self.server.tools)
+        self.assertIn("mc_context", self.server.tools)
+
+    async def test_the_observed_capabilities_tool_keeps_an_empty_signature(self) -> None:
+        # A *args/**kwargs wrapper would make the SDK advertise args/kwargs as
+        # tool arguments and reject real calls; functools.wraps prevents that.
+        self.build(None)
+        tool = self.server.tools["mc_capabilities"]
+        self.assertEqual(list(inspect.signature(tool).parameters), [])  # type: ignore[arg-type]
+
+    async def test_a_capability_change_removes_stale_tools(self) -> None:
+        registry = self.build(LIVE_SERVER_SURFACE)
+        self.assertIn("mc_player", self.server.tools)
+
+        async def fake_call(method, params=None, timeout=60.0):
+            return capabilities_reply(LIVE_CLIENT_SURFACE)
+
+        with mock.patch.object(mcp_server, "call", fake_call):
+            await self.server.tools["mc_capabilities"]()  # type: ignore[operator]
+
+        self.assertNotIn("mc_player", self.server.tools)
+        self.assertNotIn("mc_context", self.server.tools)
+        self.assertNotIn("mc_snapshot", self.server.tools)
+        self.assertIn("mc_chat", self.server.tools)
+        self.assertEqual(
+            registry.registered, set(mcp_server.tool_names(LIVE_CLIENT_SURFACE))
+        )
+
+    async def test_a_failed_probe_keeps_the_last_known_surface(self) -> None:
+        async def failing_probe():
+            raise ConnectionError("daemon restarting")
+
+        registry = mcp_server.ToolkitRegistry(vantage=SERVER_VANTAGE, probe=failing_probe)
+        mcp_server.build_server(
+            surface=LIVE_SERVER_SURFACE, vantage=SERVER_VANTAGE, registry=registry
+        )
+        self.assertIn("mc_player", self.server.tools)
+
+        await registry.refresh()
+
+        self.assertIn("mc_player", self.server.tools)
+        self.assertIn("mc_state", self.server.tools)
+
+
+class ToolkitWatchTests(RecordingServerMixin, unittest.IsolatedAsyncioTestCase):
+    async def test_background_watch_picks_up_a_late_connection(self) -> None:
+        replies: list = [None, capabilities_reply(LIVE_SERVER_SURFACE)]
+        calls = {"n": 0}
+
+        async def probe():
+            index = min(calls["n"], len(replies) - 1)
+            calls["n"] += 1
+            return replies[index]
+
+        registry = mcp_server.ToolkitRegistry(
+            vantage=SERVER_VANTAGE, probe=probe, refresh_interval=0.05
+        )
+        mcp_server.build_server(surface=None, vantage=SERVER_VANTAGE, registry=registry)
+        self.assertNotIn("mc_player", self.server.tools)
+
+        task = asyncio.create_task(registry.watch())
+        try:
+            for _ in range(200):
+                if "mc_player" in self.server.tools:
+                    break
+                await asyncio.sleep(0.01)
+            self.assertIn("mc_player", self.server.tools)
+        finally:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
 
 
 class ToolkitImportTests(unittest.TestCase):
