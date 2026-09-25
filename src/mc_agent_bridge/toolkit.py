@@ -145,7 +145,8 @@ OPERATIONS: tuple[Operation, ...] = (
     Operation("snapshot", "Write the entity set in tick order to the instance's disk.", ("snapshot",)),
     Operation("snapshots", "List the snapshots already on the connected instance.", ("snapshot",)),
     Operation("fork", "Freeze, snapshot, copy the world files, resume.", ("snapshot", "command")),
-    Operation("restore", "Summon a snapshot's entities in the recorded order.", ("command",)),
+    Operation("restore", "Validate a fork, summon its entities in recorded order under guard, and compare state.", ("command",)),
+    Operation("verify", "Compare a fork with a fresh snapshot of this instance: order, counts, position, velocity, NBT.", ("snapshot",)),
     Operation("order", "Compare a fresh snapshot's order hash with a saved fork.", ("snapshot",)),
     Operation("stop", "Shut the daemon down."),
 )

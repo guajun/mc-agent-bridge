@@ -278,16 +278,36 @@ class ForkDaemonTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(dry["dryRun"])
         self.assertEqual(dry["count"], len(ENTITIES))
         self.assertEqual(dry["commands"], SUMMON_COMMANDS)
+        self.assertTrue(dry["targetIsLabel"])
         self.assertEqual(self.mod.commands, [], "a dry run must not touch the world")
 
+        # The destination is an empty lab that loaded the copied world; the
+        # guarded apply must prove the endpoint, freeze, restore and compare.
+        self.mod.entity_records = []
+        self.mod.summon_uuids = [entity["uuid"] for entity in ENTITIES]
         result = await self.api.call(
-            "restore", {"directory": ack["dir"], "dry_run": False, "target": "lab"}
+            "restore",
+            {
+                "directory": ack["dir"],
+                "dry_run": False,
+                "target": "lab",
+                "expect_instance": "server",
+                "expect_world_dir": str(self.world),
+            },
         )
         self.assertFalse(result["dryRun"])
         self.assertEqual(result["issued"], len(ENTITIES))
         self.assertEqual(result["target"], "lab")
         self.assertEqual(result["orderHash"], ack["orderHash"])
-        self.assertEqual(self.mod.commands, SUMMON_COMMANDS)
+        self.assertEqual(result["failed"], [])
+        self.assertTrue(result["ok"], result["verification"])
+        self.assertEqual(
+            [command for command in self.mod.commands if command.startswith("/summon ")],
+            SUMMON_COMMANDS,
+        )
+        self.assertIn("/tick freeze", self.mod.commands)
+        self.assertIn("/tick unfreeze", self.mod.commands)
+        self.assertEqual(self.mod.entity_records[0]["uuid"], ENTITIES[0]["uuid"])
 
     async def test_order_matches_the_fork_and_reports_a_different_order(self) -> None:
         ack = await self.api.call("snapshot", {"name": "before"})

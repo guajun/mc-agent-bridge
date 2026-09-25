@@ -339,24 +339,116 @@ async def _mc_fork(
     )
 
 
-async def _mc_restore(directory: str, dry_run: bool = True, target: str = "") -> Any:
-    """Recreate a fork's entities with ``/summon``, in the recorded order.
+async def _mc_restore(
+    directory: str,
+    dry_run: bool = True,
+    target: str = "",
+    expect_instance: str = "",
+    expect_world_dir: str = "",
+    expect_level: str = "",
+    expect_dimension: str = "",
+    prior_tick_state: str = "auto",
+    freeze: bool = True,
+    freeze_timeout_seconds: float = 300.0,
+    forceload: bool = True,
+    release_forceload: bool = False,
+    check_existing: bool = True,
+    replace_existing: bool = False,
+    keep_going: bool = False,
+    verify: bool = True,
+    strict: bool = True,
+    verify_radius: float = 0.0,
+    collision_radius: float = 0.0,
+    pos_tolerance: float = 0.0,
+    vel_tolerance: float = 0.0,
+    ignore_nbt_keys: str = "",
+    allow_unproven_destination: bool = False,
+) -> Any:
+    """Recreate a fork's entities under guard, then prove the state came back.
 
-    One command per entity, in file order, because the order the entities
-    are created in is the order they will tick in. Always run it dry first:
-    the dry run returns every command without sending one, so you can check
-    the count and the destination before touching a world. Then call it with
-    ``dry_run=False`` against the lab instance (its own bridge, pointed at the
-    client or server that loaded the copied ``world`` directory).
+    The apply path validates the recording before touching anything, proves
+    the destination endpoint (``expect_instance`` / ``expect_world_dir`` /
+    ``expect_level``; at least one is required for an apply unless
+    ``allow_unproven_destination=True``), resolves the prior tick state
+    (``prior_tick_state``: ``auto`` reads ``/tick query`` and refuses if it
+    cannot tell, or pass ``frozen``/``running`` explicitly), freezes before
+    taking pre-restore evidence, checks the recorded dimension, loads the
+    recorded box, refuses to duplicate leftovers unless ``replace_existing=True``
+    (which kills only the detected collisions at their own positions, plus
+    their drops, with ticks running, then flushes and re-freezes), summons in
+    recorded order, re-snapshots and compares UUID order, counts, positions,
+    velocities, dimension and full NBT, then restores the prior tick state.
 
-    ``target`` labels the instance you are restoring into; this bridge talks
-    to one mod connection, so it is carried through for the record rather
-    than used for routing. Verify with ``mc_order`` afterwards.
+    ``target`` is a label only - this bridge owns one mod connection, so a
+    name cannot select a server. Always run dry first: the dry run returns the
+    commands, the validation warnings and the endpoint report without sending
+    one. ``ok``/``verdict`` are a state verdict: ``ok: true`` requires a
+    matching post-restore comparison and a preserved tick state; with
+    ``verify=False`` the result is ``verdict: "unverified"`` and ``ok: null``,
+    never a successful restore. Use ``mc_verify`` for the same comparison after
+    an externally driven restore.
     """
     return await call(
         "restore",
-        {"directory": directory, "dry_run": dry_run, "target": target or None},
+        {
+            "directory": directory,
+            "dry_run": dry_run,
+            "target": target or None,
+            "expect_instance": expect_instance or None,
+            "expect_world_dir": expect_world_dir or None,
+            "expect_level": expect_level or None,
+            "expect_dimension": expect_dimension or None,
+            "prior_tick_state": prior_tick_state or "auto",
+            "allow_unproven_destination": allow_unproven_destination,
+            "freeze": freeze,
+            "freeze_timeout_seconds": freeze_timeout_seconds,
+            "forceload": forceload,
+            "release_forceload": release_forceload,
+            "check_existing": check_existing,
+            "replace_existing": replace_existing,
+            "keep_going": keep_going,
+            "verify": verify,
+            "strict": strict,
+            "verify_radius": verify_radius or None,
+            "collision_radius": collision_radius or None,
+            "pos_tolerance": pos_tolerance or None,
+            "vel_tolerance": vel_tolerance or None,
+            "ignore_nbt_keys": [key for key in ignore_nbt_keys.split(",") if key] or None,
+        },
         timeout=600.0,
+    )
+
+
+async def _mc_verify(
+    directory: str,
+    target: str = "",
+    strict: bool = True,
+    snapshot_radius: float = 0.0,
+    pos_tolerance: float = 0.0,
+    vel_tolerance: float = 0.0,
+    ignore_nbt_keys: str = "",
+) -> Any:
+    """Compare a fork with the connected instance: order, counts, position, NBT.
+
+    The full-state sibling of ``mc_order``: it takes a fresh snapshot and
+    compares UUID order, per-type counts, positions, velocities, dimension and
+    the whole NBT string (including ``Items``), because an inventory can change
+    while ``orderHash`` stays identical. A malformed or wrong-dimension
+    destination snapshot fails the check. ``ok: false`` with the
+    ``verification`` report is the evidence a restore was not faithful.
+    """
+    return await call(
+        "verify",
+        {
+            "directory": directory,
+            "target": target or None,
+            "strict": strict,
+            "snapshot_radius": snapshot_radius or None,
+            "pos_tolerance": pos_tolerance or None,
+            "vel_tolerance": vel_tolerance or None,
+            "ignore_nbt_keys": [key for key in ignore_nbt_keys.split(",") if key] or None,
+        },
+        timeout=120.0,
     )
 
 
@@ -400,6 +492,7 @@ TOOLS: tuple[tuple[str, str, Callable[..., Any]], ...] = (
     ("mc_snapshots", "snapshots", _mc_snapshots),
     ("mc_fork", "fork", _mc_fork),
     ("mc_restore", "restore", _mc_restore),
+    ("mc_verify", "verify", _mc_verify),
     ("mc_order", "order", _mc_order),
 )
 

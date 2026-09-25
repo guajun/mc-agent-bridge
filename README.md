@@ -145,7 +145,8 @@ to subscribed connections.
 | `snapshot` | `radius`, `name` | `SNAPSHOT [radius] [name]` (entities + tick order, on the instance's disk) |
 | `snapshots` | - | `SNAPSHOTS` (what is already on the instance) |
 | `fork` | `name`, `radius`, `regions`, `world_dir`, `freeze` | freeze → `save-all flush` → `SNAPSHOT` → copy the world → unfreeze |
-| `restore` | `directory`, `dry_run`, `target` | `/summon` per entity, in recorded order (dry run by default) |
+| `restore` | `directory`, `dry_run`, `target`, `expect_instance`, `expect_world_dir`, `expect_level`, `expect_dimension`, `prior_tick_state`, `allow_unproven_destination`, `freeze`, `freeze_timeout_seconds`, `forceload`, `release_forceload`, `check_existing`, `replace_existing`, `keep_going`, `verify`, `strict`, `verify_radius`, `collision_radius`, `pos_tolerance`, `vel_tolerance`, `ignore_nbt_keys` | validate → require an endpoint proof → resolve/freeze tick → load box → baseline/dimension/collision checks → narrow collision kill with ticks running and re-freeze when replacing → `/summon` per entity in recorded order → full-state compare → restore tick state (dry run by default; see `docs/restore.md`) |
+| `verify` | `directory`, `target`, `strict`, `snapshot_radius`, tolerances | re-snapshot and compare dimension, UUID order, counts, positions, velocities and NBT with a fork |
 | `order` | `directory`, `target` | re-snapshot and compare `orderHash` with a fork |
 | `stop` | - | shut the daemon down |
 
@@ -179,7 +180,7 @@ mc-bridge mcp --vantage client     # legacy client surface only
 The tool list is filtered by the connected instance's CAPS, so a server-vantage
 session gets only the operations it can serve: health, capabilities, state,
 entities, commands, command output, wait, mark, events, save, snapshots, fork,
-restore and order - and `mc_player`/`mc_context` when the mod advertises
+restore, verify and order - and `mc_player`/`mc_context` when the mod advertises
 them - and never `mc_chat`, `mc_screen`, `mc_connect` or the other client-only
 tools.
 Before the daemon answers, the front-end registers the documented default
@@ -292,7 +293,8 @@ A save file has the blocks and the entity NBT, but not the **tick order**:
 entities are appended to the level's tick list as chunks load, and that order
 decides the result of anything computed entity by entity - pushes, cramming,
 explosions. `fork` therefore freezes the game, asks the mod for the order, and
-copies the world files; `restore` puts the entities back in that order.
+copies the world files; `restore` puts the entities back in that order under
+enough guard rails that "commands issued" is not mistaken for "state restored".
 
 ```bash
 # 1. What has already been snapshotted on this instance?
@@ -310,20 +312,45 @@ mc-bridge call fork '{"name": "before-fight", "radius": 64}'
 # }
 
 # 3. Move forkDir into the lab instance's saves/, launch it with the mod, and
-#    point a bridge at that instance (here on a second API port):
-mc-bridge --api-port 8799 call restore '{"directory": "C:/mc-agent/snapshots/before-fight"}'
-mc-bridge --api-port 8799 call restore '{"directory": "C:/mc-agent/snapshots/before-fight", "dry_run": false}'
+#    point a bridge at that instance (here on a second API port). Dry-run first:
+mc-bridge --api-port 8799 call restore '{"directory": "C:/mc-agent/snapshots/before-fight", "target": "lab", "expect_world_dir": "C:/lab/saves/world"}'
 
-# 4. The acceptance test: the re-snapshot must report the same order.
-mc-bridge --api-port 8799 call order '{"directory": "C:/mc-agent/snapshots/before-fight"}'
-# {"match": true, "expected": "9f2c0a1b2c3d4e5f", "actual": "9f2c0a1b2c3d4e5f", "entities": 521}
+# 4. Apply under guard: endpoint + dimension + duplicate checks, freeze-first
+#    so the evidence cannot age, sequential summons in order, then compare full
+#    state (uuid order, counts, pos, vel, NBT) and restore the tick state.
+mc-bridge --api-port 8799 call restore '{"directory": "C:/mc-agent/snapshots/before-fight", "target": "lab", "expect_world_dir": "C:/lab/saves/world", "dry_run": false}'
+# "ok": true only when the post-restore comparison matched and the tick state
+# is back ("verdict": "ok", "verified": true). With "verify": false the
+# result is "verdict": "unverified", "ok": null: commands issued, but never a
+# claim that the world was faithfully restored.
+
+# 5. The hash-only acceptance test remains available, and the full-state
+#    comparison can be run on its own after a manual restore:
+mc-bridge --api-port 8799 call order  '{"directory": "C:/mc-agent/snapshots/before-fight"}'
+mc-bridge --api-port 8799 call verify '{"directory": "C:/mc-agent/snapshots/before-fight"}'
 ```
 
-`restore` is a dry run until you say otherwise: it returns the commands it would
-send, which is the cheap way to check the count and the destination first. Both
-`restore` and `order` take a `target` label naming the lab instance they are
-pointed at; a bridge owns one mod connection, so the label is carried through
-for the record rather than used for routing.
+`restore` is a dry run until you say otherwise: it returns the commands, the
+validation warnings and the endpoint report without sending one. The apply path
+requires an endpoint proof (`expect_world_dir`, `expect_instance` or
+`expect_level`; an explicit `allow_unproven_destination=true` is the only
+override) and refuses a failed `STATE`, resolves the prior tick state before
+freezing (an unreadable `/tick query` refuses unless `prior_tick_state` is
+stated), freezes before taking evidence so nothing moves under it, refuses to
+duplicate leftovers unless `replace_existing=true` kills only the detected
+collisions and their drops at their own positions (never a padded volume) with
+ticks running and re-freezes, and treats a summon whose entity does not appear
+in the post-restore snapshot as a failure (the game's own message is attached
+as evidence, never parsed). A state verdict is only `ok: true` when that
+comparison ran and matched and the prior tick state is back; `verify=false`
+returns `unverified`/`null`, not success. `docs/restore.md` has the full
+workflow and the division between what the bridge automates and what the
+caller still owns.
+
+Both `restore` and `order` take a `target`; it is a **label** naming the lab
+instance for the record and the throwaway snapshot names, never a router - a
+bridge owns one mod connection, so prove the destination with
+`expect_instance`/`expect_world_dir`/`expect_level` instead.
 
 The copy is the instance's whole world directory minus the things a lab must not
 inherit - `session.lock`, the player data (`playerdata/` before 1.21, `players/`
