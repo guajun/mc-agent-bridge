@@ -2,17 +2,27 @@
 
 📖 Part of **mc-agent**; the guide lives at <https://guajun.github.io/mc-agent/>.
 
-An agent-agnostic bridge between a Minecraft client and **any** agent runtime.
+A small, Harness-neutral Minecraft Toolkit. It runs next to the game server,
+owns one connection to the `mc-agent-interface` mod, and exposes the game as a
+stable JSON surface any Harness can call over MCP or the CLI: health and
+capabilities, player context, entities, commands, chat, events, context
+bundles, snapshots and world-save metadata.
 
-The bridge does not contain an agent, and it does not know anything about what
-you want to do in the game. It exposes the game as a small set of primitives -
-state, entities, commands, chat, recording, waiting - and gets out of the way.
+The Toolkit contains no model calls, no agent loop and no conversation state,
+and it does not know what any particular Harness wants to do. It also does not
+decide what an Agent should do: it answers questions and executes requested
+primitives, and gets out of the way.
+
+The default target is the mod's **server vantage** - the authoritative one, and
+the only one that can snapshot entity tick order.
 
 ```
- agent runtime  <->  bridge daemon  <->  interface mod  <->  Minecraft
- (Hermes, Codex,      this repo        mc-agent-interface      (Fabric)
-  your own loop)                        (Java, in-game)
+ MCP client / CLI / loop  <->  bridge daemon  <->  server-vantage mod  <->  server
+ (any Harness, no SDKs)        this repo          mc-agent-interface      (Fabric)
 ```
+
+See **[docs/toolkit.md](docs/toolkit.md)** for the install-and-use guide and
+the full tool reference.
 
 ## Why a separate daemon
 
@@ -22,10 +32,10 @@ daemon owns that connection and re-serves it on loopback as a JSON-lines API.
 
 That buys three things:
 
-* **Swappable agent runtimes.** Hermes today, Codex tomorrow, a shell script
-  next week. They all speak the same API and none of them touch the game.
-* **Survivable agent sessions.** An agent that restarts, or an MCP server that
-  is spawned per session, does not disturb the game connection.
+* **Swappable Harnesses.** Hermes today, Codex tomorrow, a shell script next
+  week. They all speak the same API and none of them touch the game.
+* **Survivable Harness sessions.** A Harness that restarts, or an MCP server
+  that is spawned per session, does not disturb the game connection.
 * **Event replay.** The daemon keeps a ring buffer of recent events, so an agent
   can ask "what happened while I was thinking?" with a cursor instead of
   needing to be alive at the exact moment something happened.
@@ -38,7 +48,9 @@ loop that subscribes to the daemon's event stream - see `mc-agent-loop`.
 ## Requirements
 
 * Python 3.11+
-* The `mc-agent-interface` Fabric mod running in the client
+* The `mc-agent-interface` Fabric mod running in the same environment as the
+  game server (a dedicated server, or the integrated server inside a
+  single-player client)
 
 ## Install
 
@@ -53,30 +65,49 @@ pip install -e ".[mcp]"     # plus the MCP front-end
 # 1. Start the daemon (keep it running while the game is open)
 mc-bridge run
 
-# 2. In another shell, talk to the game
-mc-bridge call state
-mc-bridge call entities '{"radius": 32}'
-mc-bridge call command '{"command": "time set day"}'
-mc-bridge call chat '{"message": "hello from outside"}'
+# 2. In another shell, check the connection and what this instance can do
+mc-bridge call status
+mc-bridge call capabilities
 
-# 3. Watch the event stream
-mc-bridge watch --events chat,game
+# 3. Use only the operations the instance advertises
+mc-bridge call state
+mc-bridge call save
+mc-bridge call entities '{"radius": 32}'
+mc-bridge call command_output '{"command": "data get entity <name> Motion"}'
+
+# 4. Watch the event stream
+mc-bridge watch --events game,chat,mark
 ```
 
 ### Finding the game
 
-The daemon needs the port the mod actually bound to. The mod writes it to
-`port.txt` inside its data directory (`<gameDir>/mc-agent/port.txt`) and falls
-back to the next free port when the preferred one is busy.
+The default target is the server vantage. Its entrypoint writes the port it
+bound to into `<gameDir>/mc-agent-server/port.txt`; the daemon reads the file
+on every reconnect, so a port that moves is picked up automatically.
 
-Resolution order:
+Resolution order for the server vantage:
 
-1. `--mod-port`
-2. `MC_AGENT_PORT_FILE`, `./port.txt`, `./mc-agent/port.txt`
-3. `25580`
+1. `--mod-port` (an explicit port always wins)
+2. `--port-file` or `MC_AGENT_PORT_FILE` (the exact `port.txt`)
+3. `<--server-dir | $MC_AGENT_SERVER_DIR | cwd>/mc-agent-server/port.txt`
+4. `<--server-dir>/port.txt` when a server directory was named explicitly
 
-For a fully deterministic setup, launch the game with
-`-Dmcagent.port=25580 -Dmcagent.dir=<path>` so that the port never moves.
+If nothing resolves, the daemon prints an actionable error and keeps watching -
+it never guesses a port and never falls back to client-vantage. You can check
+discovery without starting the daemon:
+
+```bash
+mc-bridge discover
+# {"vantage": "server", "port": null, "source": "unresolved",
+#  "error": "cannot find the server-vantage port file ... --port-file ... --vantage client"}
+```
+
+Legacy client-vantage setups (the mod in a Minecraft client) opt in explicitly:
+
+```bash
+mc-bridge run --vantage client                      # ./port.txt, ./mc-agent/port.txt, else 25580
+mc-bridge run --vantage client --port-file /path/to/mc-agent/port.txt
+```
 
 ## The local API
 
@@ -92,27 +123,39 @@ to subscribed connections.
 | Method | Params | Maps to mod line |
 | --- | --- | --- |
 | `ping` | - | local only |
-| `status` | - | local only: connection, port, buffer, clients |
-| `capabilities` | - | `CAPS` |
+| `status` | - | local only: connection, vantage, port source, discovery, buffer, clients |
+| `capabilities` | - | `CAPS` plus the filtered toolkit surface |
 | `state` | - | `STATE` |
+| `player` | `player` (UUID, name as convenience) | `PLAYER <id>` (server vantage; adaptive) |
 | `entities` | `radius` | `ENTITIES [radius]` |
 | `command` | `command` | `CMD <command>` |
-| `chat` | `message` | `CHAT <message>` |
-| `record_start` | `ticks`, `radius`, `interval` | `SAMPLE_START <ticks> <radius> <interval>` |
-| `record_stop` | - | `SAMPLE_STOP` |
+| `command_output` | `command`, `wait` | `CMD` plus its answer (ack output, else events) |
+| `chat` | `message` | `CHAT <message>` (client vantage) |
+| `record_start` | `ticks`, `radius`, `interval` | `SAMPLE_START <ticks> <radius> <interval>` (client vantage) |
+| `record_stop` | - | `SAMPLE_STOP` (client vantage) |
 | `wait` | `ticks` | `WAIT <ticks>` |
-| `screen` | - | `SCREEN` |
+| `screen` | - | `SCREEN` (client vantage) |
 | `mark` | `text` | `MARK <text>` |
-| `connect` | `address` | `CONNECT <address>` |
-| `world` | `level` | `WORLD <level>` (open a single-player save) |
-| `lan` | `port`, `mode` | `LAN [port] [online\|offline]` (publish the world to the LAN) |
+| `connect` | `address` | `CONNECT <address>` (client vantage) |
+| `world` | `level` | `WORLD <level>` (client vantage; open a single-player save) |
+| `lan` | `port`, `mode` | `LAN [port] [online\|offline]` (client vantage) |
+| `events` | `since`, `limit`, `category` | replay from the buffer |
+| `context` | `id` | `CONTEXT <id>` (server vantage; adaptive) |
+| `save` | - | local composition of `STATE`: world-save metadata |
 | `snapshot` | `radius`, `name` | `SNAPSHOT [radius] [name]` (entities + tick order, on the instance's disk) |
 | `snapshots` | - | `SNAPSHOTS` (what is already on the instance) |
 | `fork` | `name`, `radius`, `regions`, `world_dir`, `freeze` | freeze → `save-all flush` → `SNAPSHOT` → copy the world → unfreeze |
 | `restore` | `directory`, `dry_run`, `target` | `/summon` per entity, in recorded order (dry run by default) |
 | `order` | `directory`, `target` | re-snapshot and compare `orderHash` with a fork |
-| `events` | `since`, `limit`, `category` | replay from the buffer |
 | `stop` | - | shut the daemon down |
+
+Methods are checked against the connected mod's CAPS before anything is sent. A
+client-only method on a server-vantage connection (or a server-only method on a
+client connection) returns a structured error naming the missing capability -
+and, for the two adaptive operations, the still-open mod issue it depends on.
+`player` and `context` are the boundaries for mc-agent-interface-mod#1
+(server-side player context) and #2 (chat context bundles); they light up as
+soon as the connected mod advertises the capability, with no code change here.
 
 Every client connection can also call `subscribe` / `unsubscribe` with a list of
 event categories: `hello`, `chat`, `game`, `mark`, `sample`, `error`, `other`,
@@ -129,18 +172,29 @@ mc-bridge mcp                      # stdio, for MCP clients that spawn servers
 mc-bridge mcp --transport streamable-http
 ```
 
-Tools: `mc_status`, `mc_capabilities`, `mc_state`, `mc_entities`, `mc_command`,
-`mc_command_output`, `mc_chat`, `mc_record_start`, `mc_record_stop`, `mc_wait`,
-`mc_screen`, `mc_mark`, `mc_connect`, `mc_world`, `mc_lan`, `mc_events`,
-`mc_snapshot`, `mc_snapshots`, `mc_fork`, `mc_restore`, `mc_order`.
+```bash
+mc-bridge mcp --vantage client     # legacy client surface only
+```
+
+The tool list is filtered by the connected instance's CAPS, so a server-vantage
+session gets only the operations it can serve: health, capabilities, state,
+entities, commands, command output, wait, mark, events, save, snapshots, fork,
+restore and order - plus `mc_player`/`mc_context` once those mod APIs land -
+and never `mc_chat`, `mc_screen`, `mc_connect` or the other client-only tools.
+Before the daemon answers, the front-end registers the documented default
+server surface; once it answers, the live CAPS reply wins. Callers should
+still start with `mc_capabilities`, which returns the raw CAPS list plus the
+filtered `surface.supported` / `surface.unsupported` view with reasons.
 
 `mc_command` and `mc_command_output` exist because a command's *answer* is chat,
-not a return value: the first one just sends it, the second sends it and collects
-the feedback. Anything that reports data - `data get entity <name> Motion`,
-`player <name> ...`, mod commands - should use the second.
+not a return value: the first one just sends it, the second sends it and returns
+the answer - from the command reply on the server vantage, or from game/chat
+events on the client vantage. Anything that reports data - `data get entity
+<name> Motion`, `player <name> ...`, mod commands - should use the second.
 
 Verified against `mcp` 2.x (where the SDK renamed `FastMCP` to `MCPServer`) and
-1.x; the front-end picks whichever class the installed SDK provides.
+1.x; the front-end picks whichever class the installed SDK provides. It imports
+only the MCP SDK - no agent-framework SDK and no model client.
 
 The equivalent of the older `mc-codex-bridge` design was one special-purpose
 daemon per agent. Here the daemon is neutral and each agent attaches however it
@@ -199,11 +253,12 @@ if only the entities are interesting, pass `"regions": false`.
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `MC_AGENT_PORT_FILE` | - | explicit path to the mod's `port.txt` |
+| `MC_AGENT_SERVER_DIR` | - | game/server directory for server-vantage discovery |
 | `MC_AGENT_API_HOST` | `127.0.0.1` | host the MCP front-end dials |
 | `MC_AGENT_API_PORT` | `8765` | port the MCP front-end dials |
 
-The API binds to loopback only. It can run arbitrary commands as the player in
-the connected world, so treat the machine it runs on as trusted.
+The API binds to loopback only. It can run arbitrary commands as the server's
+command source, so treat the machine it runs on as trusted.
 
 ## Embedding the bridge
 
