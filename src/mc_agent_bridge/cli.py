@@ -86,6 +86,36 @@ def _cmd_mcp(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_forward(args: argparse.Namespace) -> int:
+    from .webhook import WebhookConfigError, WebhookForwarder, load_webhook_config
+
+    try:
+        config = load_webhook_config(
+            config_path=args.config,
+            events=args.events,
+            queue_size=args.queue,
+            max_attempts=args.max_attempts,
+            backoff=args.backoff,
+            max_backoff=args.max_backoff,
+            delivery_timeout=args.delivery_timeout,
+        )
+    except WebhookConfigError as error:
+        print(f"error: {error}", file=sys.stderr)
+        return 1
+
+    forwarder = WebhookForwarder(
+        config,
+        api_host=args.api_host,
+        api_port=args.api_port,
+        reconnect_delay=args.reconnect_delay,
+    )
+    try:
+        asyncio.run(forwarder.run())
+    except KeyboardInterrupt:
+        pass
+    return 0
+
+
 def _add_api_options(parser: argparse.ArgumentParser) -> None:
     """Loopback API options, accepted before or after the sub-command.
 
@@ -152,6 +182,26 @@ def build_parser() -> argparse.ArgumentParser:
     _add_api_options(mcp)
     mcp.add_argument("--transport", default="stdio")
     mcp.set_defaults(func=_cmd_mcp)
+
+    forward = sub.add_parser(
+        "forward", help="POST selected bridge events to a signed webhook URL"
+    )
+    _add_api_options(forward)
+    forward.add_argument(
+        "--config",
+        default=None,
+        help="JSON config file (default: $MC_AGENT_WEBHOOK_CONFIG); env vars override it",
+    )
+    forward.add_argument("--events", default=None, help="comma separated event categories to forward")
+    forward.add_argument("--queue", type=int, default=None, help="bounded in-memory event queue")
+    forward.add_argument("--max-attempts", type=int, default=None, help="delivery attempts per event")
+    forward.add_argument("--backoff", type=float, default=None, help="base retry backoff in seconds")
+    forward.add_argument("--max-backoff", type=float, default=None, help="retry backoff cap in seconds")
+    forward.add_argument(
+        "--delivery-timeout", type=float, default=None, help="per-request network timeout in seconds"
+    )
+    forward.add_argument("--reconnect-delay", type=float, default=2.0)
+    forward.set_defaults(func=_cmd_forward)
 
     return parser
 

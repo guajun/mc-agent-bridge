@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import os
 import time
+import uuid
 from collections import deque
 from typing import Any
 
@@ -104,6 +105,10 @@ class BridgeDaemon:
         self.connected = False
         self.last_error: str | None = None
         self.started_at = time.time()
+        #: Identifies this daemon run. Events get ``eventId = streamId:seq``, so
+        #: consumers (webhook forwarders, agent loops) can deduplicate retries
+        #: without coordinating with the daemon.
+        self.stream_id = uuid.uuid4().hex
 
         self._buffer: deque[dict[str, Any]] = deque(maxlen=buffer_size)
         self._seq = 0
@@ -175,6 +180,8 @@ class BridgeDaemon:
         self._seq += 1
         payload = dict(message)
         payload["seq"] = self._seq
+        payload["streamId"] = self.stream_id
+        payload["eventId"] = f"{self.stream_id}:{self._seq}"
         payload["category"] = category
         payload["receivedAt"] = int(time.time() * 1000)
         self._buffer.append(payload)
@@ -229,7 +236,7 @@ class BridgeDaemon:
                 "port": self.server.port,
                 "clients": len(self.server.clients),
             },
-            "events": {"buffered": len(self._buffer), "lastSeq": self._seq},
+            "events": {"buffered": len(self._buffer), "lastSeq": self._seq, "streamId": self.stream_id},
             "uptimeSeconds": round(time.time() - self.started_at, 3),
         }
 
