@@ -342,6 +342,7 @@ async def _mc_restore(
     expect_world_dir: str = "",
     expect_level: str = "",
     expect_dimension: str = "",
+    prior_tick_state: str = "auto",
     freeze: bool = True,
     forceload: bool = True,
     replace_existing: bool = False,
@@ -354,19 +355,24 @@ async def _mc_restore(
 
     The apply path validates the recording before touching anything, proves
     the destination endpoint (``expect_instance`` / ``expect_world_dir`` /
-    ``expect_level``), checks the recorded dimension, loads the recorded box,
-    refuses to duplicate leftovers unless ``replace_existing=True`` (which
-    kills the recorded box and ``save-all flush``es), freezes the tick,
-    summons in recorded order, re-snapshots and compares UUID order, counts,
-    positions, velocities and full NBT, then restores the prior tick state.
+    ``expect_level``), resolves the prior tick state (``prior_tick_state``:
+    ``auto`` reads ``/tick query`` and refuses if it cannot tell, or pass
+    ``frozen``/``running`` explicitly), freezes before taking pre-restore
+    evidence, checks the recorded dimension, loads the recorded box, refuses
+    to duplicate leftovers unless ``replace_existing=True`` (which clears the
+    box with ticks running, flushes, and re-freezes), summons in recorded
+    order, re-snapshots and compares UUID order, counts, positions, velocities
+    and full NBT, then restores the prior tick state.
 
     ``target`` is a label only - this bridge owns one mod connection, so a
     name cannot select a server. Prove the destination with the ``expect_*``
     arguments (an unproven destination is never written to). Always run dry
     first: the dry run returns the commands and the endpoint report without
-    sending one. ``ok`` is the verdict: ``false`` means commands issued or
-    state did not match, never a successful restore. Use ``mc_verify`` for
-    the same comparison after an externally driven restore.
+    sending one. ``ok``/``verdict`` are a state verdict: ``ok: true`` requires
+    a matching post-restore comparison; with ``verify=False`` the result is
+    ``verdict: "unverified"`` and ``ok: null``, never a successful restore.
+    Use ``mc_verify`` for the same comparison after an externally driven
+    restore.
     """
     return await call(
         "restore",
@@ -378,6 +384,7 @@ async def _mc_restore(
             "expect_world_dir": expect_world_dir or None,
             "expect_level": expect_level or None,
             "expect_dimension": expect_dimension or None,
+            "prior_tick_state": prior_tick_state or "auto",
             "freeze": freeze,
             "forceload": forceload,
             "replace_existing": replace_existing,

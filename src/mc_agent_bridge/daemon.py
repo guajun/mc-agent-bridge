@@ -545,10 +545,13 @@ class BridgeDaemon:
         The old behaviour was "send one ``/summon`` per entity and count the
         acks". That cannot tell commands issued from state restored, so the
         apply path now validates the recording first, proves which instance and
-        world it is about to write to, loads the recorded chunks, refuses to
-        duplicate leftovers (or clears them explicitly), freezes the tick, then
-        re-snapshots and compares full state before unfreezing. ``target`` stays
-        a label: the destination is proven with ``expect_instance`` /
+        world it is about to write to, resolves and holds the tick state
+        *before* taking evidence, refuses to duplicate leftovers (or clears
+        them while ticks run and re-freezes), then re-snapshots and compares
+        full state. ``ok`` is only ``true`` when that comparison ran and
+        matched; with ``verify=false`` the result is ``verdict: "unverified"``
+        and ``ok: null``, never a successful restore. ``target`` stays a label:
+        the destination is proven with ``expect_instance`` /
         ``expect_world_dir`` / ``expect_level`` and the recorded dimension,
         never by routing on a name this daemon cannot resolve.
         """
@@ -561,6 +564,7 @@ class BridgeDaemon:
         expect_world_dir = _text(params.get("expect_world_dir"))
         expect_level = _text(params.get("expect_level"))
         expect_dimension = _text(params.get("expect_dimension"))
+        prior_tick_state = str(params.get("prior_tick_state") or "auto").strip().lower()
         freeze = _as_bool(params.get("freeze"), default=True)
         forceload = _as_bool(params.get("forceload"), default=True)
         release_forceload = _as_bool(params.get("release_forceload"), default=False)
@@ -613,11 +617,44 @@ class BridgeDaemon:
         if dry_run:
             result["dryRun"] = True
             result["commands"] = plan["commands"]
-            result["ok"] = True
+            # A dry run mutated nothing, so it is neither a restore success nor
+            # a state verdict; the endpoint/validation checks are in `checks`.
+            result["ok"] = None
+            result["verified"] = False
+            result["verdict"] = "dry-run"
             return result
 
         box = restore.bounding_box(entities)
+        tick: dict[str, Any] = {
+            "prior": "unknown",
+            "priorSource": None,
+            "frozenByBridge": False,
+            "clearedWhileRunning": False,
+            "restored": None,
+        }
+        result["checks"]["tick"] = tick
+        frozen_by_bridge = False
+        issued = 0
+        attempted: list[dict[str, Any]] = []
+        failed: list[dict[str, Any]] = []
+        outputs: dict[int, list[str]] = {}
+        verification: dict[str, Any] | None = None
         try:
+            # Resolve the prior tick state, and freeze, before the first
+            # mutating call. Otherwise the baseline snapshot, the duplicate
+            # check and the clear run while the game keeps ticking, and a
+            # transient entity (a falling cart) can change between the
+            # evidence and the restore it justifies.
+            prior: bool | None = None
+            if freeze:
+                prior, prior_source = await self._resolve_prior_tick_state(prior_tick_state)
+                tick["prior"] = "frozen" if prior else "running"
+                tick["priorSource"] = prior_source
+                if not prior:
+                    await self._call_mod("CMD /tick freeze")
+                    frozen_by_bridge = True
+                tick["frozenByBridge"] = frozen_by_bridge
+
             if forceload and box is not None:
                 await self._call_mod(f"CMD {restore.forceload_add_command(box)}")
             _, baseline_meta, baseline_entities, baseline_dir = await self._take_snapshot(
@@ -653,6 +690,13 @@ class BridgeDaemon:
                     "then save-all flush) or pass replace_existing=true to let the bridge do it."
                 )
             if found["count"] and check_existing and replace_existing:
+                # A kill only resolves while the game runs: frozen kills leave
+                # dying-but-present entities and their drops behind. Clear with
+                # ticks running, then re-freeze before the recheck snapshot so
+                # the evidence is stable and the prior pause state comes back.
+                if freeze and (prior is True or frozen_by_bridge):
+                    await self._call_mod("CMD /tick unfreeze")
+                    tick["clearedWhileRunning"] = True
                 # Two passes: the first kill of a chest minecart drops its
                 # inventory as item entities, and the second removes those
                 # drops. The box is supposed to hold the recording, not the
@@ -660,6 +704,9 @@ class BridgeDaemon:
                 await self._call_mod(f"CMD {restore.clear_box_command(box)}")
                 await self._call_mod(f"CMD {restore.clear_box_command(box)}")
                 await self._call_mod("CMD /save-all flush")
+                if freeze and (prior is True or frozen_by_bridge):
+                    await self._call_mod("CMD /tick freeze")
+                    tick["refrozen"] = True
                 _, recheck_meta, recheck_entities, recheck_dir = await self._take_snapshot(
                     restore.snapshot_name("pre-cleared", target)
                 )
@@ -693,26 +740,26 @@ class BridgeDaemon:
                         f"{found['count']} duplicate(s) allowed by check_existing=false and left in place"
                     )
         except BaseException:
+            # Report the original failure, but not from a state the bridge
+            # itself changed: put the prior tick state back and release the
+            # box the caller asked to release.
+            if freeze and prior is True and tick.get("clearedWhileRunning") and not tick.get("refrozen"):
+                try:
+                    await self._call_mod("CMD /tick freeze")
+                    tick["refrozen"] = True
+                except Exception as error:  # noqa: BLE001 - the original failure matters more
+                    tick["refreezeError"] = str(error)
+            if frozen_by_bridge:
+                try:
+                    await self._call_mod("CMD /tick unfreeze")
+                    tick["restored"] = True
+                except Exception as error:  # noqa: BLE001 - the original failure matters more
+                    tick["restored"] = False
+                    tick["unfreezeError"] = str(error)
             if release_forceload and box is not None:
-                await self._forceload_remove_best_effort(box)
+                tick["forceloadReleased"] = await self._forceload_remove_best_effort(box)
             raise
 
-        tick: dict[str, Any] = {"prior": "unknown", "frozenByBridge": False, "restored": None}
-        frozen_by_bridge = False
-        if freeze:
-            prior = await self._tick_query()
-            tick["prior"] = "frozen" if prior is True else "running" if prior is False else "unknown"
-            if prior is not True:
-                await self._call_mod("CMD /tick freeze")
-                frozen_by_bridge = True
-            tick["frozenByBridge"] = frozen_by_bridge
-        result["checks"]["tick"] = tick
-
-        issued = 0
-        attempted: list[dict[str, Any]] = []
-        failed: list[dict[str, Any]] = []
-        outputs: dict[int, list[str]] = {}
-        verification: dict[str, Any] | None = None
         try:
             for item in plan["items"]:
                 if failed and not keep_going:
@@ -780,14 +827,46 @@ class BridgeDaemon:
             if release_forceload and box is not None:
                 tick["forceloadReleased"] = await self._forceload_remove_best_effort(box)
 
-        result["dryRun"] = False
-        result["issued"] = issued
-        result["failed"] = failed
-        result["notAttempted"] = len(plan["items"]) - len(attempted)
-        result["partial"] = bool(failed)
-        result["verification"] = verification
-        result["tick"] = tick
-        result["ok"] = not failed and bool((verification or {}).get("ok", True))
+        # `ok` is a state verdict, not an "it did not throw" flag. Without a
+        # post-restore snapshot there is no verdict: report unverified, never a
+        # successful restore. A prior tick state the bridge did not leave the
+        # way it found it is a real failure even when the entities matched.
+        if freeze:
+            if prior is True:
+                preserved = not (tick.get("clearedWhileRunning") and not tick.get("refrozen"))
+            else:
+                preserved = tick.get("restored") is True
+        else:
+            preserved = None
+        tick["preserved"] = preserved
+
+        if failed or preserved is False:
+            verdict, ok, verified = "failed", False, False
+        elif verification is None:
+            verdict, ok, verified = "unverified", None, False
+        elif verification.get("ok"):
+            verdict, ok, verified = "ok", True, True
+        else:
+            verdict, ok, verified = "failed", False, False
+        result.update(
+            {
+                "dryRun": False,
+                "issued": issued,
+                "failed": failed,
+                "notAttempted": len(plan["items"]) - len(attempted),
+                "partial": bool(failed),
+                "verification": verification,
+                "tick": tick,
+                "ok": ok,
+                "verified": verified,
+                "verdict": verdict,
+            }
+        )
+        if verdict == "unverified":
+            result["note"] = (
+                "post-restore verification was disabled: commands were issued, but this is not a "
+                "claim that the world was faithfully restored"
+            )
         return result
 
     async def _m_verify(self, params: dict[str, Any]) -> dict[str, Any]:
@@ -898,6 +977,34 @@ class BridgeDaemon:
         if not isinstance(output, list):
             return None
         return restore.tick_state_from_output(output)
+
+    async def _resolve_prior_tick_state(self, requested: str) -> tuple[bool, str]:
+        """Whether the destination was frozen before this call, and how we know.
+
+        ``auto`` reads ``/tick query``. An unreadable answer refuses instead of
+        guessing: freezing blind and unfreezing afterwards cannot preserve an
+        already-frozen world, and leaving it alone cannot control a running
+        one. The caller can state the state with ``prior_tick_state`` or opt
+        out of tick control with ``freeze=false``.
+        """
+        if requested == "frozen":
+            return True, "caller"
+        if requested == "running":
+            return False, "caller"
+        if requested != "auto":
+            raise ValueError("prior_tick_state must be auto, frozen or running")
+        answer = await self._tick_query()
+        if answer is True:
+            return True, "query"
+        if answer is False:
+            return False, "query"
+        raise restore.RestoreError(
+            "cannot determine whether the destination tick is frozen: /tick query answered in a "
+            "format this bridge cannot read and the mod reports no frozen flag. Nothing was "
+            "restored: freezing blind and unfreezing afterwards cannot preserve an already-frozen "
+            "world. Pass prior_tick_state='frozen' or 'running' if you know it, or freeze=false to "
+            "skip tick control."
+        )
 
     async def _forceload_remove_best_effort(self, box: tuple[float, ...]) -> bool:
         try:

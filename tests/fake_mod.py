@@ -90,9 +90,18 @@ class FakeMod:
         self.dimension = "minecraft:overworld"
         #: ``/tick freeze`` state, so ``/tick query`` answers truthfully.
         self.tick_frozen = False
+        #: When set, ``/tick query`` answers with exactly these lines (tests use
+        #: an unreadable answer to exercise the unknown-prior-state refusal).
+        self.tick_query_output: list[str] | None = None
+        #: Snapshot names are recorded here with the tick state they were taken
+        #: in, so tests can prove evidence was collected while frozen.
+        self.snapshot_tick_states: list[bool] = []
         #: CMD substring -> message: the fake answers that command with the
         #: message in its output instead of a silent success (server vantage).
         self.failing_commands: dict[str, str] = {}
+        #: CMD substring -> message: the fake answers with a protocol error, so
+        #: the bridge's ``_call_mod`` raises (transport-level failure).
+        self.raising_commands: dict[str, str] = {}
         #: UUIDs handed to summons whose NBT carries no UUID (test fixtures).
         self.summon_uuids: list[str] = []
         #: Called with each CMD body before the reply is built; tests use it to
@@ -250,17 +259,19 @@ class FakeMod:
         if self.on_command is not None:
             self.on_command(command)
         if command.startswith("tick query"):
-            return {
-                "type": "cmd_ack",
-                "detail": detail,
-                "output": [
+            output = self.tick_query_output
+            if output is None:
+                output = [
                     "The game is frozen." if self.tick_frozen else "The game is running normally."
-                ],
-            }
+                ]
+            return {"type": "cmd_ack", "detail": detail, "output": list(output)}
         if command.startswith("tick freeze"):
             self.tick_frozen = True
         elif command.startswith("tick unfreeze"):
             self.tick_frozen = False
+        for marker, message in self.raising_commands.items():
+            if marker in command:
+                return {"type": "error", "message": message}
         for marker, message in self.failing_commands.items():
             if marker in command:
                 return {"type": "cmd_ack", "detail": detail, "output": [message]}
@@ -305,6 +316,7 @@ class FakeMod:
 
     def take_snapshot(self, arguments: str) -> dict[str, Any]:
         """`SNAPSHOT [radius] [name]`: write the files the real mod would write."""
+        self.snapshot_tick_states.append(self.tick_frozen)
         if not self.snapshots_dir:
             return {"type": "error", "message": "SNAPSHOT is not enabled on this fake"}
         radius: float | None = None

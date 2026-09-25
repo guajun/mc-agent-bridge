@@ -132,6 +132,10 @@ class GuardedRestoreDaemonTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(result["commands"]), 2)
         self.assertTrue(result["commands"][0].startswith("/summon minecraft:chest_minecart 10.5 64.0 -3.5 "))
         self.assertTrue(result["checks"]["endpoint"]["verified"])
+        # A dry run mutated nothing, so it is not a restore success either.
+        self.assertIsNone(result["ok"])
+        self.assertFalse(result["verified"])
+        self.assertEqual(result["verdict"], "dry-run")
         self.assertEqual(self.mod.commands, [], "a dry run must not send a command")
 
     async def test_wrong_endpoint_is_refused_before_anything_is_sent(self) -> None:
@@ -191,6 +195,8 @@ class GuardedRestoreDaemonTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             [command for command in self.mod.commands if command.startswith("/summon ")], []
         )
+        self.assertIn("/tick unfreeze", self.mod.commands)
+        self.assertFalse(self.mod.tick_frozen, "a refusal must not leave the world frozen")
 
     async def test_pre_existing_duplicates_are_refused_with_evidence(self) -> None:
         directory = await self.fork_fixture()
@@ -205,13 +211,16 @@ class GuardedRestoreDaemonTests(unittest.IsolatedAsyncioTestCase):
             [command for command in self.mod.commands if command.startswith("/summon ")], []
         )
         self.assertEqual(len(self.mod.entity_records), 2, "the destination was not mutated")
+        self.assertIn("/tick unfreeze", self.mod.commands)
+        self.assertFalse(self.mod.tick_frozen, "a refusal must not leave the world frozen")
 
     async def test_replace_existing_clears_and_flushes_before_restoring(self) -> None:
         directory = await self.fork_fixture()
-        events: list[str] = []
+        self.mod.snapshot_tick_states.clear()
+        events: list[tuple[str, bool]] = []
 
         def on_command(command: str) -> None:
-            events.append(command)
+            events.append((command, self.mod.tick_frozen))
             if command.startswith("kill "):
                 self.mod.entity_records = []
 
@@ -231,17 +240,39 @@ class GuardedRestoreDaemonTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result["ok"], result["verification"])
         self.assertEqual(result["checks"]["existing"]["action"], "cleared+flushed")
         self.assertEqual(result["checks"]["existing"]["remainingCollisions"], 0)
+        self.assertEqual(result["checks"]["existing"]["remainingInBox"], 0)
         self.assertEqual(result["issued"], 2)
         self.assertEqual(result["failed"], [])
+        self.assertEqual(result["verdict"], "ok")
+        self.assertTrue(result["verified"])
 
         def first(prefix: str) -> int:
-            return next(index for index, event in enumerate(events) if event.startswith(prefix))
+            return next(index for index, event in enumerate(events) if event[0].startswith(prefix))
 
-        # The clear has to happen while the game can process the kill, the flush
-        # has to persist it, and only then may the tick freeze and the summons run.
+        def last(prefix: str) -> int:
+            return next(
+                index
+                for index in range(len(events) - 1, -1, -1)
+                if events[index][0].startswith(prefix)
+            )
+
+        # Freeze first so the evidence cannot age, unfreeze only for the kill
+        # (frozen kills leave dying entities and drops), re-freeze before the
+        # recheck, summon while frozen, and unfreeze last because we froze.
+        self.assertLess(first("tick freeze"), first("forceload"))
+        self.assertLess(first("tick freeze"), first("tick unfreeze"))
+        self.assertLess(first("tick unfreeze"), first("kill "))
         self.assertLess(first("kill "), first("save-all flush"))
-        self.assertLess(first("save-all flush"), first("tick freeze"))
-        self.assertLess(first("tick freeze"), first("summon "))
+        self.assertLess(first("save-all flush"), last("tick freeze"))
+        self.assertLess(last("tick freeze"), first("summon "))
+        self.assertLess(last("summon "), last("tick unfreeze"))
+        self.assertEqual(events[first("kill ")][1], False, "the kill must run while not frozen")
+        self.assertEqual(events[first("save-all flush")][1], False)
+        self.assertEqual(result["tick"]["clearedWhileRunning"], True)
+        self.assertTrue(result["tick"]["refrozen"])
+        self.assertTrue(result["tick"]["preserved"])
+        # Baseline, recheck and verification snapshots were taken frozen.
+        self.assertEqual(self.mod.snapshot_tick_states, [True, True, True])
 
     async def test_a_failed_summon_is_reported_and_the_verdict_is_false(self) -> None:
         directory = await self.fork_fixture()
@@ -292,6 +323,10 @@ class GuardedRestoreDaemonTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["summonable"], 2)
         self.assertEqual(len(result["skipped"]), 1)
         self.assertEqual(result["skipped"][0]["uuid"], PASSENGER["uuid"])
+        # Verification was disabled, so the result is explicitly unverified.
+        self.assertIsNone(result["ok"])
+        self.assertFalse(result["verified"])
+        self.assertEqual(result["verdict"], "unverified")
         summons = [command for command in self.mod.commands if command.startswith("/summon ")]
         self.assertEqual(len(summons), 2)
         self.assertNotIn(PASSENGER["uuid"], " ".join(summons))
@@ -305,7 +340,9 @@ class GuardedRestoreDaemonTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(result["ok"], result["verification"])
         self.assertEqual(result["tick"]["prior"], "frozen")
+        self.assertEqual(result["tick"]["priorSource"], "query")
         self.assertFalse(result["tick"]["frozenByBridge"])
+        self.assertTrue(result["tick"]["preserved"])
         self.assertNotIn("/tick freeze", self.mod.commands)
         self.assertNotIn("/tick unfreeze", self.mod.commands)
 
@@ -316,11 +353,107 @@ class GuardedRestoreDaemonTests(unittest.IsolatedAsyncioTestCase):
         result = await self.api.call("restore", {"directory": directory, "dry_run": False})
 
         self.assertEqual(result["tick"]["prior"], "running")
+        self.assertEqual(result["tick"]["priorSource"], "query")
         self.assertTrue(result["tick"]["frozenByBridge"])
         self.assertTrue(result["tick"]["restored"])
+        self.assertTrue(result["tick"]["preserved"])
         self.assertIn("/tick freeze", self.mod.commands)
         self.assertIn("/tick unfreeze", self.mod.commands)
         self.assertFalse(self.mod.tick_frozen)
+
+    async def test_verification_disabled_is_never_a_success(self) -> None:
+        """P1 regression: verify=false must never report ok=true.
+
+        The destination is missing an entity on purpose; with verification
+        skipped the bridge cannot know, so the honest verdict is unverified,
+        not a successful restore.
+        """
+        directory = await self.fork_fixture()
+        self.destination_is_empty()
+        self.mod.failing_commands["minecraft:diamond"] = "Unable to summon entity"
+        self.mod.lines.clear()
+
+        result = await self.api.call(
+            "restore", {"directory": directory, "dry_run": False, "verify": False}
+        )
+
+        self.assertIsNot(result["ok"], True, "commands issued is not restored state")
+        self.assertIsNone(result["ok"])
+        self.assertFalse(result["verified"])
+        self.assertEqual(result["verdict"], "unverified")
+        self.assertIsNone(result["verification"])
+        self.assertEqual(result["issued"], 2)
+        self.assertEqual(result["failed"], [])
+        self.assertIn("not a claim", result["note"])
+
+    async def test_verification_disabled_still_reports_transport_failures(self) -> None:
+        directory = await self.fork_fixture()
+        self.destination_is_empty()
+        self.mod.raising_commands["minecraft:diamond"] = "the game refused the command"
+
+        result = await self.api.call(
+            "restore", {"directory": directory, "dry_run": False, "verify": False}
+        )
+
+        self.assertIs(result["ok"], False)
+        self.assertFalse(result["verified"])
+        self.assertEqual(result["verdict"], "failed")
+        self.assertEqual(len(result["failed"]), 1)
+        self.assertIn("refused", result["failed"][0]["error"])
+        self.assertEqual(result["notAttempted"], 1, "fail-fast stops the batch")
+
+    async def test_unknown_prior_tick_state_refuses_before_mutation(self) -> None:
+        directory = await self.fork_fixture()
+        self.destination_is_empty()
+        self.mod.tick_query_output = ["参数错误"]
+        self.mod.lines.clear()
+
+        with self.assertRaises(RuntimeError) as caught:
+            await self.api.call("restore", {"directory": directory, "dry_run": False})
+        self.assertIn("cannot determine", str(caught.exception))
+        self.assertEqual(self.mod.commands, ["/tick query"], "nothing after the failed query")
+        self.assertFalse((self.snapshots / "restore-pre").exists())
+        self.assertEqual(len(self.mod.entity_records), 0)
+
+    async def test_prior_tick_state_can_be_stated_explicitly(self) -> None:
+        directory = await self.fork_fixture()
+        self.destination_is_empty()
+        self.mod.tick_query_output = ["参数错误"]
+        self.mod.lines.clear()
+
+        result = await self.api.call(
+            "restore",
+            {"directory": directory, "dry_run": False, "prior_tick_state": "running"},
+        )
+        self.assertEqual(result["tick"]["prior"], "running")
+        self.assertEqual(result["tick"]["priorSource"], "caller")
+        self.assertTrue(result["ok"], result["verification"])
+        self.assertNotIn("/tick query", self.mod.commands)
+        self.assertIn("/tick freeze", self.mod.commands)
+
+        # A stated frozen state is left frozen: no freeze and no unfreeze.
+        self.mod.tick_frozen = True
+        self.mod.entity_records = []
+        self.mod.lines.clear()
+        result = await self.api.call(
+            "restore",
+            {"directory": directory, "dry_run": False, "prior_tick_state": "frozen"},
+        )
+        self.assertEqual(result["tick"]["priorSource"], "caller")
+        self.assertFalse(result["tick"]["frozenByBridge"])
+        self.assertTrue(result["tick"]["preserved"])
+        self.assertTrue(result["ok"], result["verification"])
+        self.assertNotIn("/tick query", self.mod.commands)
+        self.assertNotIn("/tick freeze", self.mod.commands)
+        self.assertNotIn("/tick unfreeze", self.mod.commands)
+
+    async def test_an_invalid_prior_tick_state_is_a_parameter_error(self) -> None:
+        directory = await self.fork_fixture()
+        with self.assertRaises(RuntimeError) as caught:
+            await self.api.call(
+                "restore", {"directory": directory, "dry_run": False, "prior_tick_state": "maybe"}
+            )
+        self.assertIn("prior_tick_state", str(caught.exception))
 
     async def test_a_failed_verification_snapshot_is_not_a_success(self) -> None:
         directory = await self.fork_fixture()
@@ -364,6 +497,8 @@ class GuardedRestoreDaemonTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             [command for command in self.mod.commands if command.startswith("/summon ")], []
         )
+        self.assertIn("/tick unfreeze", self.mod.commands)
+        self.assertFalse(self.mod.tick_frozen, "a refusal must not leave the world frozen")
 
     async def test_verify_reports_inventory_change_even_when_the_order_hash_matches(self) -> None:
         directory = await self.fork_fixture()

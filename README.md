@@ -145,7 +145,7 @@ to subscribed connections.
 | `snapshot` | `radius`, `name` | `SNAPSHOT [radius] [name]` (entities + tick order, on the instance's disk) |
 | `snapshots` | - | `SNAPSHOTS` (what is already on the instance) |
 | `fork` | `name`, `radius`, `regions`, `world_dir`, `freeze` | freeze → `save-all flush` → `SNAPSHOT` → copy the world → unfreeze |
-| `restore` | `directory`, `dry_run`, `target`, `expect_instance`, `expect_world_dir`, `expect_level`, `expect_dimension`, `freeze`, `forceload`, `release_forceload`, `check_existing`, `replace_existing`, `keep_going`, `verify`, `strict`, `verify_radius`, `pos_tolerance`, `vel_tolerance`, `ignore_nbt_keys` | validate → prove endpoint → load box → baseline/dimension/duplicate checks → freeze → `/summon` per entity in recorded order → full-state compare → unfreeze (dry run by default; see `docs/restore.md`) |
+| `restore` | `directory`, `dry_run`, `target`, `expect_instance`, `expect_world_dir`, `expect_level`, `expect_dimension`, `prior_tick_state`, `freeze`, `forceload`, `release_forceload`, `check_existing`, `replace_existing`, `keep_going`, `verify`, `strict`, `verify_radius`, `pos_tolerance`, `vel_tolerance`, `ignore_nbt_keys` | validate → prove endpoint → resolve/freeze tick → load box → baseline/dimension/duplicate checks → clear with ticks running and re-freeze when replacing → `/summon` per entity in recorded order → full-state compare → restore tick state (dry run by default; see `docs/restore.md`) |
 | `verify` | `directory`, `target`, `strict`, `snapshot_radius`, tolerances | re-snapshot and compare UUID order, counts, positions, velocities and NBT with a fork |
 | `order` | `directory`, `target` | re-snapshot and compare `orderHash` with a fork |
 | `stop` | - | shut the daemon down |
@@ -315,11 +315,14 @@ mc-bridge call fork '{"name": "before-fight", "radius": 64}'
 #    point a bridge at that instance (here on a second API port). Dry-run first:
 mc-bridge --api-port 8799 call restore '{"directory": "C:/mc-agent/snapshots/before-fight", "target": "lab", "expect_world_dir": "C:/lab/saves/world"}'
 
-# 4. Apply under guard: endpoint + dimension + duplicate checks, freeze, summon
-#    in order, then compare full state (uuid order, counts, pos, vel, NBT).
+# 4. Apply under guard: endpoint + dimension + duplicate checks, freeze-first
+#    so the evidence cannot age, sequential summons in order, then compare full
+#    state (uuid order, counts, pos, vel, NBT) and restore the tick state.
 mc-bridge --api-port 8799 call restore '{"directory": "C:/mc-agent/snapshots/before-fight", "target": "lab", "expect_world_dir": "C:/lab/saves/world", "dry_run": false}'
-# "ok": true only when every entity came back; a failed summon or a changed
-# inventory is "ok": false with a per-entity mismatch report.
+# "ok": true only when the post-restore comparison matched and the tick state
+# is back ("verdict": "ok", "verified": true). With "verify": false the
+# result is "verdict": "unverified", "ok": null: commands issued, but never a
+# claim that the world was faithfully restored.
 
 # 5. The hash-only acceptance test remains available, and the full-state
 #    comparison can be run on its own after a manual restore:
@@ -329,13 +332,16 @@ mc-bridge --api-port 8799 call verify '{"directory": "C:/mc-agent/snapshots/befo
 
 `restore` is a dry run until you say otherwise: it returns the commands, the
 validation warnings and a proof of the connected endpoint without sending one.
-The apply path refuses to write to a destination it cannot prove, refuses to
-duplicate leftovers unless `replace_existing=true` clears them first, freezes
-the tick and preserves the prior freeze state, and treats a summon whose entity
-does not appear in the post-restore snapshot as a failure (the game's own
-message is attached as evidence, never parsed). `docs/restore.md` has the full
-workflow and the division between what the bridge automates and what the caller
-still owns.
+The apply path refuses to write to a destination it cannot prove, resolves the
+prior tick state before freezing (an unreadable `/tick query` refuses unless
+`prior_tick_state` is stated), freezes before taking evidence so nothing moves
+under it, refuses to duplicate leftovers unless `replace_existing=true` clears
+them while ticks run and re-freezes, and treats a summon whose entity does not
+appear in the post-restore snapshot as a failure (the game's own message is
+attached as evidence, never parsed). A state verdict is only `ok: true` when
+that comparison ran and matched; `verify=false` returns `unverified`/`null`,
+not success. `docs/restore.md` has the full workflow and the division between
+what the bridge automates and what the caller still owns.
 
 Both `restore` and `order` take a `target`; it is a **label** naming the lab
 instance for the record and the throwaway snapshot names, never a router - a
