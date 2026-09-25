@@ -26,11 +26,20 @@ instead:
 | `expect_world_dir` | `STATE.worldDir` - the save directory the connected server actually owns. Best proof that a lab is not the live world. |
 | `expect_level` | `STATE.levelName`, a weaker but cheap label. |
 
-Every one of these is checked against a live `STATE` reply *before* a command is
-sent, and an expectation that cannot be verified (STATE has no `worldDir`, say)
-is a refusal - "cannot verify" is not "verified". If the values do not match,
-the error names the field, the expected value, the actual value, and says
-nothing was sent and that a label does not route.
+Every one of these is checked against the live endpoint report *before* a
+command is sent; `expect_instance` comes from the mod's hello/CAPS frame (the
+only source of the instance name) and the other two from `STATE`. An
+expectation that cannot be verified (STATE has no `worldDir`, say) is a
+refusal - "cannot verify" is not "verified". If the values do not match, the
+error names the field, the expected value, the actual value, and says nothing
+was sent and that a label does not route.
+
+For an apply (`dry_run=false`) at least one of the three is **required**:
+no proof means no mutation. `allow_unproven_destination=true` is the explicit
+override for a caller who knows what it is writing to; it is recorded in
+`checks.endpoint.overridden` and `checks.endpoint.action`. A failed `STATE`
+refuses an apply with or without an expectation unless that override is given.
+Dry runs never mutate, so they may be called without a proof.
 
 `expect_world_dir` is the guard against the original failure mode: pointing a
 bridge at the source world while passing the lab's name as a label. For a lab
@@ -48,7 +57,8 @@ sequence and refuses at the first unsafe step:
    field inconsistencies are warnings because the file's line order drives the
    restore. Passengers (`"restorable": false`) are skipped and reported, never
    summoned twice.
-2. **Prove the endpoint** with the `expect_*` parameters above.
+2. **Prove the endpoint** with the `expect_*` parameters above; an apply
+   without a proof, or with a failed `STATE`, refuses before any other call.
 3. **Resolve the prior tick state, and freeze, before taking any evidence.**
    `prior_tick_state=auto` reads `/tick query`; if that answer cannot be read
    the restore refuses before sending anything else, because guessing would
@@ -63,14 +73,18 @@ sequence and refuses at the first unsafe step:
    **dimension check**: the destination's primary dimension must equal the
    recording's (`expect_dimension` overrides explicitly).
 6. **Duplicate check**: same UUID, or the same entity type within
-   `collision_radius` (default 0.75 blocks) of a recorded position. A collision
-   refuses the restore with samples of the leftovers. `replace_existing=true`
-   clears the recorded box (`kill @e[type=!player,...]` twice - the first kill
-   of a chest minecart drops its inventory, the second removes those drops),
-   runs that clear with ticks *running* (frozen kills leave dying-but-present
-   entities), `save-all flush`es, re-freezes, re-snapshots and refuses if
-   anything is still inside the box. `check_existing=false` is the escape hatch
-   for callers who manage leftovers themselves.
+   `collision_radius` (default 0.75 blocks) of a recorded position. Each
+   leftover is counted once. A collision refuses the restore with samples of
+   the leftovers. `replace_existing=true` issues one narrow `kill` per detected
+   collision - `@e[type=<leftover type>,x=<leftover pos>,distance=..<r>]` - plus
+   a `minecraft:item` kill at the same spots for the inventory a killed chest
+   minecart drops. It never kills a padded volume, so unrelated entities are
+   left alone. The clear runs with ticks *running* (frozen kills leave
+   dying-but-present entities), `save-all flush`es, re-freezes, re-snapshots
+   and refuses if anything is still at a recorded position or collides.
+   `check_existing=false` is the escape hatch for callers who manage leftovers
+   themselves; combining it with `replace_existing=true` is a parameter error,
+   not a silent no-op.
 7. **Summon sequentially** in recorded order, still frozen. A command-level
    error (the mod refuses the line) stops the batch unless `keep_going=true`.
    A command that answers but whose entity never appears - the failure mode
@@ -79,14 +93,19 @@ sequence and refuses at the first unsafe step:
    game's text is locale-dependent, so it is never parsed for success/failure.
 8. **Verify** (unless `verify=false`): a fresh snapshot, still frozen, is
    compared with the recording - UUID order and `orderHash`, per-type counts,
-   positions, velocities and the full NBT string (including `Items`). Extra
-   destination entities fail `strict=true` (default) and are reported as
-   incidental with `strict=false`.
+   dimension, positions, velocities and the full NBT string (including
+   `Items`). Malformed destination records fail the comparison instead of
+   quietly dropping a field, and a position or velocity present on one side
+   only is a mismatch. Extra destination entities fail `strict=true` (default)
+   and are reported as incidental with `strict=false`.
 9. **Restore the tick state** found in step 3: unfreeze if and only if the
    bridge froze a running world; a world that was frozen is left frozen (after
    the temporary unfreeze a clear needs, it is re-frozen). A failure to put the
    tick state back is reported in `tick.unfreezeError`/`tick.refreezeError` and
-   makes the verdict fail rather than hiding.
+   makes the verdict fail rather than hiding it. A `freeze_timeout_seconds`
+   watchdog releases the world if the restore never reaches its handlers; its
+   firing also fails the verdict, because the comparison no longer ran under a
+   controlled tick.
 
 The result carries a state verdict, not an "it did not throw" flag:
 
@@ -112,12 +131,15 @@ commands failed or were not attempted after a failure.
 | `directory` | - | The fork directory (`mc_fork`'s `snapshotDir`). |
 | `dry_run` | `true` | Return validation, endpoint report and commands; send nothing. |
 | `target` | - | Label only; names the baseline/check snapshots. |
-| `expect_instance` / `expect_world_dir` / `expect_level` | - | Destination proofs (see above). |
+| `expect_instance` / `expect_world_dir` / `expect_level` | - | Destination proofs (see above); at least one is required for an apply. |
+| `allow_unproven_destination` | `false` | Explicitly permit an apply with no proof or a failed `STATE`; recorded in `checks.endpoint.overridden`. |
 | `expect_dimension` | recording's | Override the dimension requirement explicitly. |
 | `prior_tick_state` | `auto` | `auto` reads `/tick query` and refuses if unreadable; `frozen`/`running` state it explicitly. |
 | `freeze` | `true` | Controlled tick state for the restore. |
+| `freeze_timeout_seconds` | `300` | Watchdog: unfreeze if the restore is still running this long after freezing; `0` disables. |
 | `forceload` / `release_forceload` | `true` / `false` | Load the recorded box; release it afterwards. |
-| `check_existing` / `replace_existing` | `true` / `false` | Refuse duplicates, or clear and re-check them. |
+| `check_existing` / `replace_existing` | `true` / `false` | Refuse duplicates, or kill the detected collisions (plus their drops) at their own positions and re-check. |
+| `collision_radius` | `0.75` | Same-type distance that counts as a duplicate. |
 | `keep_going` | `false` | Continue after a command failure (default fail fast). |
 | `verify` / `strict` | `true` / `true` | Full-state comparison; `strict=false` tolerates extra entities. |
 | `verify_radius` | every entity | Radius for the verification snapshot. |
@@ -126,7 +148,17 @@ commands failed or were not attempted after a failure.
 
 `verify` (and the MCP `mc_verify` tool) runs the same comparison without
 restoring - use it after an externally driven restore, or to prove "the order
-hash matches but an inventory did not".
+hash matches but an inventory did not". It validates the destination snapshot
+itself too (counts/hash/malformed records) and fails on a dimension mismatch,
+so a `the_nether` snapshot with identical entities is not `ok` against an
+overworld recording.
+
+After a real server restart the tick order is rebuilt by chunk load order, so
+the strict comparison may fail on order alone. Use `strict=false` and check
+`missing: 0`, `unexpected: 0` and `counts.match: true` for the no-respawn
+acceptance; `dimension` and the per-entity fields are still required. A
+`strict=false` `ok` additionally requires the recorded UUIDs to appear in the
+same relative order, which a restart does not guarantee.
 
 ## What callers must still do
 
@@ -147,16 +179,22 @@ The bridge does not choose the destination or copy the world for you:
    rather than guessing whether the world was frozen.
 4. After a successful restore, if you need to prove the copied disk entities do
    not respawn, stop the lab, start it again (a real chunk reload) and run
-   `verify` again: the entity *set* must still be the recording. Tick order is
-   rebuilt at load time, so a restart is a set/count check, not an order check.
+   `verify` with `strict=false` again: check `missing: 0`, `unexpected: 0` and
+   `counts.match: true`. Tick order is rebuilt at load time, so a restart is a
+   set/count check, not an order promise; `strict=false` still compares every
+   field of every shared entity and the dimension.
 
 ## Live acceptance (26.2 Fabric lab, generic stacked chest minecarts)
 
 The E2E run for this change used two fresh dedicated servers (no player, server
-vantage, interface mod 0.5.2, Fabric loader 0.19.5, Java 25), built a 3-cart
-stacked chest-minecart fixture in the source lab with distinct items in each
-cart, forked it, loaded the copy into a destination lab, and restored it under
-guard.
+vantage), built a 3-cart stacked chest-minecart fixture in the source lab with
+distinct items in each cart, forked it, loaded the clean copy into a destination
+lab, and restored it under guard.
+
+Build under test: interface mod **0.6.0**, a clean build whose source commit is
+`3b93ceb137f8e05624d9d443356c0db78c4b4751` and whose jar SHA-256 is
+`45f12e16b3979be6a699ac3c744b2a68dfcf8dd2379f5987bf9b9319adf4404f`;
+Fabric loader 0.19.5, Java 25.0.1, Minecraft 26.2.
 
 Fixture and result, taken from `source-before` / `bridge6-fixture` and from the
 verification snapshot after a real server restart:
@@ -174,12 +212,12 @@ What the run proved, with the evidence kept under `labs/evidence/`:
 | --- | --- |
 | wrong `expect_world_dir` (source world) | refused before any command: "the label `target` does not route" |
 | dry run | 3 commands, endpoint verified, nothing sent |
-| guarded apply | `ok: true`, 3/3 summoned, order hash `a663c5c0dfd7ec6f` identical, positions/velocities/NBT/items identical, tick frozen and unfrozen |
-| second restore without replacement | refused with 3 UUID + 3 spatial collisions, no mutation, tick state restored on the refusal |
-| `replace_existing` | freeze first, unfreeze for a two-pass kill + `save-all flush`, re-freeze, `remainingCollisions: 0`, `remainingInBox: 0`, exact restore, `tick.preserved: true` |
-| `verify=false` (P1 regression) | `ok: null`, `verdict: "unverified"`, `verified: false`, `verification: null`; a separate `verify` afterwards is `ok: true` |
+| guarded apply | `ok: true`/`verdict: ok`/`verified: true`, 3/3 summoned, dimension/order hash `a663c5c0dfd7ec6f`/counts/positions/velocities/NBT/items identical, `tick: {prior: running, frozenByBridge: true, restored: true, preserved: true}` |
+| second restore without replacement | refused with 3 UUID collisions (spatial 0, no double count), no mutation, tick state restored on the refusal |
+| `replace_existing` | six narrow kill commands, one per collision position plus its item drop (`kill @e[type=minecraft:chest_minecart,x=0.5,y=100.0,z=0.5,distance=..1]` ...), `remainingCollisions: 0`, `remainingAtRecordedPositions: 0`, exact restore, `tick.preserved: true` |
+| `verify=false` | `ok: null`, `verdict: "unverified"`, `verified: false`, `verification: null`; a separate `verify` afterwards is `ok: true` |
 | live inventory mutation (`Items[0].count` 5/2/7 -> 64) | `verify` `ok: false`, order hash unchanged, 3 `nbtMismatches` with both inventory fragments; guarded repair `ok: true` |
-| server stop/start (real chunk reload) | 3 entities, 0 missing, 0 unexpected, exact items, order hash unchanged |
+| server stop/start (real chunk reload) | `verify strict=false`: 3 entities, 0 missing, 0 unexpected, counts/dimension/NBT match |
 | source world after the whole run | full-state comparison against `source-before`: unchanged |
 
 The fork manifest also confirmed the 26.2 layout live: entity storage under
@@ -187,7 +225,20 @@ The fork manifest also confirmed the 26.2 layout live: entity storage under
 (`"stripped"` in the manifest), and after the reload no copied entity respawned
 alongside the restored ones.
 
-The refusal for an unreadable prior tick state (`prior_tick_state=auto` with a
-non-English `/tick query`) is covered by the daemon regression
-`test_unknown_prior_tick_state_refuses_before_mutation`; the live server answers
-in `en_us`, so the query parses there by design.
+The paths that need a real refusal rather than a live demonstration are covered
+by daemon regressions because the dedicated server answers in `en_us`: an
+unreadable `/tick query` (`test_unknown_prior_tick_state_refuses_before_mutation`),
+an apply without an endpoint proof (`test_apply_without_an_endpoint_proof_refuses_before_any_command`),
+a failed `STATE` (`test_apply_refuses_when_state_fails_and_a_proof_was_given`),
+a failed unfreeze (`test_a_failed_unfreeze_fails_the_verdict_and_is_reported`),
+the freeze watchdog (`test_the_freeze_watchdog_releases_a_stuck_restore`),
+`verify` dimension/malformed-input failures and the narrow clear targeting.
+
+### Reproducing and retained evidence
+
+The driver is `labs/live_verify.py` with stages `setup`, `fork`, `restore`,
+`duplicate`, `mutate`, `unverified`, `after-reload`, `source-final`. It writes
+`labs/evidence/<stage>.json` plus `summary.json`, and `labs/evidence/index.json`
+records the bridge commit, the interface jar path/hash and source commit, the
+runtime versions, the ports, and a SHA-256 of every evidence file, so a later
+reader can tell whether the retained files are the ones the report describes.

@@ -318,6 +318,11 @@ def restore_plan(entities: Sequence[dict[str, Any]]) -> dict[str, Any]:
 # --------------------------------------------------------------- destination boxes
 
 
+def positions_of(entities: Sequence[dict[str, Any]]) -> list[tuple[float, float, float]]:
+    """The recorded positions, for collision and post-clear proximity checks."""
+    return [point for point in (_vec(entity.get("pos")) for entity in entities) if point]
+
+
 def bounding_box(
     entities: Sequence[dict[str, Any]], margin: float = 16.0
 ) -> tuple[float, float, float, float, float, float] | None:
@@ -362,26 +367,25 @@ def forceload_remove_command(box: tuple[float, float, float, float, float, float
     )
 
 
-def entities_in_box(
-    entities: Sequence[dict[str, Any]], box: tuple[float, float, float, float, float, float]
+def near_positions(
+    entities: Sequence[dict[str, Any]],
+    positions: Sequence[tuple[float, float, float]],
+    radius: float,
 ) -> list[dict[str, Any]]:
-    """Entities whose position lies inside the recorded box.
+    """Entities within ``radius`` of any recorded position.
 
-    Used after ``replace_existing`` cleared and flushed: the box is supposed
-    to be empty, so anything still here is a leftover the restore would place
-    next to (most commonly the item drops a killed chest minecart leaves).
+    Used after a clear: anything this close to a recorded position is a
+    leftover the restore would place next to (most commonly the item drops a
+    killed chest minecart leaves). This is deliberately *not* a volume around
+    the recording - unrelated entities elsewhere are not evidence and must not
+    be touched or blocked on.
     """
-    min_x, min_y, min_z, max_x, max_y, max_z = box
     inside: list[dict[str, Any]] = []
     for entity in entities:
         position = _vec(entity.get("pos"))
         if position is None:
             continue
-        if (
-            min_x <= position[0] <= max_x
-            and min_y <= position[1] <= max_y
-            and min_z <= position[2] <= max_z
-        ):
+        if any(math.dist(position, point) <= radius for point in positions):
             inside.append(
                 {
                     "uuid": str(entity.get("uuid") or ""),
@@ -392,21 +396,42 @@ def entities_in_box(
     return inside
 
 
-def clear_box_command(box: tuple[float, float, float, float, float, float]) -> str:
-    """``/kill`` every non-player entity inside the recorded box.
+def clear_commands(
+    targets: Sequence[dict[str, Any]], radius: float = COLLISION_RADIUS
+) -> list[str]:
+    """Narrow ``/kill`` commands for the detected leftovers, plus their drops.
 
-    Selector coordinates are floors with a one-block pad, and the ``dx/dy/dz``
-    select the volume inclusively enough that an entity exactly on the boundary
-    is still cleared. Players are preserved: they are not restorable and the
-    restore must not touch them.
+    Every command selects one entity type within a small radius of the
+    leftover's own position, so only entities at the collision itself are hit -
+    not a padded volume around the recording. The ``minecraft:item`` pass
+    removes the inventory a killed chest minecart drops; it gets a wider radius
+    because those drops fall while the game runs.
     """
-    x = math.floor(box[0])
-    y = math.floor(box[1])
-    z = math.floor(box[2])
-    dx = math.ceil(box[3]) - x + 1
-    dy = math.ceil(box[4]) - y + 1
-    dz = math.ceil(box[5]) - z + 1
-    return f"kill @e[type=!player,x={x},y={y},z={z},dx={dx},dy={dy},dz={dz}]"
+    kill_radius = max(float(radius), 0.5) + 0.25
+    drop_radius = max(2.0, kill_radius * 2.0)
+    commands: list[str] = []
+    seen: set[tuple[str, tuple[float, ...]]] = set()
+    positions: set[tuple[float, ...]] = set()
+    for target in targets:
+        position = _vec(target.get("pos"))
+        if position is None:
+            continue
+        rounded = tuple(round(value, 3) for value in position)
+        positions.add(rounded)
+        key = (str(target.get("type") or ""), rounded)
+        if key in seen:
+            continue
+        seen.add(key)
+        entity_type = str(target.get("type") or "")
+        x, y, z = (repr(float(value)) for value in position)
+        selector = f"type={entity_type}" if entity_type else "type=!player"
+        commands.append(f"kill @e[{selector},x={x},y={y},z={z},distance=..{kill_radius:g}]")
+    for position in sorted(positions):
+        x, y, z = (repr(float(value)) for value in position)
+        commands.append(
+            f"kill @e[type=minecraft:item,x={x},y={y},z={z},distance=..{drop_radius:g}]"
+        )
+    return commands
 
 
 # ------------------------------------------------------------------- comparison
@@ -533,12 +558,19 @@ def strip_top_level_keys(nbt: str, keys: Iterable[str]) -> str:
 
 
 def nbt_fragment(nbt: str, key: str = "Items") -> str | None:
-    """The raw ``Items:[...]``/``Items:{...}`` fragment, for evidence reports.
+    """The raw top-level ``Items:[...]``/``Items:{...}`` fragment.
 
     Extracting the inventory fragment is what lets a mismatch report say what
     changed instead of "NBT differs": a hash-only verdict would not show the
-    item that vanished.
+    item that vanished. A nested ``components.Items`` must not shadow the
+    top-level inventory, so the outer object is split at depth 1 first.
     """
+    items = _split_top_level(nbt)
+    if items is not None:
+        for name, value in items:
+            if name == key and value[:1] in "[{":
+                return value
+        return None
     marker = f'"{key}":'
     position = nbt.find(marker)
     if position < 0:
@@ -601,6 +633,43 @@ def compare_snapshots(
     expected_index = _view(expected)
     actual_index = _view(actual)
 
+    expected_dimension = str(expected_meta.get("dimension") or "").strip() or None
+    actual_dimension = str(actual_meta.get("dimension") or "").strip() or None
+    dimension_match: bool | None
+    if expected_dimension is None:
+        dimension_match = None  # the recording does not say; nothing to require
+    else:
+        dimension_match = actual_dimension == expected_dimension
+
+    # A malformed actual record (unreadable position/velocity, missing type or
+    # uuid, duplicated uuid) must fail the comparison instead of quietly
+    # dropping the field it could not parse.
+    malformed: list[dict[str, Any]] = []
+    actual_uuid_counts: Counter[str] = Counter()
+    for index, record in enumerate(actual):
+        problems: list[str] = []
+        if not isinstance(record, dict):
+            malformed.append({"index": index, "uuid": None, "problems": ["not a JSON object"]})
+            continue
+        uuid = record.get("uuid")
+        if not isinstance(uuid, str) or not uuid:
+            problems.append("uuid")
+        else:
+            actual_uuid_counts[uuid] += 1
+        if not isinstance(record.get("type"), str) or not record.get("type"):
+            problems.append("type")
+        if _vec(record.get("pos")) is None:
+            problems.append("pos")
+        if "vel" in record and _vec(record.get("vel")) is None:
+            problems.append("vel")
+        if problems:
+            malformed.append(
+                {"index": index, "uuid": uuid if isinstance(uuid, str) else None, "problems": problems}
+            )
+    duplicate_actual_uuids = sorted(
+        uuid for uuid, times in actual_uuid_counts.items() if times > 1
+    )
+
     expected_counts = Counter(str(record.get("type") or "(missing type)") for record in expected)
     actual_counts = Counter(str(record.get("type") or "(missing type)") for record in actual)
     rows = []
@@ -633,20 +702,39 @@ def compare_snapshots(
             type_mismatches.append({"uuid": uuid, "expected": want_type, "actual": got_type})
         want_pos = _vec(want.get("pos"))
         got_pos = _vec(got.get("pos"))
-        if want_pos is not None and got_pos is not None:
-            distance = math.dist(want_pos, got_pos)
-            if distance > pos_tolerance:
+        if want_pos is not None or got_pos is not None:
+            if want_pos is None or got_pos is None:
                 position_deltas.append(
                     {
                         "uuid": uuid,
                         "type": want_type or got_type,
-                        "distance": round(distance, 6),
-                        "components": [round(got_pos[i] - want_pos[i], 6) for i in range(3)],
+                        "distance": None,
+                        "reason": "position missing or malformed on one side",
                     }
                 )
+            else:
+                distance = math.dist(want_pos, got_pos)
+                if distance > pos_tolerance:
+                    position_deltas.append(
+                        {
+                            "uuid": uuid,
+                            "type": want_type or got_type,
+                            "distance": round(distance, 6),
+                            "components": [round(got_pos[i] - want_pos[i], 6) for i in range(3)],
+                        }
+                    )
         want_vel = _motion(want)
         got_vel = _motion(got)
-        if want_vel is not None and got_vel is not None:
+        if want_vel is not None and got_vel is None:
+            velocity_deltas.append(
+                {
+                    "uuid": uuid,
+                    "type": want_type or got_type,
+                    "speed": None,
+                    "reason": "velocity present in the recording but missing on the destination",
+                }
+            )
+        elif want_vel is not None and got_vel is not None:
             speed = math.dist(want_vel, got_vel)
             if speed > vel_tolerance:
                 velocity_deltas.append(
@@ -697,6 +785,8 @@ def compare_snapshots(
         "velocities": bool(velocity_deltas),
         "nbt": bool(nbt_mismatches),
         "subsequence": not _subsequence(expected_uuids, actual_uuids),
+        "dimension": dimension_match is False,
+        "actualMalformed": bool(malformed) or bool(duplicate_actual_uuids),
     }
     if strict:
         ok = not any(failures.values())
@@ -708,11 +798,23 @@ def compare_snapshots(
             or failures["velocities"]
             or failures["nbt"]
             or failures["subsequence"]
+            or failures["dimension"]
+            or failures["actualMalformed"]
         )
 
     return {
         "ok": ok,
         "strict": strict,
+        "dimension": {
+            "expected": expected_dimension,
+            "actual": actual_dimension,
+            "match": dimension_match,
+        },
+        "actualMalformed": {"count": len(malformed), "sample": malformed[:limit]},
+        "actualDuplicateUuids": {
+            "count": len(duplicate_actual_uuids),
+            "sample": duplicate_actual_uuids[:limit],
+        },
         "orderHash": {
             "expected": fork.order_hash(expected_uuids),
             "actual": fork.order_hash(actual_uuids),
@@ -769,40 +871,51 @@ def collisions(
     A UUID collision is exact - the destination already holds the recorded
     entity. A spatial collision is the same entity type within ``radius`` of a
     recorded position, which is what a copied-but-not-cleared world looks like
-    when the UUIDs differ. Both are reported with samples so the caller can
-    clear the right thing rather than rerun blind.
+    when the UUIDs differ. Each leftover is counted once (a UUID collision is
+    not also reported as spatial), and ``targets`` holds the full list the
+    clear commands are built from - not just samples.
     """
     existing = list(existing)
-    by_uuid = _view(existing)
-    duplicate_uuids = [str(record.get("uuid") or "") for record in expected if str(record.get("uuid") or "") in by_uuid]
+    expected_uuids = {str(record.get("uuid") or "") for record in expected}
+    expected_points = [
+        (str(record.get("type") or ""), _vec(record.get("pos"))) for record in expected
+    ]
+    expected_points = [point for point in expected_points if point[1] is not None]
 
-    spatial: list[dict[str, Any]] = []
-    for want in expected:
-        want_pos = _vec(want.get("pos"))
-        if want_pos is None:
+    uuid_collisions: list[dict[str, Any]] = []
+    spatial_collisions: list[dict[str, Any]] = []
+    targets: list[dict[str, Any]] = []
+    for got in existing:
+        position = _vec(got.get("pos"))
+        entry = {
+            "uuid": str(got.get("uuid") or ""),
+            "type": str(got.get("type") or ""),
+            "pos": [round(value, 3) for value in position] if position else None,
+        }
+        if entry["uuid"] and entry["uuid"] in expected_uuids:
+            uuid_collisions.append(entry)
+            targets.append({**entry, "reason": "uuid"})
             continue
-        want_type = str(want.get("type") or "")
-        for got in existing:
-            if str(got.get("type") or "") != want_type:
+        if position is None:
+            continue
+        for want_type, want_pos in expected_points:
+            if want_type != entry["type"] or want_pos is None:
                 continue
-            got_pos = _vec(got.get("pos"))
-            if got_pos is None:
-                continue
-            distance = math.dist(want_pos, got_pos)
+            distance = math.dist(want_pos, position)
             if distance <= radius:
-                spatial.append(
-                    {
-                        "uuid": str(got.get("uuid") or ""),
-                        "expectedUuid": str(want.get("uuid") or ""),
-                        "type": want_type,
-                        "distance": round(distance, 6),
-                    }
+                spatial_collisions.append(
+                    {**entry, "expectedType": want_type, "distance": round(distance, 6)}
                 )
+                targets.append({**entry, "reason": "position"})
                 break
     return {
-        "count": len(set(duplicate_uuids)) + len(spatial),
-        "uuidCollisions": {"count": len(duplicate_uuids), "sample": duplicate_uuids[:10]},
-        "spatialCollisions": {"count": len(spatial), "sample": spatial[:10]},
+        "count": len(targets),
+        "uuidCollisions": {
+            "count": len(uuid_collisions),
+            "sample": [entry["uuid"] for entry in uuid_collisions[:10]],
+        },
+        "spatialCollisions": {"count": len(spatial_collisions), "sample": spatial_collisions[:10]},
+        "targets": targets,
     }
 
 
@@ -830,22 +943,44 @@ def endpoint_checks(
     expect_instance: str | None = None,
     expect_world_dir: str | None = None,
     expect_level: str | None = None,
+    allow_unproven: bool = False,
 ) -> dict[str, Any]:
     """Verify the connected destination against explicit expectations.
 
     ``target`` on the restore call is a *label*: a bridge owns one mod
     connection and cannot route to a server by name. Routing has to be proven
     instead, and these are the proofs a caller can state up front. Each
-    expectation is checked against ``STATE`` before anything is sent; a missing
-    field is a refusal too, because "cannot verify" is not "verified".
+    expectation is checked against the live endpoint report before anything is
+    sent; a missing field is a refusal too, because "cannot verify" is not
+    "verified". With no expectation at all the result is explicitly
+    ``verified: False`` - the apply path refuses that unless the caller passes
+    ``allow_unproven_destination=true``.
+
+    ``expect_instance`` comes from the mod's hello/CAPS frame (the only source
+    of the instance name); ``expect_world_dir``/``expect_level`` come from
+    ``STATE``.
     """
+    expectations = [
+        name
+        for name, value in (
+            ("expect_instance", expect_instance),
+            ("expect_world_dir", expect_world_dir),
+            ("expect_level", expect_level),
+        )
+        if value
+    ]
     if endpoint.get("error"):
-        if expect_instance or expect_world_dir or expect_level:
+        if expectations:
             raise RestoreError(
                 f"cannot verify the destination endpoint: STATE failed ({endpoint['error']}); "
                 "nothing was sent to the game"
             )
-        return {"verified": False, "reason": f"STATE failed: {endpoint['error']}"}
+        return {
+            "verified": False,
+            "reason": f"STATE failed: {endpoint['error']}",
+            "proofs": [],
+            "overridden": bool(allow_unproven),
+        }
 
     mismatches: list[str] = []
     instance = str(endpoint.get("instance") or "")
@@ -884,8 +1019,23 @@ def endpoint_checks(
             + ". Nothing was sent to the game; the label `target` does not route - "
             "point a separate bridge at the intended instance."
         )
+    if not expectations:
+        return {
+            "verified": False,
+            "reason": (
+                "no expect_instance/expect_world_dir/expect_level was given; an apply is "
+                "refused unless allow_unproven_destination=true"
+            ),
+            "proofs": [],
+            "overridden": bool(allow_unproven),
+            "instance": instance or None,
+            "worldDir": world_dir or None,
+            "levelName": level_name,
+        }
     return {
         "verified": True,
+        "proofs": expectations,
+        "overridden": False,
         "instance": instance or None,
         "worldDir": world_dir or None,
         "levelName": level_name,

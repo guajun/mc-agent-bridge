@@ -178,7 +178,7 @@ class GuardedRestoreDaemonTests(unittest.IsolatedAsyncioTestCase):
         self.mod.lines.clear()
 
         with self.assertRaises(RuntimeError) as caught:
-            await self.api.call("restore", {"directory": str(directory), "dry_run": False})
+            await self.api.call("restore", {"directory": str(directory), "dry_run": False, "expect_world_dir": str(self.world)})
         self.assertIn("order_hash", str(caught.exception))
         self.assertEqual(self.mod.commands, [])
 
@@ -190,7 +190,7 @@ class GuardedRestoreDaemonTests(unittest.IsolatedAsyncioTestCase):
         self.mod.lines.clear()
 
         with self.assertRaises(RuntimeError) as caught:
-            await self.api.call("restore", {"directory": directory, "dry_run": False})
+            await self.api.call("restore", {"directory": directory, "dry_run": False, "expect_world_dir": str(self.world)})
         self.assertIn("dimension", str(caught.exception))
         self.assertEqual(
             [command for command in self.mod.commands if command.startswith("/summon ")], []
@@ -203,7 +203,7 @@ class GuardedRestoreDaemonTests(unittest.IsolatedAsyncioTestCase):
         self.mod.lines.clear()
 
         with self.assertRaises(RuntimeError) as caught:
-            await self.api.call("restore", {"directory": directory, "dry_run": False})
+            await self.api.call("restore", {"directory": directory, "dry_run": False, "expect_world_dir": str(self.world)})
         message = str(caught.exception)
         self.assertIn("duplicate", message)
         self.assertIn("uuid collisions: 2", message)
@@ -240,7 +240,7 @@ class GuardedRestoreDaemonTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result["ok"], result["verification"])
         self.assertEqual(result["checks"]["existing"]["action"], "cleared+flushed")
         self.assertEqual(result["checks"]["existing"]["remainingCollisions"], 0)
-        self.assertEqual(result["checks"]["existing"]["remainingInBox"], 0)
+        self.assertEqual(result["checks"]["existing"]["remainingAtRecordedPositions"], 0)
         self.assertEqual(result["issued"], 2)
         self.assertEqual(result["failed"], [])
         self.assertEqual(result["verdict"], "ok")
@@ -280,7 +280,7 @@ class GuardedRestoreDaemonTests(unittest.IsolatedAsyncioTestCase):
         self.mod.failing_commands["minecraft:diamond"] = "Unable to summon entity"
         self.mod.lines.clear()
 
-        result = await self.api.call("restore", {"directory": directory, "dry_run": False})
+        result = await self.api.call("restore", {"directory": directory, "dry_run": False, "expect_world_dir": str(self.world)})
 
         self.assertFalse(result["ok"])
         self.assertTrue(result["partial"])
@@ -302,7 +302,7 @@ class GuardedRestoreDaemonTests(unittest.IsolatedAsyncioTestCase):
         self.mod.failing_commands["minecraft:emerald"] = "refused too"
 
         result = await self.api.call(
-            "restore", {"directory": directory, "dry_run": False, "keep_going": True}
+            "restore", {"directory": directory, "dry_run": False, "expect_world_dir": str(self.world), "keep_going": True}
         )
         self.assertEqual(len(result["failed"]), 2)
         self.assertEqual(result["issued"], 2)
@@ -315,7 +315,7 @@ class GuardedRestoreDaemonTests(unittest.IsolatedAsyncioTestCase):
         self.mod.lines.clear()
 
         result = await self.api.call(
-            "restore", {"directory": directory, "dry_run": False, "verify": False}
+            "restore", {"directory": directory, "dry_run": False, "expect_world_dir": str(self.world), "verify": False}
         )
 
         self.assertEqual(result["issued"], 2)
@@ -336,7 +336,7 @@ class GuardedRestoreDaemonTests(unittest.IsolatedAsyncioTestCase):
         directory = await self.fork_fixture()
         self.destination_is_empty()
 
-        result = await self.api.call("restore", {"directory": directory, "dry_run": False})
+        result = await self.api.call("restore", {"directory": directory, "dry_run": False, "expect_world_dir": str(self.world)})
 
         self.assertTrue(result["ok"], result["verification"])
         self.assertEqual(result["tick"]["prior"], "frozen")
@@ -350,7 +350,7 @@ class GuardedRestoreDaemonTests(unittest.IsolatedAsyncioTestCase):
         directory = await self.fork_fixture()
         self.destination_is_empty()
 
-        result = await self.api.call("restore", {"directory": directory, "dry_run": False})
+        result = await self.api.call("restore", {"directory": directory, "dry_run": False, "expect_world_dir": str(self.world)})
 
         self.assertEqual(result["tick"]["prior"], "running")
         self.assertEqual(result["tick"]["priorSource"], "query")
@@ -374,7 +374,7 @@ class GuardedRestoreDaemonTests(unittest.IsolatedAsyncioTestCase):
         self.mod.lines.clear()
 
         result = await self.api.call(
-            "restore", {"directory": directory, "dry_run": False, "verify": False}
+            "restore", {"directory": directory, "dry_run": False, "expect_world_dir": str(self.world), "verify": False}
         )
 
         self.assertIsNot(result["ok"], True, "commands issued is not restored state")
@@ -392,7 +392,7 @@ class GuardedRestoreDaemonTests(unittest.IsolatedAsyncioTestCase):
         self.mod.raising_commands["minecraft:diamond"] = "the game refused the command"
 
         result = await self.api.call(
-            "restore", {"directory": directory, "dry_run": False, "verify": False}
+            "restore", {"directory": directory, "dry_run": False, "expect_world_dir": str(self.world), "verify": False}
         )
 
         self.assertIs(result["ok"], False)
@@ -409,7 +409,7 @@ class GuardedRestoreDaemonTests(unittest.IsolatedAsyncioTestCase):
         self.mod.lines.clear()
 
         with self.assertRaises(RuntimeError) as caught:
-            await self.api.call("restore", {"directory": directory, "dry_run": False})
+            await self.api.call("restore", {"directory": directory, "dry_run": False, "expect_world_dir": str(self.world)})
         self.assertIn("cannot determine", str(caught.exception))
         self.assertEqual(self.mod.commands, ["/tick query"], "nothing after the failed query")
         self.assertFalse((self.snapshots / "restore-pre").exists())
@@ -423,7 +423,7 @@ class GuardedRestoreDaemonTests(unittest.IsolatedAsyncioTestCase):
 
         result = await self.api.call(
             "restore",
-            {"directory": directory, "dry_run": False, "prior_tick_state": "running"},
+            {"directory": directory, "dry_run": False, "expect_world_dir": str(self.world), "prior_tick_state": "running"},
         )
         self.assertEqual(result["tick"]["prior"], "running")
         self.assertEqual(result["tick"]["priorSource"], "caller")
@@ -437,7 +437,7 @@ class GuardedRestoreDaemonTests(unittest.IsolatedAsyncioTestCase):
         self.mod.lines.clear()
         result = await self.api.call(
             "restore",
-            {"directory": directory, "dry_run": False, "prior_tick_state": "frozen"},
+            {"directory": directory, "dry_run": False, "expect_world_dir": str(self.world), "prior_tick_state": "frozen"},
         )
         self.assertEqual(result["tick"]["priorSource"], "caller")
         self.assertFalse(result["tick"]["frozenByBridge"])
@@ -451,7 +451,7 @@ class GuardedRestoreDaemonTests(unittest.IsolatedAsyncioTestCase):
         directory = await self.fork_fixture()
         with self.assertRaises(RuntimeError) as caught:
             await self.api.call(
-                "restore", {"directory": directory, "dry_run": False, "prior_tick_state": "maybe"}
+                "restore", {"directory": directory, "dry_run": False, "expect_world_dir": str(self.world), "prior_tick_state": "maybe"}
             )
         self.assertIn("prior_tick_state", str(caught.exception))
 
@@ -466,21 +466,21 @@ class GuardedRestoreDaemonTests(unittest.IsolatedAsyncioTestCase):
         self.mod.on_command = fail_the_next_snapshot
         self.mod.lines.clear()
 
-        result = await self.api.call("restore", {"directory": directory, "dry_run": False})
+        result = await self.api.call("restore", {"directory": directory, "dry_run": False, "expect_world_dir": str(self.world)})
 
         self.assertFalse(result["ok"])
         self.assertEqual(result["issued"], 2)
         self.assertIn("verification snapshot failed", result["verification"]["error"])
 
-    async def test_replacement_refuses_when_the_box_is_not_clean_after_clearing(self) -> None:
+    async def test_replacement_refuses_when_collisions_remain_after_clearing(self) -> None:
         directory = await self.fork_fixture()
         first_kill = {"done": False}
 
         def on_command(command: str) -> None:
             if command.startswith("kill ") and not first_kill["done"]:
                 first_kill["done"] = True
-                # Killing a chest minecart drops its inventory; if the second
-                # pass cannot remove the drop, the restore must refuse.
+                # Killing a chest minecart drops its inventory; if the drop
+                # cannot be removed, the restore must refuse.
                 drop = dict(CART_A, uuid="99999999-9999-4999-8999-999999999999", type="minecraft:item")
                 self.mod.entity_records = [drop]
                 self.mod.summon_uuids = []
@@ -491,14 +491,178 @@ class GuardedRestoreDaemonTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(RuntimeError) as caught:
             await self.api.call(
                 "restore",
-                {"directory": directory, "dry_run": False, "replace_existing": True},
+                {"directory": directory, "dry_run": False, "expect_world_dir": str(self.world), "replace_existing": True},
             )
-        self.assertIn("still there", str(caught.exception))
+        self.assertIn("still at the recorded positions", str(caught.exception))
         self.assertEqual(
             [command for command in self.mod.commands if command.startswith("/summon ")], []
         )
         self.assertIn("/tick unfreeze", self.mod.commands)
         self.assertFalse(self.mod.tick_frozen, "a refusal must not leave the world frozen")
+
+    async def test_apply_without_an_endpoint_proof_refuses_before_any_command(self) -> None:
+        directory = await self.fork_fixture()
+        self.destination_is_empty()
+        self.mod.lines.clear()
+
+        with self.assertRaises(RuntimeError) as caught:
+            await self.api.call("restore", {"directory": directory, "dry_run": False})
+        self.assertIn("endpoint proof", str(caught.exception))
+        self.assertEqual(self.mod.commands, [], "nothing may be sent to an unproven destination")
+        self.assertEqual(len(self.mod.entity_records), 0)
+
+        result = await self.api.call(
+            "restore",
+            {
+                "directory": directory,
+                "dry_run": False,
+                "allow_unproven_destination": True,
+            },
+        )
+        self.assertEqual(result["checks"]["endpoint"]["action"], "allowed (allow_unproven_destination=true)")
+        self.assertTrue(result["ok"], result["verification"])
+
+    async def test_apply_refuses_when_state_fails_and_a_proof_was_given(self) -> None:
+        directory = await self.fork_fixture()
+        self.destination_is_empty()
+        self.mod.state_error = "STATE unavailable"
+        self.mod.lines.clear()
+
+        with self.assertRaises(RuntimeError) as caught:
+            await self.api.call(
+                "restore",
+                {"directory": directory, "dry_run": False, "expect_world_dir": str(self.world)},
+            )
+        self.assertIn("cannot verify the destination endpoint", str(caught.exception))
+        self.assertEqual(self.mod.commands, [])
+
+        allowed = await self.api.call(
+            "restore",
+            {
+                "directory": directory,
+                "dry_run": False,
+                "allow_unproven_destination": True,
+            },
+        )
+        self.assertTrue(allowed["checks"]["endpoint"]["overridden"])
+        self.assertTrue(allowed["ok"], allowed["verification"])
+
+    async def test_replace_existing_without_check_existing_is_a_parameter_error(self) -> None:
+        directory = await self.fork_fixture()
+        with self.assertRaises(RuntimeError) as caught:
+            await self.api.call(
+                "restore",
+                {
+                    "directory": directory,
+                    "dry_run": False,
+                    "expect_world_dir": str(self.world),
+                    "check_existing": False,
+                    "replace_existing": True,
+                },
+            )
+        self.assertIn("replace_existing=true requires check_existing=true", str(caught.exception))
+        self.assertEqual(self.mod.commands, [])
+
+    async def test_narrow_clear_targets_only_the_collision_positions(self) -> None:
+        directory = await self.fork_fixture()
+        self.mod.on_command = lambda command: (
+            setattr(self.mod, "entity_records", []) if command.startswith("kill ") else None
+        )
+        self.mod.lines.clear()
+
+        result = await self.api.call(
+            "restore",
+            {
+                "directory": directory,
+                "dry_run": False,
+                "expect_world_dir": str(self.world),
+                "replace_existing": True,
+            },
+        )
+
+        clear_commands = result["checks"]["existing"]["clearCommands"]
+        self.assertTrue(clear_commands)
+        for command in clear_commands:
+            self.assertNotIn("dx=", command, "no padded volume kill")
+            self.assertNotIn("x=-16", command)
+            self.assertIn("distance=..", command)
+        # Every entity kill is at one of the two recorded positions.
+        self.assertTrue(
+            all("x=10.5,y=64.0,z=-3.5" in command or "x=10.5,y=65.0,z=-3.5" in command for command in clear_commands),
+            clear_commands,
+        )
+        self.assertTrue(result["ok"], result["verification"])
+
+    async def test_a_failed_unfreeze_fails_the_verdict_and_is_reported(self) -> None:
+        directory = await self.fork_fixture()
+        self.destination_is_empty()
+        self.mod.raising_commands["tick unfreeze"] = "unfreeze refused"
+        self.mod.lines.clear()
+
+        result = await self.api.call(
+            "restore",
+            {
+                "directory": directory,
+                "dry_run": False,
+                "expect_world_dir": str(self.world),
+            },
+        )
+
+        self.assertIs(result["ok"], False)
+        self.assertEqual(result["verdict"], "failed")
+        self.assertFalse(result["tick"]["restored"])
+        self.assertFalse(result["tick"]["preserved"])
+        self.assertEqual(result["tick"]["unfreezeError"], "unfreeze refused")
+        self.assertTrue(self.mod.tick_frozen, "the fake leaves the world frozen like the real refusal")
+
+    async def test_the_freeze_watchdog_releases_a_stuck_restore(self) -> None:
+        directory = await self.fork_fixture()
+        self.destination_is_empty()
+        self.mod.slow_commands["summon minecraft:chest_minecart"] = 0.3
+        self.mod.lines.clear()
+
+        result = await self.api.call(
+            "restore",
+            {
+                "directory": directory,
+                "dry_run": False,
+                "expect_world_dir": str(self.world),
+                "freeze_timeout_seconds": 0.05,
+            },
+            timeout=30,
+        )
+
+        self.assertTrue(result["tick"]["watchdogUnfroze"])
+        self.assertFalse(self.mod.tick_frozen, "the watchdog must release the world")
+        self.assertIs(result["ok"], False)
+        self.assertEqual(result["verdict"], "failed")
+        self.assertIn("watchdog", result["note"])
+
+    async def test_verify_fails_on_a_dimension_mismatch(self) -> None:
+        directory = await self.fork_fixture()
+        self.mod.dimension = "minecraft:the_nether"
+
+        result = await self.api.call("verify", {"directory": directory, "target": "lab-b"})
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(
+            result["verification"]["dimension"],
+            {
+                "expected": "minecraft:overworld",
+                "actual": "minecraft:the_nether",
+                "match": False,
+            },
+        )
+
+    async def test_verify_fails_on_a_malformed_actual_record(self) -> None:
+        directory = await self.fork_fixture()
+        self.mod.entity_records[0] = dict(self.mod.entity_records[0], pos="not a position")
+
+        result = await self.api.call("verify", {"directory": directory, "target": "lab-b"})
+
+        self.assertFalse(result["ok"])
+        self.assertGreaterEqual(result["verification"]["actualMalformed"]["count"], 1)
+        self.assertTrue(result["actualIssues"], "the destination snapshot is validated too")
 
     async def test_verify_reports_inventory_change_even_when_the_order_hash_matches(self) -> None:
         directory = await self.fork_fixture()

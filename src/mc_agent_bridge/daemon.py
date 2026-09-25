@@ -565,6 +565,12 @@ class BridgeDaemon:
         expect_level = _text(params.get("expect_level"))
         expect_dimension = _text(params.get("expect_dimension"))
         prior_tick_state = str(params.get("prior_tick_state") or "auto").strip().lower()
+        allow_unproven_destination = _as_bool(
+            params.get("allow_unproven_destination"), default=False
+        )
+        freeze_timeout_seconds = _number(
+            params.get("freeze_timeout_seconds"), 300.0, "freeze_timeout_seconds"
+        )
         freeze = _as_bool(params.get("freeze"), default=True)
         forceload = _as_bool(params.get("forceload"), default=True)
         release_forceload = _as_bool(params.get("release_forceload"), default=False)
@@ -580,6 +586,12 @@ class BridgeDaemon:
             params.get("collision_radius"), restore.COLLISION_RADIUS, "collision_radius"
         )
         ignore_nbt_keys = _as_list(params.get("ignore_nbt_keys"), "ignore_nbt_keys")
+        if replace_existing and not check_existing:
+            raise ValueError(
+                "replace_existing=true requires check_existing=true: a replacement without a "
+                "duplicate check has nothing to target. Drop replace_existing, or stop disabling "
+                "check_existing."
+            )
 
         meta, entities = fork.read_snapshot(directory)
         issues = restore.validate_snapshot(meta, entities)
@@ -608,6 +620,7 @@ class BridgeDaemon:
                     expect_instance=expect_instance,
                     expect_world_dir=expect_world_dir,
                     expect_level=expect_level,
+                    allow_unproven=allow_unproven_destination,
                 ),
                 "dimension": None,
                 "existing": None,
@@ -624,6 +637,27 @@ class BridgeDaemon:
             result["verdict"] = "dry-run"
             return result
 
+        # An apply needs a proven destination. `target` is a label and the
+        # endpoint report is what proves which world will be written to: a
+        # failed STATE or no expectation at all refuses before forceload/tick.
+        endpoint_result = result["checks"]["endpoint"]
+        if not allow_unproven_destination:
+            if endpoint.get("error"):
+                raise restore.RestoreError(
+                    "cannot prove the destination endpoint: STATE failed "
+                    f"({endpoint['error']}); nothing was sent to the game. Pass "
+                    "allow_unproven_destination=true only if you accept writing to an unproven "
+                    "instance."
+                )
+            if not endpoint_result.get("verified"):
+                raise restore.RestoreError(
+                    "apply requires an endpoint proof: pass expect_world_dir (strongest), "
+                    "expect_instance or expect_level; nothing was sent to the game. Pass "
+                    "allow_unproven_destination=true to override explicitly."
+                )
+        elif not endpoint_result.get("verified"):
+            endpoint_result["action"] = "allowed (allow_unproven_destination=true)"
+
         box = restore.bounding_box(entities)
         tick: dict[str, Any] = {
             "prior": "unknown",
@@ -634,6 +668,8 @@ class BridgeDaemon:
         }
         result["checks"]["tick"] = tick
         frozen_by_bridge = False
+        watchdog: asyncio.Task[None] | None = None
+        watchdog_done = asyncio.Event()
         issued = 0
         attempted: list[dict[str, Any]] = []
         failed: list[dict[str, Any]] = []
@@ -653,6 +689,12 @@ class BridgeDaemon:
                 if not prior:
                     await self._call_mod("CMD /tick freeze")
                     frozen_by_bridge = True
+                    if freeze_timeout_seconds > 0:
+                        # Safety net: if the restore hangs while the world is
+                        # frozen, unfreeze rather than leaving it paused forever.
+                        watchdog = asyncio.create_task(
+                            self._freeze_watchdog(freeze_timeout_seconds, tick, watchdog_done)
+                        )
                 tick["frozenByBridge"] = frozen_by_bridge
 
             if forceload and box is not None:
@@ -690,6 +732,7 @@ class BridgeDaemon:
                     "then save-all flush) or pass replace_existing=true to let the bridge do it."
                 )
             if found["count"] and check_existing and replace_existing:
+                clear_commands = restore.clear_commands(found["targets"], collision_radius)
                 # A kill only resolves while the game runs: frozen kills leave
                 # dying-but-present entities and their drops behind. Clear with
                 # ticks running, then re-freeze before the recheck snapshot so
@@ -697,12 +740,12 @@ class BridgeDaemon:
                 if freeze and (prior is True or frozen_by_bridge):
                     await self._call_mod("CMD /tick unfreeze")
                     tick["clearedWhileRunning"] = True
-                # Two passes: the first kill of a chest minecart drops its
-                # inventory as item entities, and the second removes those
-                # drops. The box is supposed to hold the recording, not the
-                # recording plus its popped-out contents.
-                await self._call_mod(f"CMD {restore.clear_box_command(box)}")
-                await self._call_mod(f"CMD {restore.clear_box_command(box)}")
+                # Each command selects one entity type within a small radius of
+                # the detected collision's own position (plus the item drops a
+                # killed chest minecart leaves) - never the padded chunk-load
+                # box, so unrelated entities are left alone.
+                for command in clear_commands:
+                    await self._call_mod(f"CMD {command}")
                 await self._call_mod("CMD /save-all flush")
                 if freeze and (prior is True or frozen_by_bridge):
                     await self._call_mod("CMD /tick freeze")
@@ -711,18 +754,23 @@ class BridgeDaemon:
                     restore.snapshot_name("pre-cleared", target)
                 )
                 remaining = restore.collisions(entities, recheck_entities, collision_radius)
-                inside = restore.entities_in_box(recheck_entities, box)
+                leftover = restore.near_positions(
+                    recheck_entities,
+                    restore.positions_of(entities),
+                    max(collision_radius, 0.5),
+                )
                 existing["action"] = "cleared+flushed"
+                existing["clearCommands"] = clear_commands
                 existing["clearedSnapshotDir"] = recheck_dir
                 existing["remainingCollisions"] = remaining["count"]
-                existing["remainingInBox"] = len(inside)
-                if remaining["count"] or inside:
+                existing["remainingAtRecordedPositions"] = len(leftover)
+                if remaining["count"] or leftover:
                     raise restore.RestoreError(
-                        "replace_existing cleared the recorded box but "
-                        f"{len(inside) or remaining['count']} entity/entities are still there after "
-                        "save-all flush; refusing a restore that would duplicate or collide. "
-                        "Leftovers: "
-                        f"{inside[:5] or remaining['uuidCollisions']['sample'] or remaining['spatialCollisions']['sample']}"
+                        "replace_existing cleared the detected collisions but "
+                        f"{len(leftover) or remaining['count']} entity/entities are still at the "
+                        "recorded positions after save-all flush; refusing a restore that would "
+                        "duplicate or collide. Leftovers: "
+                        f"{leftover[:5] or remaining['uuidCollisions']['sample'] or remaining['spatialCollisions']['sample']}"
                     )
                 if recheck_entities:
                     existing["note"] = (
@@ -743,13 +791,14 @@ class BridgeDaemon:
             # Report the original failure, but not from a state the bridge
             # itself changed: put the prior tick state back and release the
             # box the caller asked to release.
+            await self._stop_watchdog(watchdog, watchdog_done)
             if freeze and prior is True and tick.get("clearedWhileRunning") and not tick.get("refrozen"):
                 try:
                     await self._call_mod("CMD /tick freeze")
                     tick["refrozen"] = True
                 except Exception as error:  # noqa: BLE001 - the original failure matters more
                     tick["refreezeError"] = str(error)
-            if frozen_by_bridge:
+            if frozen_by_bridge and not tick.get("watchdogUnfroze"):
                 try:
                     await self._call_mod("CMD /tick unfreeze")
                     tick["restored"] = True
@@ -817,7 +866,8 @@ class BridgeDaemon:
                 except Exception as error:  # noqa: BLE001 - report, do not lose the issued count
                     verification = {"ok": False, "error": f"verification snapshot failed: {error}"}
         finally:
-            if frozen_by_bridge:
+            await self._stop_watchdog(watchdog, watchdog_done)
+            if frozen_by_bridge and not tick.get("watchdogUnfroze"):
                 try:
                     await self._call_mod("CMD /tick unfreeze")
                     tick["restored"] = True
@@ -840,7 +890,7 @@ class BridgeDaemon:
             preserved = None
         tick["preserved"] = preserved
 
-        if failed or preserved is False:
+        if failed or preserved is False or tick.get("watchdogUnfroze"):
             verdict, ok, verified = "failed", False, False
         elif verification is None:
             verdict, ok, verified = "unverified", None, False
@@ -866,6 +916,12 @@ class BridgeDaemon:
             result["note"] = (
                 "post-restore verification was disabled: commands were issued, but this is not a "
                 "claim that the world was faithfully restored"
+            )
+        elif tick.get("watchdogUnfroze"):
+            result["note"] = (
+                "the freeze watchdog released the world before the restore completed; the "
+                "post-restore comparison did not run under a controlled tick and its verdict "
+                "cannot stand"
             )
         return result
 
@@ -895,6 +951,11 @@ class BridgeDaemon:
         _, actual_meta, actual, actual_dir = await self._take_snapshot(
             restore.snapshot_name("check", target), radius
         )
+        # The destination snapshot is data too: a malformed record there must
+        # fail the check instead of vanishing from the comparison, and the
+        # dimension has to match even when every entity does.
+        actual_issues = restore.validate_snapshot(actual_meta, actual)
+        actual_blockers = restore.blocking_issues(actual_issues)
         report = restore.compare_snapshots(
             meta,
             entities,
@@ -905,6 +966,10 @@ class BridgeDaemon:
             vel_tolerance=vel_tolerance,
             ignore_nbt_keys=ignore_nbt_keys,
         )
+        if actual_blockers:
+            report = dict(report)
+            report["ok"] = False
+            report["failures"] = {**report.get("failures", {}), "actualMalformed": True}
         return {
             "directory": directory,
             "target": target,
@@ -921,8 +986,9 @@ class BridgeDaemon:
                 "dimension": actual_meta.get("dimension"),
             },
             "warnings": [issue.as_dict() for issue in issues if not issue.blocking],
+            "actualIssues": [issue.as_dict() for issue in actual_issues],
             "verification": report,
-            "ok": report["ok"],
+            "ok": report["ok"] and not actual_blockers,
         }
 
     async def _take_snapshot(
@@ -1005,6 +1071,47 @@ class BridgeDaemon:
             "world. Pass prior_tick_state='frozen' or 'running' if you know it, or freeze=false to "
             "skip tick control."
         )
+
+    async def _stop_watchdog(
+        self, watchdog: asyncio.Task[None] | None, done: asyncio.Event
+    ) -> None:
+        """Stop the freeze watchdog without cancelling an in-flight request.
+
+        Cancelling a task that is waiting on the mod's request lock would leave
+        its reply to be consumed by the next request, shifting the response
+        stream. Setting the event lets a sleeping watchdog return quietly, and
+        ``shield`` lets an already-requesting one finish its own reply; if it
+        does not finish quickly it is left to time out on its own.
+        """
+        if watchdog is None:
+            return
+        done.set()
+        try:
+            await asyncio.wait_for(asyncio.shield(watchdog), timeout=5.0)
+        except (asyncio.TimeoutError, asyncio.CancelledError, Exception):  # noqa: BLE001
+            pass
+
+    async def _freeze_watchdog(
+        self, seconds: float, tick: dict[str, Any], done: asyncio.Event
+    ) -> None:
+        """Release a frozen world if a restore is still holding it after ``seconds``.
+
+        The restore's own handlers unfreeze on every normal and exceptional
+        path; this covers a handler that never reaches them (a hung mod
+        response, a stuck await). It records what it did in ``tick`` so the
+        verdict reflects a world the watchdog had to release.
+        """
+        try:
+            await asyncio.wait_for(done.wait(), timeout=seconds)
+            return  # the restore finished in time; nothing to release
+        except (asyncio.TimeoutError, TimeoutError):
+            pass
+        tick["watchdogUnfroze"] = True
+        try:
+            await self._call_mod("CMD /tick unfreeze")
+            tick["restored"] = True
+        except Exception as error:  # noqa: BLE001 - recorded, not raised into the restore
+            tick["watchdogUnfreezeError"] = str(error)
 
     async def _forceload_remove_best_effort(self, box: tuple[float, ...]) -> bool:
         try:

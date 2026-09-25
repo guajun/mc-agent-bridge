@@ -82,8 +82,9 @@ class FakeMod:
         self.world_dir = os.fspath(world_dir) if world_dir is not None else None
         #: Where SNAPSHOT writes, mirroring <mcagent.dir>/snapshots.
         self.snapshots_dir = os.fspath(snapshots_dir) if snapshots_dir is not None else None
-        #: Entity records, in tick order, that SNAPSHOT writes out.
-        self.entity_records = list(entities or [])
+        #: Entity records, in tick order, that SNAPSHOT writes out. Each record
+        #: is copied so a test that mutates one cannot leak into another.
+        self.entity_records = [dict(record) for record in (entities or [])]
         self.tick = tick
         #: The dimension the fake reports in STATE/SNAPSHOT; tests flip it to
         #: exercise the bridge's wrong-dimension refusal.
@@ -102,6 +103,9 @@ class FakeMod:
         #: CMD substring -> message: the fake answers with a protocol error, so
         #: the bridge's ``_call_mod`` raises (transport-level failure).
         self.raising_commands: dict[str, str] = {}
+        #: CMD substring -> seconds: the fake holds that command's ack, so tests
+        #: can exercise the freeze watchdog while a restore is stuck.
+        self.slow_commands: dict[str, float] = {}
         #: UUIDs handed to summons whose NBT carries no UUID (test fixtures).
         self.summon_uuids: list[str] = []
         #: Called with each CMD body before the reply is built; tests use it to
@@ -109,6 +113,8 @@ class FakeMod:
         self.on_command: Callable[[str], None] | None = None
         #: Set to make SNAPSHOT answer with an error, for failure-path tests.
         self.snapshot_error: str | None = None
+        #: Set to make STATE answer with an error, for endpoint-proof tests.
+        self.state_error: str | None = None
         #: The mod may name the listing reply either way; the bridge must take both.
         self.snapshots_reply_type = "snapshots"
 
@@ -173,6 +179,10 @@ class FakeMod:
                 self.lines.append(line)
                 if self.caps_delay and line.upper() == "CAPS":
                     await asyncio.sleep(self.caps_delay)
+                for marker, delay in self.slow_commands.items():
+                    if marker in line:
+                        await asyncio.sleep(delay)
+                        break
                 reply = self.reply_for(line)
                 writer.write((json.dumps(reply, ensure_ascii=False) + "\n").encode("utf-8"))
                 await writer.drain()
@@ -190,6 +200,8 @@ class FakeMod:
     def reply_for(self, line: str) -> dict[str, Any]:
         upper = line.upper()
         if upper == "STATE":
+            if self.state_error is not None:
+                return {"type": "error", "message": self.state_error}
             state: dict[str, Any] = {
                 "type": "state",
                 "tick": self.tick,
@@ -265,13 +277,15 @@ class FakeMod:
                     "The game is frozen." if self.tick_frozen else "The game is running normally."
                 ]
             return {"type": "cmd_ack", "detail": detail, "output": list(output)}
+        # A command that raises at the protocol level has no side effect, so the
+        # failure check comes before the tick/summon state changes.
+        for marker, message in self.raising_commands.items():
+            if marker in command:
+                return {"type": "error", "message": message}
         if command.startswith("tick freeze"):
             self.tick_frozen = True
         elif command.startswith("tick unfreeze"):
             self.tick_frozen = False
-        for marker, message in self.raising_commands.items():
-            if marker in command:
-                return {"type": "error", "message": message}
         for marker, message in self.failing_commands.items():
             if marker in command:
                 return {"type": "cmd_ack", "detail": detail, "output": [message]}

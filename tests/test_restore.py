@@ -158,18 +158,36 @@ class BoxCommandTests(unittest.TestCase):
         self.assertEqual(restore.forceload_add_command(box), "forceload add -6 -20 27 13")
         self.assertEqual(restore.forceload_remove_command(box), "forceload remove -6 -20 27 13")
 
-    def test_clear_command_preserves_players_and_covers_the_box(self) -> None:
-        box = restore.bounding_box(ENTITIES, margin=16.0)
-        command = restore.clear_box_command(box)
-        self.assertIn("type=!player", command)
-        self.assertIn("x=-6,y=48,z=-20", command)
-        self.assertIn("dx=34,dy=34,dz=34", command)
+    def test_clear_commands_target_only_the_collision_positions(self) -> None:
+        targets = [
+            {"uuid": "99999999-9999-4999-8999-999999999999", "type": "minecraft:chest_minecart", "pos": [10.5, 64.0, -3.5]}
+        ]
+        commands = restore.clear_commands(targets, restore.COLLISION_RADIUS)
+        self.assertEqual(
+            commands[0],
+            "kill @e[type=minecraft:chest_minecart,x=10.5,y=64.0,z=-3.5,distance=..1]",
+        )
+        self.assertEqual(
+            commands[1],
+            "kill @e[type=minecraft:item,x=10.5,y=64.0,z=-3.5,distance=..2]",
+        )
+        # No padded volume: no dx/dy/dz and no +-16 block box.
+        self.assertNotIn("dx=", commands[0])
+        self.assertNotIn("x=-6", commands[0])
 
-    def test_entities_in_box_flags_only_what_is_inside(self) -> None:
-        box = restore.bounding_box(ENTITIES, margin=16.0)
+    def test_clear_commands_deduplicate_the_same_target(self) -> None:
+        target = {"uuid": "a", "type": "minecraft:item", "pos": [1.0, 2.0, 3.0]}
+        commands = restore.clear_commands([target, dict(target, uuid="b")], 0.75)
+        self.assertEqual(len(commands), 2, "one entity kill + one drop kill for one position")
+
+    def test_clear_commands_refuse_nothing_when_targets_are_empty(self) -> None:
+        self.assertEqual(restore.clear_commands([]), [])
+
+    def test_near_positions_flags_only_entities_at_recorded_positions(self) -> None:
+        positions = restore.positions_of(ENTITIES)
         drop = copy(CART_A, uuid="77777777-7777-4777-8777-777777777777", type="minecraft:item", pos=[10.5, 63.0, -3.5])
         outside = copy(CART_A, uuid="88888888-8888-4888-8888-888888888888", pos=[100.0, 64.0, 100.0])
-        found = restore.entities_in_box([drop, outside], box)
+        found = restore.near_positions([drop, outside], positions, 1.0)
         self.assertEqual([entity["uuid"] for entity in found], [drop["uuid"]])
         self.assertEqual(found[0]["type"], "minecraft:item")
 
@@ -193,6 +211,20 @@ class NbtTests(unittest.TestCase):
 
     def test_missing_inventory_is_none(self) -> None:
         self.assertIsNone(restore.nbt_fragment('{"Motion":[0.0d,0.0d,0.0d]}'))
+
+    def test_a_nested_items_key_does_not_shadow_the_top_level_inventory(self) -> None:
+        nbt = (
+            '{"components":{"Items":[{"id":"minecraft:bone","count":1}]},'
+            '"Items":[{"Slot":0b,"id":"minecraft:diamond","count":5}]}'
+        )
+        self.assertEqual(
+            restore.nbt_fragment(nbt),
+            '[{"Slot":0b,"id":"minecraft:diamond","count":5}]',
+        )
+
+    def test_a_missing_top_level_items_is_none_even_with_a_nested_one(self) -> None:
+        nbt = '{"components":{"Items":[{"id":"minecraft:bone","count":1}]}}'
+        self.assertIsNone(restore.nbt_fragment(nbt))
 
     def test_strip_top_level_keys_drops_only_the_named_field(self) -> None:
         stripped = restore.strip_top_level_keys(CART_A["nbt"], ["UUID"])
@@ -305,6 +337,78 @@ class CompareSnapshotTests(unittest.TestCase):
         )
         self.assertEqual(report["playersExcluded"], {"expected": 1, "actual": 0})
 
+    def test_a_dimension_mismatch_fails_the_comparison(self) -> None:
+        report = restore.compare_snapshots(
+            meta_for(ENTITIES, dimension="minecraft:overworld"),
+            ENTITIES,
+            meta_for(ENTITIES, dimension="minecraft:the_nether"),
+            ENTITIES,
+        )
+        self.assertFalse(report["ok"])
+        self.assertEqual(report["dimension"], {
+            "expected": "minecraft:overworld",
+            "actual": "minecraft:the_nether",
+            "match": False,
+        })
+        self.assertTrue(report["failures"]["dimension"])
+
+        same = restore.compare_snapshots(
+            meta_for(ENTITIES, dimension="minecraft:overworld"),
+            ENTITIES,
+            meta_for(ENTITIES, dimension="minecraft:overworld"),
+            ENTITIES,
+        )
+        self.assertTrue(same["ok"])
+        self.assertIs(same["dimension"]["match"], True)
+        self.assertFalse(same["failures"]["dimension"])
+
+    def test_a_malformed_actual_record_fails_the_comparison(self) -> None:
+        for broken, problem in (
+            (copy(CART_A, pos="not a position"), "pos"),
+            (copy(CART_A, vel=[1.0, 2.0]), "vel"),
+            (copy(CART_A, type=None), "type"),
+            (copy(CART_A, uuid=""), "uuid"),
+        ):
+            report = restore.compare_snapshots(
+                meta_for(ENTITIES), ENTITIES, meta_for([broken, CART_B]), [broken, CART_B]
+            )
+            self.assertFalse(report["ok"], problem)
+            self.assertGreaterEqual(report["actualMalformed"]["count"], 1)
+            self.assertIn(
+                problem,
+                report["actualMalformed"]["sample"][0]["problems"],
+            )
+
+    def test_a_duplicate_actual_uuid_fails_the_comparison(self) -> None:
+        twin = copy(CART_A, nbt=CART_A["nbt"].replace("[I;1,2,3,4]", "[I;9,9,9,9]"))
+        report = restore.compare_snapshots(
+            meta_for(ENTITIES), ENTITIES, meta_for([CART_A, twin]), [CART_A, twin]
+        )
+        self.assertFalse(report["ok"])
+        self.assertEqual(report["actualDuplicateUuids"]["count"], 1)
+        self.assertIn(CART_A["uuid"], report["actualDuplicateUuids"]["sample"])
+
+    def test_a_position_missing_on_one_side_is_a_mismatch_not_equality(self) -> None:
+        gone = copy(CART_A)
+        del gone["pos"]
+        report = restore.compare_snapshots(
+            meta_for([CART_A]), [CART_A], meta_for([gone]), [gone]
+        )
+        self.assertFalse(report["ok"])
+        self.assertEqual(report["positionDeltas"]["count"], 1)
+        self.assertIn("missing", report["positionDeltas"]["sample"][0]["reason"])
+
+    def test_a_velocity_missing_on_the_actual_side_is_a_mismatch(self) -> None:
+        gone = copy(CART_A)
+        del gone["vel"]
+        gone["nbt"] = gone["nbt"].replace('"Motion":[0.0d,0.0d,0.0d],', "")
+        report = restore.compare_snapshots(
+            meta_for([CART_A]), [CART_A], meta_for([gone]), [gone]
+        )
+        self.assertFalse(report["ok"])
+        self.assertEqual(report["velocityDeltas"]["count"], 1)
+        self.assertIn("missing", report["velocityDeltas"]["sample"][0]["reason"])
+
 
 class CollisionTests(unittest.TestCase):
     def test_same_uuid_is_an_exact_collision(self) -> None:
@@ -324,6 +428,23 @@ class CollisionTests(unittest.TestCase):
         other = copy(CART_A, uuid="66666666-6666-4666-8666-666666666666", type="minecraft:tnt", pos=[10.5, 64.5, -3.5])
         found = restore.collisions(ENTITIES, [far, other])
         self.assertEqual(found["count"], 0)
+
+    def test_a_uuid_collision_is_not_double_counted_as_spatial(self) -> None:
+        found = restore.collisions(ENTITIES, [CART_A, CART_B])
+        self.assertEqual(found["count"], 2)
+        self.assertEqual(found["uuidCollisions"]["count"], 2)
+        self.assertEqual(found["spatialCollisions"]["count"], 0)
+        self.assertEqual(len(found["targets"]), 2)
+        self.assertTrue(all(target["reason"] == "uuid" for target in found["targets"]))
+
+    def test_targets_carry_the_full_collision_set_not_just_samples(self) -> None:
+        leftovers = [
+            copy(CART_A, uuid="44444444-4444-4444-8444-44444444444%d" % index, pos=[10.5, 64.0, -3.5])
+            for index in range(12)
+        ]
+        found = restore.collisions(ENTITIES, leftovers)
+        self.assertEqual(found["count"], 12)
+        self.assertEqual(len(found["targets"]), 12)
 
 
 class EndpointCheckTests(unittest.TestCase):
@@ -364,13 +485,33 @@ class EndpointCheckTests(unittest.TestCase):
         with self.assertRaises(RestoreError):
             restore.endpoint_checks(self.endpoint(levelName=None), expect_level="world")
 
+    def test_no_expectations_is_explicitly_unverified(self) -> None:
+        checks = restore.endpoint_checks(self.endpoint())
+        self.assertFalse(checks["verified"])
+        self.assertEqual(checks["proofs"], [])
+        self.assertIn("no expect_", checks["reason"])
+
     def test_no_expectations_and_a_failed_state_reports_unverified_but_may_proceed(self) -> None:
         checks = restore.endpoint_checks({"error": "not connected"})
         self.assertFalse(checks["verified"])
         self.assertIn("not connected", checks["reason"])
+        self.assertEqual(checks["proofs"], [])
 
         with self.assertRaises(RestoreError):
             restore.endpoint_checks({"error": "not connected"}, expect_instance="server")
+
+    def test_allow_unproven_is_flagged_in_the_result(self) -> None:
+        checks = restore.endpoint_checks({"error": "not connected"}, allow_unproven=True)
+        self.assertFalse(checks["verified"])
+        self.assertTrue(checks["overridden"])
+
+    def test_matching_expectations_report_which_proofs_were_used(self) -> None:
+        checks = restore.endpoint_checks(
+            self.endpoint(), expect_instance="server", expect_world_dir="f:/labs/dst/world/"
+        )
+        self.assertTrue(checks["verified"])
+        self.assertEqual(checks["proofs"], ["expect_instance", "expect_world_dir"])
+        self.assertFalse(checks["overridden"])
 
     def test_normalize_path_folds_separators_case_and_dots(self) -> None:
         self.assertEqual(
