@@ -194,7 +194,9 @@ lab, and restored it under guard.
 Build under test: interface mod **0.6.0**, a clean build whose source commit is
 `3b93ceb137f8e05624d9d443356c0db78c4b4751` and whose jar SHA-256 is
 `45f12e16b3979be6a699ac3c744b2a68dfcf8dd2379f5987bf9b9319adf4404f`;
-Fabric loader 0.19.5, Java 25.0.1, Minecraft 26.2.
+Fabric loader 0.19.5, Java 25.0.1, Minecraft 26.2. The bridge under test is the
+combined result of this change and `main`'s bridge 0.4.1 `player.view` fix
+(PR8), so the same run also smoke-tests that fix.
 
 Fixture and result, taken from `source-before` / `bridge6-fixture` and from the
 verification snapshot after a real server restart:
@@ -218,6 +220,7 @@ What the run proved, with the evidence kept under `labs/evidence/`:
 | `verify=false` | `ok: null`, `verdict: "unverified"`, `verified: false`, `verification: null`; a separate `verify` afterwards is `ok: true` |
 | live inventory mutation (`Items[0].count` 5/2/7 -> 64) | `verify` `ok: false`, order hash unchanged, 3 `nbtMismatches` with both inventory fragments; guarded repair `ok: true` |
 | server stop/start (real chunk reload) | `verify strict=false`: 3 entities, 0 missing, 0 unexpected, counts/dimension/NBT match |
+| `player`/`player.view` smoke (PR8 on 0.6.0) | a Carpet fake player spawned at a restored position returns `found`, `dimension`, eye/direction and a `hit` on the chest minecart at `(0.5, 101.0, 0.5)` |
 | source world after the whole run | full-state comparison against `source-before`: unchanged |
 
 The fork manifest also confirmed the 26.2 layout live: entity storage under
@@ -237,8 +240,9 @@ the freeze watchdog (`test_the_freeze_watchdog_releases_a_stuck_restore`),
 ### Reproducing and retained evidence
 
 The driver is `labs/live_verify.py` with stages `setup`, `fork`, `restore`,
-`duplicate`, `mutate`, `unverified`, `after-reload`, `source-final`. It writes
-`labs/evidence/<stage>.json` plus `summary.json`, and `labs/evidence/index.json`
-records the bridge commit, the interface jar path/hash and source commit, the
-runtime versions, the ports, and a SHA-256 of every evidence file, so a later
-reader can tell whether the retained files are the ones the report describes.
+`duplicate`, `mutate`, `unverified`, `player-view`, `after-reload`,
+`source-final`. It writes `labs/evidence/<stage>.json` plus `summary.json`, and
+`labs/evidence/index.json` records the bridge commit, the interface jar
+path/hash and source commit, the runtime versions, the ports, and a SHA-256 of
+every evidence file, so a later reader can tell whether the retained files are
+the ones the report describes.
