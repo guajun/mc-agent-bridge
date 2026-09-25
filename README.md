@@ -200,6 +200,91 @@ The equivalent of the older `mc-codex-bridge` design was one special-purpose
 daemon per agent. Here the daemon is neutral and each agent attaches however it
 likes: MCP, the JSON-lines API, or a loop built on this package.
 
+## Forwarding events to a webhook
+
+`mc-bridge forward` is an optional, receiver-neutral event forwarder. It
+subscribes to the daemon's event stream over loopback and POSTs selected events
+to one HTTP(S) URL. It contains no agent runtime and makes no model calls, and
+only *outbound* requests leave the machine, so the mod and local API keep their
+loopback bindings.
+
+```bash
+export MC_AGENT_WEBHOOK_URL="https://listener.example/hooks/mc-agent"
+export MC_AGENT_WEBHOOK_SECRET="$(python -c 'import secrets; print(secrets.token_urlsafe(32))')"
+mc-bridge forward --events chat,game,mark,error
+```
+
+Forwarding is **off by default**: without both a URL and a secret the command
+refuses to start. Credentials come from the environment or a JSON config file,
+never from command-line flags, so they cannot land in shell history. Queue and
+retry state live in memory only - there is no durable delivery across machine
+restarts, and a restarted forwarder does not replay what it missed. Receivers
+should therefore treat `eventId` as the idempotency key.
+
+### Request contract
+
+Every delivery is an HTTP `POST` with a JSON body:
+
+```jsonc
+{
+  "eventId": "9f2c0a1b...:7",        // stable; unchanged across retries
+  "sequence": 7,                       // the daemon's buffered sequence
+  "streamId": "9f2c0a1b...",          // identifies the daemon run
+  "event": "chat",                     // bridge category: chat, game, mark, error, ...
+  "type": "chat",                      // the raw server event type
+  "category": "chat",
+  "timestamp": 1730000000123,          // event receipt time, epoch milliseconds
+  "tick": 4211,                        // game tick when available, else null
+  "sender": "Alice",                   // sender identity when the event has one
+  "context_id": "ctx-42",              // server-vantage chat context reference
+  "data": { "...": "the original server event, verbatim" }
+}
+```
+
+| Header | Meaning |
+| --- | --- |
+| `X-MC-Agent-Signature` | `sha256=<hex>` HMAC-SHA256 over `"<timestamp>.<raw body>"`, key = shared secret |
+| `X-MC-Agent-Timestamp` | Unix seconds used in the signature |
+| `X-MC-Agent-Event-Id` | Same `eventId` as the body; use it as the idempotency key |
+| `X-MC-Agent-Event-Type` | Raw event type, for routing without parsing the body first |
+| `X-MC-Agent-Attempt` | 1 for the first try, 2 for the first retry, ... |
+
+A receiver verifies a request by checking that the signing timestamp is inside
+its replay window (300 seconds is the documented default) and comparing the
+signature in constant time. A minimal Python receiver side check:
+
+```python
+import hashlib, hmac, time
+
+def verify(secret, header_timestamp, raw_body, signature, window=300):
+    if abs(time.time() - int(header_timestamp)) > window:
+        return False
+    expected = "sha256=" + hmac.new(
+        secret.encode(), f"{header_timestamp}.".encode() + raw_body, hashlib.sha256
+    ).hexdigest()
+    return hmac.compare_digest(expected, signature)
+```
+
+### Retries and status
+
+Network failures, truncated or malformed HTTP responses, HTTP 5xx, 408, 425
+and 429 are retried with bounded exponential backoff (default 1s base, 30s
+cap, 5 attempts); other statuses are reported as permanent and not retried.
+Redirects are never followed - following one would turn the signed POST into
+a GET and drop the body - so point the forwarder at the final receiver URL;
+a 3xx is a permanent failure. A retry re-signs with a fresh timestamp but
+reuses the same body and `eventId`. The forwarder logs every failure,
+permanent rejection and queue overflow, and `WebhookForwarder.status()` exposes
+`queued`, `delivered`, `retries`, `failed`, `dropped`, `lastEventId` and a
+sanitized `lastError`. Logs never contain the shared secret or the full
+receiver URL - the URL's path and query are redacted too, because hosted
+webhook URLs often carry a token there.
+
+Configuring a particular receiver or Harness to consume the webhook (routes,
+skills, credentials) is deliberately out of scope; the contract above is all a
+receiver needs. The event source, this forwarder and the mod are expected to
+run on the same machine.
+
 ## Forking a live world
 
 A save file has the blocks and the entity NBT, but not the **tick order**:
@@ -256,6 +341,15 @@ if only the entities are interesting, pass `"regions": false`.
 | `MC_AGENT_SERVER_DIR` | - | game/server directory for server-vantage discovery |
 | `MC_AGENT_API_HOST` | `127.0.0.1` | host the MCP front-end dials |
 | `MC_AGENT_API_PORT` | `8765` | port the MCP front-end dials |
+| `MC_AGENT_WEBHOOK_URL` | - | receiver URL; forwarding needs this and a secret |
+| `MC_AGENT_WEBHOOK_SECRET` | - | shared secret for HMAC-SHA256 signing |
+| `MC_AGENT_WEBHOOK_EVENTS` | `chat,game,mark,error` | comma separated categories, `*` for all |
+| `MC_AGENT_WEBHOOK_QUEUE` | `256` | bounded in-memory delivery queue |
+| `MC_AGENT_WEBHOOK_MAX_ATTEMPTS` | `5` | delivery attempts per event, first try included |
+| `MC_AGENT_WEBHOOK_BACKOFF` | `1.0` | base retry backoff in seconds |
+| `MC_AGENT_WEBHOOK_MAX_BACKOFF` | `30.0` | retry delay cap in seconds |
+| `MC_AGENT_WEBHOOK_TIMEOUT` | `10.0` | per-request network timeout in seconds |
+| `MC_AGENT_WEBHOOK_CONFIG` | - | JSON file with `url`, `secret`, `events`, ... (env overrides it) |
 
 The API binds to loopback only. It can run arbitrary commands as the server's
 command source, so treat the machine it runs on as trusted.
