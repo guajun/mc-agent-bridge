@@ -96,6 +96,21 @@ class DaemonTests(unittest.IsolatedAsyncioTestCase):
         finally:
             await api.close()
 
+    async def test_events_carry_a_stable_stream_and_event_id(self) -> None:
+        api = await self.client()
+        try:
+            await wait_for(lambda: self.daemon.connected)
+            await self.mod.push({"type": "chat", "text": "ping", "sender": "tester"})
+            await wait_for(lambda: bool(self.daemon.recent_events(category="chat")["events"]))
+
+            event = (await api.call("events", {"category": "chat"}))["events"][-1]
+            self.assertEqual(event["streamId"], self.daemon.stream_id)
+            self.assertEqual(event["eventId"], f"{self.daemon.stream_id}:{event['seq']}")
+            status = await api.call("status")
+            self.assertEqual(status["events"]["streamId"], self.daemon.stream_id)
+        finally:
+            await api.close()
+
     async def test_unknown_method_and_missing_mod(self) -> None:
         api = await self.client()
         try:

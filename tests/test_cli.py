@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import contextlib
+import io
+import os
 import unittest
 
 from mc_agent_bridge.cli import build_parser
@@ -36,3 +39,25 @@ class ParserTests(unittest.TestCase):
     def test_watch_and_mcp_parse(self) -> None:
         self.assertEqual(self.parser.parse_args(["watch", "--events", "chat"]).events, "chat")
         self.assertEqual(self.parser.parse_args(["mcp"]).transport, "stdio")
+
+    def test_forward_parses_and_takes_no_credential_flags(self) -> None:
+        args = self.parser.parse_args(
+            ["forward", "--config", "hook.json", "--events", "chat", "--delivery-timeout", "3"]
+        )
+        self.assertEqual(args.config, "hook.json")
+        self.assertEqual(args.events, "chat")
+        self.assertEqual(args.delivery_timeout, 3.0)
+
+        for option in ("--url", "--secret"):
+            with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
+                self.parser.parse_args(["forward", option, "value"])
+
+    def test_forward_refuses_to_start_without_credentials(self) -> None:
+        from unittest.mock import patch
+
+        from mc_agent_bridge.cli import main
+
+        stderr = io.StringIO()
+        with patch.dict(os.environ, {}, clear=True), contextlib.redirect_stderr(stderr):
+            self.assertEqual(main(["forward"]), 1)
+        self.assertIn("off by default", stderr.getvalue())
