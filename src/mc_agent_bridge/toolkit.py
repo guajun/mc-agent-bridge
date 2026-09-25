@@ -4,8 +4,8 @@ The mod is the source of truth for capabilities. Its ``CAPS`` reply (and the
 ``hello`` frame) lists tokens such as ``state``, ``chat`` or ``snapshot``; the
 toolkit maps each operation onto those tokens and hides - or explains -
 operations the connected mod cannot serve. That keeps client-vantage tools out
-of a server-vantage session, and makes unmerged mod work (per-player context,
-chat-time context bundles) appear only once the mod advertises it.
+of a server-vantage session, and gates server-vantage operations (per-player
+context, chat-time context bundles) on the capability the mod advertises.
 
 Nothing here talks to the game. These are pure functions over a capability set,
 shared by the daemon, the CLI and the MCP front-end.
@@ -52,10 +52,9 @@ INTERFACE_MOD_PLAYER_LABEL = "mc-agent-interface-mod#1 (Expose server-side conte
 INTERFACE_MOD_CONTEXT = "https://github.com/guajun/mc-agent-interface-mod/issues/2"
 INTERFACE_MOD_CONTEXT_LABEL = "mc-agent-interface-mod#2 (Capture and cache player context with chat events)"
 
-#: Alias groups for capability tokens. Most names are their own only token;
-#: the two not-yet-merged APIs are still free to pick a spelling, so the
-#: adapter accepts the names the mod issues use. This is the single place to
-#: change once they are merged.
+#: Alias groups for capability tokens. The adapter accepts every spelling a
+#: released mod has used, so capability negotiation survives a renaming; this
+#: is the single place to extend when a new release picks another name.
 CAPABILITY_ALIASES: dict[str, tuple[str, ...]] = {
     "player_context": ("player_context", "playercontext", "player", "context:player"),
     "context_bundle": (
@@ -104,8 +103,9 @@ class Operation:
     description: str
     #: Canonical capability names; every one must be advertised.
     requires: tuple[str, ...] = ()
-    #: Where the gap comes from when ``requires`` is unmet, if it is not the
-    #: released mod - i.e. a still-open mod issue.
+    #: Where the gap comes from when ``requires`` is unmet, if it is not just the
+    #: connected mod's capability set (for example the mod-side issue that
+    #: introduced the capability).
     dependency: str | None = None
     dependency_label: str | None = None
 
@@ -181,7 +181,7 @@ class UnsupportedCapability(RuntimeError):
             return (
                 f"toolkit operation {self.operation.name!r} is not available: requires "
                 f"{self.operation.dependency_label or self.operation.dependency}; {where} does not "
-                f"advertise {advertised}. The toolkit has no fallback for an unmerged mod API, so "
+                f"advertise {advertised}. The toolkit has no fallback for a missing mod capability, so "
                 f"nothing was sent to the game."
             )
         return (

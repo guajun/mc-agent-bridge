@@ -224,8 +224,8 @@ class BridgeDaemon:
         payload["eventId"] = f"{self.stream_id}:{self._seq}"
         payload["category"] = category
         payload["receivedAt"] = int(time.time() * 1000)
-        # The unmerged chat-context work may spell its event reference either
-        # way; normalize it so consumers have one stable field to read.
+        # A chat event may spell its context reference either way; normalize it
+        # so consumers have one stable field to read.
         reference = adapters.context_id(payload)
         if reference is not None:
             payload["contextId"] = reference
@@ -334,8 +334,8 @@ class BridgeDaemon:
     async def _m_player(self, params: dict[str, Any]) -> dict[str, Any]:
         """Per-player server context, via the adaptive adapter boundary.
 
-        The mod API is still open work (mc-agent-interface-mod#1); the daemon
-        only reaches this handler when CAPS advertises the capability, so an
+        The daemon only reaches this handler when CAPS advertises the
+        ``player`` capability (mc-agent-interface-mod 0.6.0), so an
         unavailable operation fails in the capability gate instead of sending
         a request the mod cannot answer.
         """
@@ -1182,10 +1182,10 @@ class BridgeDaemon:
     async def _m_context(self, params: dict[str, Any]) -> dict[str, Any]:
         """Retrieve a chat-time context bundle by its stable reference.
 
-        The mod API is still open work (mc-agent-interface-mod#2); like
-        ``player``, this handler is only reachable when CAPS advertises the
-        capability. An unknown or expired id comes back structured, not as a
-        different player's context.
+        The daemon only reaches this handler when CAPS advertises the
+        ``context`` capability (mc-agent-interface-mod 0.6.0); like ``player``,
+        an unknown or expired id comes back structured, not as a different
+        player's context.
         """
         context_id = (
             str(

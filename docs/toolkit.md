@@ -160,20 +160,23 @@ mc_events(since=0, category="game")  # replay what happened
 
 ### Adaptive operations
 
-Two operations are wired to mod APIs that are still open work:
+Two operations are gated on the connected mod's capability (shipped in
+mc-agent-interface-mod 0.6.0):
 
-| Tool | Needs | Tracking issue |
+| Tool | Needs | Origin |
 | --- | --- | --- |
-| `mc_player(player)` | server-side player context (identity, rotation, view target) | [mc-agent-interface-mod#1](https://github.com/guajun/mc-agent-interface-mod/issues/1) |
+| `mc_player(player)` | server-side player context: identity, dimension, position, rotation, eye, view direction and target | [mc-agent-interface-mod#1](https://github.com/guajun/mc-agent-interface-mod/issues/1) |
 | `mc_context(context_id)` | chat-time player context bundle lookup | [mc-agent-interface-mod#2](https://github.com/guajun/mc-agent-interface-mod/issues/2) |
 
 They are hidden until the connected mod advertises the capability. If a caller
 tries one anyway (for example through a stale tool list), the daemon refuses it
-*before* sending anything and says which issue the capability comes from. The
-adapter boundary - request line, reply normalization, aliases - lives in
-`src/mc_agent_bridge/adapters.py`, so merging the mod issues is a one-file
-change on this side. Until then, use `mc_state`'s `playerList` for a global
-per-player view (name, UUID, position, dimension; no rotation or view target).
+*before* sending anything and says which capability is missing. The adapter
+boundary - request line, reply normalization, aliases - lives in
+`src/mc_agent_bridge/adapters.py`. The released mod reports the entity record
+under `player` and the ray under a separate top-level `view`; the adapter merges
+the ray into `player.view` so one accessor works for every reply shape. The
+raw mod reply is authoritative; `mc_capabilities` confirms what the connection
+serves.
 
 ## 6. CLI fallback
 

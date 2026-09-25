@@ -35,7 +35,7 @@ class CapabilityNormalizationTests(unittest.TestCase):
         self.assertIsNone(normalize_capabilities(None))
         self.assertEqual(normalize_capabilities([]), frozenset())
 
-    def test_alias_groups_recognize_the_unmerged_mod_spellings(self) -> None:
+    def test_alias_groups_recognize_the_released_mod_spellings(self) -> None:
         for spelling in ("player_context", "playerContext", "player", "context:player"):
             self.assertTrue(has_capability(normalize_capabilities([spelling]), "player_context"))
         for spelling in ("context_bundle", "context", "chat_context", "context:chat"):
