@@ -1,24 +1,25 @@
-"""Adapter boundary for the not-yet-merged server-vantage mod operations.
+"""Adapter boundary for the server-vantage player and context operations.
 
-The toolkit exposes two operations whose mod API is still open work:
+The toolkit exposes two operations whose mod APIs shipped in
+mc-agent-interface-mod 0.6.0:
 
-* ``player`` - per-player server-side context (mc-agent-interface-mod#1);
-* ``context`` - chat-time context-bundle lookup (mc-agent-interface-mod#2).
+* ``player`` - per-player server-side context, including the view ray;
+* ``context`` - chat-time context-bundle lookup.
 
-The bridge talks to the mod over the line protocol, so until those issues
-merge the toolkit knows only the request line and reply shape it *expects*. It
-checks the connected mod's CAPS before sending anything: if the capability is
-advertised the adapter sends the canonical line and normalizes the reply; if it
-is not, the daemon raises :class:`~mc_agent_bridge.toolkit.UnsupportedCapability`
-and no request reaches the game.
+The bridge talks to the mod over the line protocol, so the adapter knows the
+canonical request lines and keeps the mapped shapes stable across mod reply
+variants. It checks the connected mod's CAPS before sending anything: if the
+capability is advertised the adapter sends the canonical line and normalizes
+the reply; if it is not, the daemon raises
+:class:`~mc_agent_bridge.toolkit.UnsupportedCapability` and no request reaches
+the game.
 
-When the mod issues merge, adjust only this file:
-
-* canonical request lines are ``PLAYER <uuid|name>`` and ``CONTEXT <id>``;
-* reply normalization accepts a nested object (``player`` / ``context``) or
-  flat fields, keeps unknown fields out of the model-facing result, and
-  preserves structured ``found``/``status``/``reason`` answers for unknown or
-  expired lookups.
+Canonical request lines are ``PLAYER <uuid|name>`` and ``CONTEXT <id>``. Reply
+normalization accepts a nested object (``player`` / ``context``), flat fields,
+and the released mod's split shape (a ``player`` entity record plus a separate
+top-level ``view``), keeps unknown fields out of the model-facing result, and
+preserves structured ``found``/``status``/``reason`` answers for unknown or
+expired lookups.
 """
 
 from __future__ import annotations
@@ -82,9 +83,27 @@ def _nested_or_flat(reply: dict[str, Any], key: str, fields: tuple[str, ...]) ->
     return flat or None
 
 
+def _player_with_view(reply: dict[str, Any], player: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Keep the server-side view with the player it belongs to.
+
+    The released mod answers ``PLAYER`` with the entity record under ``player``
+    and the ray under a separate top-level ``view``; this toolkit's contract
+    documents ``player.view``. Merge the two without overwriting a view the
+    player object already carries, so one accessor works for both shapes.
+    """
+    if not isinstance(player, dict):
+        return player
+    view = reply.get("view")
+    if not isinstance(view, dict) or isinstance(player.get("view"), dict):
+        return player
+    merged = dict(player)
+    merged["view"] = view
+    return merged
+
+
 def player_context(reply: dict[str, Any], identifier: str | None = None) -> dict[str, Any]:
     """Normalize a mod ``PLAYER`` reply into a stable toolkit result."""
-    player = _nested_or_flat(reply, "player", _PLAYER_FIELDS)
+    player = _player_with_view(reply, _nested_or_flat(reply, "player", _PLAYER_FIELDS))
     found = reply.get("found")
     result: dict[str, Any] = {
         "type": "player_context",

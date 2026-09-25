@@ -179,8 +179,9 @@ mc-bridge mcp --vantage client     # legacy client surface only
 The tool list is filtered by the connected instance's CAPS, so a server-vantage
 session gets only the operations it can serve: health, capabilities, state,
 entities, commands, command output, wait, mark, events, save, snapshots, fork,
-restore and order - plus `mc_player`/`mc_context` once those mod APIs land -
-and never `mc_chat`, `mc_screen`, `mc_connect` or the other client-only tools.
+restore and order - and `mc_player`/`mc_context` when the mod advertises
+them - and never `mc_chat`, `mc_screen`, `mc_connect` or the other client-only
+tools.
 Before the daemon answers, the front-end registers the documented default
 server surface; once it answers, the live CAPS reply wins. Callers should
 still start with `mc_capabilities`, which returns the raw CAPS list plus the

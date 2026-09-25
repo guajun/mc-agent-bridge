@@ -69,7 +69,7 @@ class FakeMod:
         self.capabilities = (
             list(CLIENT_CAPABILITIES) if capabilities is None else list(capabilities)
         )
-        #: Replies for the adaptive operations (unmerged mod APIs).
+        #: Replies for the adaptive operations (capability-gated mod APIs).
         self.player_reply = player_reply
         self.context_reply = context_reply
         #: When set, CMD acks carry the output array the server vantage sends.

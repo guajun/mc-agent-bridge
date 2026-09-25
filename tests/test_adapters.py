@@ -1,10 +1,11 @@
 """Tests for the adaptive boundaries: per-player context and context bundles.
 
-The mod APIs behind ``player``/``context`` are still open issues, so the
-contract these tests pin down is: (1) when the connected mod advertises the
-capability, the canonical line is delegated and the reply normalized; (2) when
-it does not, nothing is sent and the caller gets an actionable error naming the
-tracking issue.
+The mod APIs behind ``player``/``context`` shipped in mc-agent-interface-mod
+0.6.0, so the contract these tests pin down is: (1) when the connected mod
+advertises the capability, the canonical line is delegated and the reply
+normalized; (2) both reply shapes seen in the wild land on the documented
+``player.view``; (3) when the capability is missing, nothing is sent and the
+caller gets an actionable error naming the tracking issue.
 """
 
 from __future__ import annotations
@@ -39,6 +40,37 @@ PLAYER_REPLY = {
         "position": [10.5, 64.0, -3.25],
         "rotation": {"yaw": 90.0, "pitch": 12.5},
         "view": {"type": "block", "x": 12, "y": 63, "z": -3, "block": "minecraft:stone"},
+    },
+}
+
+#: The released mod (0.6.0) splits the entity record and the ray: the view is a
+#: top-level field, not a child of ``player``.
+PLAYER_REPLY_SPLIT_VIEW = {
+    "type": "player",
+    "tick": 4210,
+    "found": True,
+    "matchedBy": "uuid",
+    "player": {
+        "uuid": "f0a8f4ba-99f5-412a-9189-db832c934913",
+        "name": "Alice",
+        "dimension": "minecraft:overworld",
+        "x": 0.5,
+        "y": 100.0,
+        "z": 0.5,
+        "yaw": 0.0,
+        "pitch": 0.0,
+        "eye": [0.5, 101.62, 0.5],
+    },
+    "view": {
+        "eye": [0.5, 101.62, 0.5],
+        "direction": [0.0, 0.0, 1.0],
+        "blockRange": 4.5,
+        "entityRange": 3.0,
+        "target": {
+            "type": "block",
+            "distance": 3.5,
+            "block": {"id": "minecraft:dispenser", "x": 0, "y": 101, "z": 4, "face": "north"},
+        },
     },
 }
 
@@ -105,6 +137,34 @@ class AdapterDaemonTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["uuid"], PLAYER_REPLY["player"]["uuid"])
         self.assertEqual(result["name"], "Steve")
         self.assertEqual(result["player"]["position"], [10.5, 64.0, -3.25])
+        self.assertEqual(result["player"]["view"]["block"], "minecraft:stone")
+
+    async def test_split_view_reply_keeps_the_ray_with_the_player(self) -> None:
+        """The released mod's top-level ``view`` must reach the caller."""
+        api = await self.start(
+            SERVER_CAPABILITIES + ["player_context"], player_reply=PLAYER_REPLY_SPLIT_VIEW
+        )
+        result = await api.call(
+            "player", {"player": PLAYER_REPLY_SPLIT_VIEW["player"]["uuid"]}
+        )
+
+        self.assertTrue(result["found"])
+        self.assertEqual(result["name"], "Alice")
+        player = result["player"]
+        self.assertEqual(player["uuid"], PLAYER_REPLY_SPLIT_VIEW["player"]["uuid"])
+        self.assertEqual(player["eye"], [0.5, 101.62, 0.5])
+        self.assertEqual(player["view"]["blockRange"], 4.5)
+        self.assertEqual(player["view"]["target"]["type"], "block")
+        self.assertEqual(
+            player["view"]["target"]["block"]["id"], "minecraft:dispenser"
+        )
+
+    async def test_nested_view_is_not_overwritten_by_a_missing_top_level_view(self) -> None:
+        api = await self.start(
+            SERVER_CAPABILITIES + ["player_context"], player_reply=PLAYER_REPLY
+        )
+        result = await api.call("player", {"player": "Steve"})
+
         self.assertEqual(result["player"]["view"]["block"], "minecraft:stone")
 
     async def test_unknown_player_stays_a_structured_answer(self) -> None:
