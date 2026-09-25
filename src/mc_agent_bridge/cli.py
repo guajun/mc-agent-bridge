@@ -8,7 +8,8 @@ import json
 import sys
 from typing import Any
 
-from .daemon import DEFAULT_API_PORT, DEFAULT_MOD_PORT, BridgeDaemon
+from .daemon import DEFAULT_API_PORT, BridgeDaemon
+from .discovery import DEFAULT_SERVER_PORT, VANTAGE_SERVER, VANTAGES, resolve_port
 from .local_api import LocalApiClient
 
 
@@ -36,6 +37,8 @@ def _cmd_run(args: argparse.Namespace) -> int:
         host=args.mod_host,
         mod_port=args.mod_port,
         port_file=args.port_file,
+        server_dir=args.server_dir,
+        vantage=args.vantage,
         api_host=args.api_host,
         api_port=args.api_port,
         buffer_size=args.buffer,
@@ -46,6 +49,17 @@ def _cmd_run(args: argparse.Namespace) -> int:
     except KeyboardInterrupt:
         print("\n[mc-agent-bridge] stopped")
     return 0
+
+
+def _cmd_discover(args: argparse.Namespace) -> int:
+    resolution = resolve_port(
+        args.mod_port,
+        args.port_file,
+        vantage=args.vantage,
+        server_dir=args.server_dir,
+    )
+    _print(resolution.as_dict())
+    return 0 if resolution.resolved else 2
 
 
 def _cmd_call(args: argparse.Namespace) -> int:
@@ -82,7 +96,7 @@ def _cmd_watch(args: argparse.Namespace) -> int:
 def _cmd_mcp(args: argparse.Namespace) -> int:
     from .mcp_server import main as mcp_main
 
-    mcp_main(transport=args.transport)
+    mcp_main(transport=args.transport, vantage=args.vantage)
     return 0
 
 
@@ -143,6 +157,23 @@ def _add_api_options(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def _add_discovery_options(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--vantage",
+        choices=VANTAGES,
+        default=VANTAGE_SERVER,
+        help="which mod entrypoint to attach to (default: server; client is the legacy override)",
+    )
+    parser.add_argument(
+        "--server-dir",
+        default=None,
+        help=(
+            "game/server directory containing mc-agent-server/port.txt "
+            "(default: current directory; env MC_AGENT_SERVER_DIR)"
+        ),
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="mc-bridge",
@@ -153,17 +184,26 @@ def build_parser() -> argparse.ArgumentParser:
 
     run = sub.add_parser("run", help="run the bridge daemon in the foreground")
     _add_api_options(run)
+    _add_discovery_options(run)
     run.add_argument("--mod-host", default="127.0.0.1")
     run.add_argument(
         "--mod-port",
         type=int,
         default=None,
-        help=f"interface mod port (default: read port.txt, else {DEFAULT_MOD_PORT})",
+        help=f"explicit interface mod port (default: read the port file; server vantage default is {DEFAULT_SERVER_PORT})",
     )
     run.add_argument("--port-file", default=None, help="explicit path to the mod's port.txt")
     run.add_argument("--buffer", type=int, default=1000, help="buffered events kept for replay")
     run.add_argument("--reconnect-delay", type=float, default=2.0)
     run.set_defaults(func=_cmd_run)
+
+    discover = sub.add_parser(
+        "discover", help="resolve the mod endpoint without starting the daemon"
+    )
+    _add_discovery_options(discover)
+    discover.add_argument("--mod-port", type=int, default=None)
+    discover.add_argument("--port-file", default=None, help="explicit path to the mod's port.txt")
+    discover.set_defaults(func=_cmd_discover)
 
     call = sub.add_parser("call", help="call one bridge method")
     _add_api_options(call)
@@ -181,6 +221,12 @@ def build_parser() -> argparse.ArgumentParser:
     mcp = sub.add_parser("mcp", help="serve the bridge over MCP (stdio by default)")
     _add_api_options(mcp)
     mcp.add_argument("--transport", default="stdio")
+    mcp.add_argument(
+        "--vantage",
+        choices=VANTAGES,
+        default=VANTAGE_SERVER,
+        help="surface registered before the daemon answers (default: server)",
+    )
     mcp.set_defaults(func=_cmd_mcp)
 
     forward = sub.add_parser(

@@ -40,6 +40,25 @@ class ParserTests(unittest.TestCase):
         self.assertEqual(self.parser.parse_args(["watch", "--events", "chat"]).events, "chat")
         self.assertEqual(self.parser.parse_args(["mcp"]).transport, "stdio")
 
+    def test_run_accepts_server_first_discovery_options(self) -> None:
+        args = self.parser.parse_args(
+            ["run", "--server-dir", "labs/my-lab", "--port-file", "labs/my-lab/mc-agent-server/port.txt"]
+        )
+        self.assertEqual(args.server_dir, "labs/my-lab")
+        self.assertEqual(args.port_file, "labs/my-lab/mc-agent-server/port.txt")
+        self.assertEqual(args.vantage, "server")
+
+    def test_client_vantage_is_an_explicit_override(self) -> None:
+        args = self.parser.parse_args(["run", "--vantage", "client"])
+        self.assertEqual(args.vantage, "client")
+        self.assertEqual(self.parser.parse_args(["mcp", "--vantage", "client"]).vantage, "client")
+
+    def test_discover_parses_without_api_options(self) -> None:
+        args = self.parser.parse_args(["discover", "--mod-port", "25581"])
+        self.assertEqual(args.mod_port, 25581)
+        self.assertEqual(args.vantage, "server")
+        self.assertEqual(args.func.__name__, "_cmd_discover")
+
     def test_forward_parses_and_takes_no_credential_flags(self) -> None:
         args = self.parser.parse_args(
             ["forward", "--config", "hook.json", "--events", "chat", "--delivery-timeout", "3"]

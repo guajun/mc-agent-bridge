@@ -17,11 +17,18 @@ import uuid
 from collections import deque
 from typing import Any
 
-from . import fork
+from . import adapters, fork
+from .discovery import VANTAGE_SERVER, PortResolution, resolve_port
 from .local_api import LocalApiServer
-from .protocol import ModClient, read_port_file
+from .protocol import ModClient
+from .toolkit import (
+    OPERATION_BY_NAME,
+    UnsupportedCapability,
+    missing_capabilities,
+    normalize_capabilities,
+    surface,
+)
 
-DEFAULT_MOD_PORT = 25580
 DEFAULT_API_PORT = 8765
 
 #: A snapshot writes one JSON record per entity to the instance's disk, which can
@@ -51,34 +58,6 @@ def categorize(message: dict[str, Any]) -> str:
     return "other"
 
 
-def port_file_candidates(explicit: str | None = None) -> list[str]:
-    """Where to look for the port the mod actually bound to.
-
-    The mod writes ``port.txt`` into ``<gameDir>/mc-agent`` and falls back to the
-    next free port when the preferred one is taken, so reading that file is more
-    reliable than assuming a fixed port.
-    """
-    if explicit:
-        return [explicit]
-    candidates: list[str] = []
-    from_env = os.environ.get("MC_AGENT_PORT_FILE")
-    if from_env:
-        candidates.append(from_env)
-    candidates.append(os.path.join(os.getcwd(), "port.txt"))
-    candidates.append(os.path.join(os.getcwd(), "mc-agent", "port.txt"))
-    return candidates
-
-
-def resolve_mod_port(explicit_port: int | None, port_file: str | None) -> tuple[int, str]:
-    if explicit_port:
-        return int(explicit_port), "argument"
-    for candidate in port_file_candidates(port_file):
-        found = read_port_file(candidate)
-        if found:
-            return found, candidate
-    return DEFAULT_MOD_PORT, "default"
-
-
 class BridgeDaemon:
     """Owns one mod connection, serves the loopback API, buffers recent events."""
 
@@ -91,16 +70,26 @@ class BridgeDaemon:
         api_port: int = DEFAULT_API_PORT,
         buffer_size: int = 1000,
         reconnect_delay: float = 2.0,
+        vantage: str = VANTAGE_SERVER,
+        server_dir: str | None = None,
     ) -> None:
         self.host = host
         self.explicit_port = mod_port
         self.port_file = port_file
+        self.vantage = vantage
+        self.server_dir = server_dir
         self.api_host = api_host
         self.api_port = api_port
         self.reconnect_delay = reconnect_delay
 
-        self.mod_port, self.port_source = resolve_mod_port(mod_port, port_file)
+        self.discovery: PortResolution = resolve_port(
+            mod_port, port_file, vantage=vantage, server_dir=server_dir
+        )
+        self.mod_port: int | None = self.discovery.port
+        self.port_source = self.discovery.source
         self.hello: dict[str, Any] | None = None
+        self.instance: str | None = None
+        self.mod_capabilities: frozenset[str] | None = None
         self.client: ModClient | None = None
         self.connected = False
         self.last_error: str | None = None
@@ -121,9 +110,32 @@ class BridgeDaemon:
     async def run(self) -> None:
         await self.server.start()
         self._running = True
-        print(f"[mc-agent-bridge] local API on {self.api_host}:{self.server.port}", flush=True)
+        print(
+            f"[mc-agent-bridge] local API on {self.api_host}:{self.server.port} "
+            f"(vantage: {self.vantage})",
+            flush=True,
+        )
+        reported_discovery: str | None = None
         while self._running:
-            self.mod_port, self.port_source = resolve_mod_port(self.explicit_port, self.port_file)
+            self.discovery = resolve_port(
+                self.explicit_port, self.port_file, vantage=self.vantage, server_dir=self.server_dir
+            )
+            if not self.discovery.resolved:
+                # No fallback to the other vantage and no guessed default: say
+                # what is missing and keep watching for the port file to appear.
+                self.connected = False
+                self.mod_port = None
+                self.port_source = self.discovery.source
+                self.last_error = self.discovery.error
+                if self.discovery.error != reported_discovery:
+                    print(f"[mc-agent-bridge] {self.discovery.error}", flush=True)
+                    reported_discovery = self.discovery.error
+                await self._sleep_or_stop(self.reconnect_delay)
+                continue
+
+            reported_discovery = None
+            self.mod_port = self.discovery.port
+            self.port_source = self.discovery.source
             client = ModClient(self.host, self.mod_port, on_event=self._record_event)
             try:
                 hello = await client.connect(retry=False)
@@ -138,10 +150,35 @@ class BridgeDaemon:
 
             self.client = client
             self.hello = hello
-            self.connected = True
             self.last_error = None
+            # Negotiate before publishing readiness: while ``client`` is set but
+            # ``connected`` is false, game operations are refused instead of
+            # being let through as an unknown legacy mod and sent once the CAPS
+            # request releases ModClient's lock.
+            instance = hello.get("instance") or None
+            # CAPS is the authority for the surface; fall back to the hello
+            # frame, then to "unknown" (a legacy mod the bridge cannot filter).
+            advertised: object = hello.get("capabilities")
+            try:
+                caps_reply = await client.request("CAPS", timeout=10.0)
+            except (OSError, TimeoutError, asyncio.TimeoutError, ConnectionError):
+                caps_reply = None
+            if isinstance(caps_reply, dict) and caps_reply.get("type") == "capabilities":
+                if isinstance(caps_reply.get("capabilities"), (list, tuple)):
+                    advertised = caps_reply["capabilities"]
+                if caps_reply.get("instance"):
+                    instance = str(caps_reply["instance"])
+            self.instance = instance
+            self.mod_capabilities = normalize_capabilities(advertised)
+            self.connected = True
+            described = (
+                f"{len(self.mod_capabilities)} capabilities"
+                if self.mod_capabilities is not None
+                else "capabilities unknown (legacy mod)"
+            )
             print(
-                f"[mc-agent-bridge] connected to interface mod on port {self.mod_port}",
+                f"[mc-agent-bridge] connected to {self.instance or 'interface'} mod on port "
+                f"{self.mod_port} ({described})",
                 flush=True,
             )
             # ModClient already forwards the hello frame to on_event, so it is
@@ -151,6 +188,8 @@ class BridgeDaemon:
 
             self.connected = False
             self.client = None
+            self.instance = None
+            self.mod_capabilities = None
             await self._record_event(
                 {
                     "type": "bridge_disconnected",
@@ -184,6 +223,11 @@ class BridgeDaemon:
         payload["eventId"] = f"{self.stream_id}:{self._seq}"
         payload["category"] = category
         payload["receivedAt"] = int(time.time() * 1000)
+        # The unmerged chat-context work may spell its event reference either
+        # way; normalize it so consumers have one stable field to read.
+        reference = adapters.context_id(payload)
+        if reference is not None:
+            payload["contextId"] = reference
         self._buffer.append(payload)
         self.server.broadcast(category, payload)
 
@@ -206,13 +250,35 @@ class BridgeDaemon:
     # --------------------------------------------------------- request handling
 
     async def handle(self, method: str, params: dict[str, Any]) -> Any:
+        operation = OPERATION_BY_NAME.get(method)
+        if operation is not None:
+            missing = missing_capabilities(operation, self.mod_capabilities)
+            if missing:
+                raise UnsupportedCapability(
+                    operation,
+                    missing,
+                    instance=self.instance,
+                    vantage=self.vantage,
+                )
         handler = getattr(self, f"_m_{method}", None)
         if handler is None:
             raise ValueError(f"unknown bridge method: {method}")
         return await handler(params)
 
+    def surface(self) -> dict[str, Any]:
+        """The filtered operation surface for the current mod connection."""
+        return surface(
+            instance=self.instance,
+            capabilities=self.mod_capabilities,
+            vantage=self.vantage,
+        )
+
     async def _call_mod(self, line: str, timeout: float = 15.0) -> dict[str, Any]:
         client = self.client
+        if client is not None and not self.connected:
+            raise RuntimeError(
+                "the bridge is still negotiating capabilities with the interface mod; retry shortly"
+            )
         if client is None or not self.connected:
             raise RuntimeError(
                 f"interface mod is not connected (last error: {self.last_error or 'none'})"
@@ -228,7 +294,13 @@ class BridgeDaemon:
     async def _m_status(self, _params: dict[str, Any]) -> dict[str, Any]:
         return {
             "connected": self.connected,
+            "vantage": self.vantage,
+            "instance": self.instance,
             "mod": {"host": self.host, "port": self.mod_port, "portSource": self.port_source},
+            "discovery": self.discovery.as_dict(),
+            "capabilities": (
+                sorted(self.mod_capabilities) if self.mod_capabilities is not None else None
+            ),
             "hello": self.hello,
             "lastError": self.last_error,
             "api": {
@@ -241,10 +313,44 @@ class BridgeDaemon:
         }
 
     async def _m_capabilities(self, _params: dict[str, Any]) -> dict[str, Any]:
-        return await self._call_mod("CAPS")
+        reply = await self._call_mod("CAPS")
+        instance = str(reply.get("instance") or self.instance or "") or None
+        advertised = reply.get("capabilities")
+        if isinstance(advertised, (list, tuple)):
+            self.mod_capabilities = normalize_capabilities(advertised)
+            self.instance = instance
+        enriched = dict(reply)
+        enriched["instance"] = instance
+        enriched["modCapabilities"] = (
+            sorted(self.mod_capabilities) if self.mod_capabilities is not None else None
+        )
+        enriched["surface"] = self.surface()
+        return enriched
 
     async def _m_state(self, _params: dict[str, Any]) -> dict[str, Any]:
         return await self._call_mod("STATE")
+
+    async def _m_player(self, params: dict[str, Any]) -> dict[str, Any]:
+        """Per-player server context, via the adaptive adapter boundary.
+
+        The mod API is still open work (mc-agent-interface-mod#1); the daemon
+        only reaches this handler when CAPS advertises the capability, so an
+        unavailable operation fails in the capability gate instead of sending
+        a request the mod cannot answer.
+        """
+        identifier = (
+            str(
+                params.get("player")
+                or params.get("uuid")
+                or params.get("name")
+                or params.get("id")
+                or ""
+            ).strip()
+        )
+        if not identifier:
+            raise ValueError('player needs a name or UUID: {"player": "<name-or-uuid>"}')
+        reply = await self._call_mod(adapters.player_line(_one_line(identifier)))
+        return adapters.player_context(reply, identifier)
 
     async def _m_screen(self, _params: dict[str, Any]) -> dict[str, Any]:
         return await self._call_mod("SCREEN")
@@ -258,6 +364,42 @@ class BridgeDaemon:
     async def _m_command(self, params: dict[str, Any]) -> dict[str, Any]:
         command = str(params.get("command") or "").strip()
         return await self._call_mod(f"CMD {_one_line(command)}")
+
+    async def _m_command_output(self, params: dict[str, Any]) -> dict[str, Any]:
+        """Run a command and return the answer it produced.
+
+        The server vantage collects command output in the ``cmd_ack`` itself
+        (and mirrors it as game events); the client vantage answers only with
+        an ack, so the output is collected from the event buffer instead. One
+        method gives MCP and the CLI the same behavior.
+        """
+        command = str(params.get("command") or "").strip()
+        if not command:
+            raise ValueError('command_output needs a command: {"command": "..."}')
+        wait = float(params.get("wait") or 2.0)
+        cursor = self._seq
+        ack = await self._call_mod(f"CMD {_one_line(command)}")
+        ack_output = ack.get("output")
+        if isinstance(ack_output, list):
+            return {
+                "type": "command_output",
+                "command": ack.get("detail") or command,
+                "output": [str(line) for line in ack_output],
+                "source": "ack",
+            }
+        await asyncio.sleep(max(0.1, min(wait, 30.0)))
+        events = self.recent_events(since=cursor, limit=200)
+        output = [
+            str(event.get("text") or "")
+            for event in events["events"]
+            if event.get("category") in ("game", "chat")
+        ]
+        return {
+            "type": "command_output",
+            "command": ack.get("detail") or command,
+            "output": output,
+            "source": "events",
+        }
 
     async def _m_chat(self, params: dict[str, Any]) -> dict[str, Any]:
         message = str(params.get("message") or "")
@@ -276,6 +418,30 @@ class BridgeDaemon:
         if not level:
             raise ValueError("world needs a level name")
         return await self._call_mod(f"WORLD {level}")
+
+    async def _m_save(self, _params: dict[str, Any]) -> dict[str, Any]:
+        """World-save metadata the server vantage already reports in STATE.
+
+        No new mod API: this is the read-only view a Harness needs to locate
+        the save a fork would copy, without pulling a full entity snapshot.
+        """
+        state = await self._call_mod("STATE")
+        world_dir = state.get("worldDir")
+        exists: bool | None = None
+        if isinstance(world_dir, str) and world_dir:
+            exists = os.path.isdir(world_dir)
+        return {
+            "type": "world_save",
+            "instance": state.get("instance") or self.instance,
+            "levelName": state.get("levelName"),
+            "worldDir": world_dir,
+            "worldDirExistsOnBridgeHost": exists,
+            "serverVersion": state.get("serverVersion"),
+            "tick": state.get("tick"),
+            "players": state.get("players"),
+            "playerList": state.get("playerList"),
+            "levels": state.get("levels"),
+        }
 
     async def _m_lan(self, params: dict[str, Any]) -> dict[str, Any]:
         port = int(params.get("port") or 0)
@@ -463,6 +629,27 @@ class BridgeDaemon:
             await self._call_mod("CMD /tick unfreeze")
         except Exception as error:  # noqa: BLE001 - the original failure matters more
             print(f"[mc-agent-bridge] warning: could not /tick unfreeze: {error}", flush=True)
+
+    async def _m_context(self, params: dict[str, Any]) -> dict[str, Any]:
+        """Retrieve a chat-time context bundle by its stable reference.
+
+        The mod API is still open work (mc-agent-interface-mod#2); like
+        ``player``, this handler is only reachable when CAPS advertises the
+        capability. An unknown or expired id comes back structured, not as a
+        different player's context.
+        """
+        context_id = (
+            str(
+                params.get("id")
+                or params.get("context_id")
+                or params.get("contextId")
+                or ""
+            ).strip()
+        )
+        if not context_id:
+            raise ValueError('context needs an id from a chat event: {"id": "<context-id>"}')
+        reply = await self._call_mod(adapters.context_line(_one_line(context_id)))
+        return adapters.context_bundle(reply, context_id)
 
     async def _m_events(self, params: dict[str, Any]) -> dict[str, Any]:
         return self.recent_events(

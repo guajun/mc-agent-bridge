@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "mc-agent-bridge"
 version = "0.4.0"
-description = "Agent-agnostic Minecraft bridge: mod protocol client, local API, MCP server."
+description = "Harness-neutral Minecraft Toolkit: server-vantage mod client, loopback API, CLI and MCP surface."
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }

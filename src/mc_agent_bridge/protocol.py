@@ -28,6 +28,14 @@ REPLY_TYPES = {
     "pong",
     "snapshot_ack",
     "snapshots",
+    # Per-player context and chat context bundles (still-open mod APIs,
+    # mc-agent-interface-mod#1/#2). The adapter accepts both the bare and the
+    # *_ack spelling; the bare names must be replies here, or their answers
+    # would be routed into the event stream and the caller would time out.
+    "player",
+    "player_context",
+    "context",
+    "context_bundle",
 }
 
 #: Kept for readability and for mod builds that predate the event marker.

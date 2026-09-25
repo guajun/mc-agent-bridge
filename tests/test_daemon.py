@@ -9,10 +9,10 @@ import unittest
 from pathlib import Path
 
 from mc_agent_bridge import fork
-from mc_agent_bridge.daemon import BridgeDaemon, categorize, resolve_mod_port
+from mc_agent_bridge.daemon import BridgeDaemon, categorize
 from mc_agent_bridge.local_api import LocalApiClient
 
-from .fake_mod import FakeMod
+from .fake_mod import SERVER_CAPABILITIES, FakeMod
 from .test_fork import ENTITIES, SKIP_FILES, WORLD_FILES, tree, write_world
 
 
@@ -33,9 +33,6 @@ class CategorizeTests(unittest.TestCase):
         self.assertEqual(categorize({"type": "mark"}), "mark")
         self.assertEqual(categorize({"type": "whatever"}), "other")
 
-    def test_explicit_port_wins(self) -> None:
-        self.assertEqual(resolve_mod_port(1234, None), (1234, "argument"))
-        self.assertEqual(resolve_mod_port(None, None)[0], 25580)
 
 
 class DaemonTests(unittest.IsolatedAsyncioTestCase):
@@ -144,6 +141,8 @@ class ForkDaemonTests(unittest.IsolatedAsyncioTestCase):
             snapshots_dir=self.snapshots,
             entities=ENTITIES,
             tick=104233,
+            instance="server",
+            capabilities=SERVER_CAPABILITIES,
         )
         await self.mod.start()
         self.daemon = BridgeDaemon(mod_port=self.mod.port, api_port=0, reconnect_delay=0.05)
@@ -164,7 +163,7 @@ class ForkDaemonTests(unittest.IsolatedAsyncioTestCase):
     async def test_snapshot_writes_the_entity_set_and_reports_its_order_hash(self) -> None:
         ack = await self.api.call("snapshot", {"name": "before"}, timeout=30)
 
-        self.assertEqual(self.mod.lines, ["SNAPSHOT 0 before"])
+        self.assertEqual(self.mod.requests, ["SNAPSHOT 0 before"])
         self.assertEqual(ack["type"], "snapshot_ack")
         self.assertEqual(ack["entities"], len(ENTITIES))
         self.assertEqual(ack["orderHash"], fork.order_hash([e["uuid"] for e in ENTITIES]))
@@ -176,7 +175,7 @@ class ForkDaemonTests(unittest.IsolatedAsyncioTestCase):
         result = await self.api.call("fork", {"name": "before", "radius": 64}, timeout=60)
 
         self.assertEqual(
-            self.mod.lines,
+            self.mod.requests,
             [
                 "CMD /tick freeze",
                 "CMD /save-all flush",
@@ -257,7 +256,7 @@ class ForkDaemonTests(unittest.IsolatedAsyncioTestCase):
 
         # Only the tick commands are conditional: the flush is what puts the
         # chunks on disk whether or not this call did the freezing.
-        self.assertEqual(self.mod.lines, ["CMD /save-all flush", "SNAPSHOT 0 entities-only"])
+        self.assertEqual(self.mod.requests, ["CMD /save-all flush", "SNAPSHOT 0 entities-only"])
         self.assertTrue(result["snapshotDir"])
         self.assertIsNone(result["forkDir"])
         self.assertIsNone(result["manifest"])
@@ -268,7 +267,7 @@ class ForkDaemonTests(unittest.IsolatedAsyncioTestCase):
         """The consumer's client can omit the name, so the ack has to supply it."""
         result = await self.api.call("fork", {"freeze": False, "regions": False}, timeout=60)
 
-        self.assertEqual(self.mod.lines, ["CMD /save-all flush", "SNAPSHOT"])
+        self.assertEqual(self.mod.requests, ["CMD /save-all flush", "SNAPSHOT"])
         self.assertEqual(result["name"], "snapshot")
         self.assertTrue(result["snapshotDir"].endswith("snapshot"))
 
@@ -337,4 +336,143 @@ class ForkDaemonTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(RuntimeError) as caught:
             await self.api.call("snapshot", {"name": "before the fight"})
         self.assertIn("spaces", str(caught.exception))
-        self.assertEqual(self.mod.lines, [])
+        self.assertEqual(self.mod.requests, [])
+
+
+
+class ServerVantageDaemonTests(unittest.IsolatedAsyncioTestCase):
+    """The daemon's server-first behavior: discovery, status and capability gate."""
+
+    async def asyncSetUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.mod = FakeMod(
+            instance="server",
+            capabilities=SERVER_CAPABILITIES,
+            snapshots_dir=self.root / "snapshots",
+        )
+        await self.mod.start()
+        self.daemon: BridgeDaemon | None = None
+        self.task: asyncio.Task | None = None
+
+    async def asyncTearDown(self) -> None:
+        if self.daemon is not None:
+            await self.daemon.stop()
+        if self.task is not None:
+            with contextlib.suppress(asyncio.CancelledError, TimeoutError):
+                await asyncio.wait_for(self.task, timeout=3)
+        await self.mod.stop()
+        self.tmp.cleanup()
+
+    async def start_daemon(self, with_port_file: bool = True) -> BridgeDaemon:
+        if with_port_file:
+            port_dir = self.root / "mc-agent-server"
+            port_dir.mkdir(exist_ok=True)
+            (port_dir / "port.txt").write_text(str(self.mod.port), encoding="utf-8")
+        self.daemon = BridgeDaemon(
+            server_dir=str(self.root), api_port=0, reconnect_delay=0.05
+        )
+        self.task = asyncio.create_task(self.daemon.run())
+        await wait_for(lambda: self.daemon.server.port != 0)
+        return self.daemon
+
+    async def client(self) -> LocalApiClient:
+        assert self.daemon is not None
+        api = LocalApiClient(port=self.daemon.server.port)
+        await api.connect(retry=False)
+        return api
+
+    async def test_missing_port_file_is_an_actionable_error_and_not_a_fallback(self) -> None:
+        daemon = await self.start_daemon(with_port_file=False)
+        await wait_for(lambda: daemon.last_error is not None)
+        self.assertFalse(daemon.connected)
+        self.assertIsNone(daemon.mod_port)
+        error = daemon.last_error or ""
+        self.assertIn("--port-file", error)
+        self.assertIn("--vantage client", error)
+
+        api = await self.client()
+        try:
+            status = await api.call("status")
+            self.assertEqual(status["vantage"], "server")
+            self.assertFalse(status["connected"])
+            self.assertIsNone(status["discovery"]["port"])
+            self.assertIn("--port-file", status["discovery"]["error"])
+        finally:
+            await api.close()
+
+    async def test_the_port_file_is_picked_up_when_it_appears(self) -> None:
+        daemon = await self.start_daemon(with_port_file=False)
+        await wait_for(lambda: daemon.last_error is not None)
+        port_dir = self.root / "mc-agent-server"
+        port_dir.mkdir()
+        (port_dir / "port.txt").write_text(str(self.mod.port), encoding="utf-8")
+
+        await wait_for(lambda: daemon.connected and daemon.mod_capabilities is not None)
+        self.assertEqual(daemon.mod_port, self.mod.port)
+        self.assertEqual(daemon.instance, "server")
+        self.assertTrue(daemon.mod_capabilities)
+        self.assertEqual(daemon.discovery.source, f"port-file:{port_dir / 'port.txt'}")
+
+    async def test_status_and_capabilities_report_the_filtered_surface(self) -> None:
+        daemon = await self.start_daemon()
+        await wait_for(lambda: daemon.mod_capabilities is not None)
+        api = await self.client()
+        try:
+            status = await api.call("status")
+            self.assertEqual(status["vantage"], "server")
+            self.assertEqual(status["instance"], "server")
+            capabilities = await api.call("capabilities")
+            self.assertEqual(capabilities["instance"], "server")
+            self.assertEqual(capabilities["surface"]["instance"], "server")
+            self.assertIn("snapshot", capabilities["surface"]["supported"])
+            self.assertIn("chat", capabilities["surface"]["unsupported"])
+            operations = {entry["name"]: entry for entry in capabilities["surface"]["operations"]}
+            self.assertEqual(operations["player"]["dependency"].split("/")[-1], "1")
+            self.assertEqual(operations["context"]["dependency"].split("/")[-1], "2")
+        finally:
+            await api.close()
+
+    async def test_a_client_only_operation_is_refused_before_reaching_the_mod(self) -> None:
+        daemon = await self.start_daemon()
+        await wait_for(lambda: daemon.mod_capabilities is not None)
+        api = await self.client()
+        try:
+            with self.assertRaises(RuntimeError) as caught:
+                await api.call("chat", {"message": "hello"})
+            self.assertIn("chat", str(caught.exception))
+            self.assertFalse(any(line.startswith("CHAT ") for line in self.mod.lines))
+        finally:
+            await api.close()
+
+    async def test_server_operations_still_pass_through(self) -> None:
+        daemon = await self.start_daemon()
+        await wait_for(lambda: daemon.mod_capabilities is not None)
+        api = await self.client()
+        try:
+            await api.call("snapshot", {"name": "srv"})
+            self.assertTrue(any(line.startswith("SNAPSHOT") for line in self.mod.lines))
+        finally:
+            await api.close()
+
+    async def test_operations_are_refused_while_capability_negotiation_is_pending(self) -> None:
+        self.mod.caps_delay = 0.6
+        daemon = await self.start_daemon()
+        # The hello frame has arrived and the CAPS request is in flight, but
+        # readiness is not published yet: no game operation may slip through
+        # ungated and be answered after CAPS completes.
+        await wait_for(lambda: daemon.client is not None and not daemon.connected)
+        api = await self.client()
+        try:
+            with self.assertRaises(RuntimeError) as pending:
+                await api.call("chat", {"message": "should-be-blocked"})
+            self.assertIn("negotiating", str(pending.exception))
+            self.assertFalse(any(line.startswith("CHAT ") for line in self.mod.lines))
+
+            await wait_for(lambda: daemon.connected and daemon.mod_capabilities is not None)
+            with self.assertRaises(RuntimeError) as gated:
+                await api.call("chat", {"message": "still-blocked"})
+            self.assertIn("not available", str(gated.exception))
+            self.assertFalse(any(line.startswith("CHAT ") for line in self.mod.lines))
+        finally:
+            await api.close()
