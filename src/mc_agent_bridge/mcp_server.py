@@ -9,7 +9,7 @@ covers "game events start work" workflows.
 The tool list is not static: at startup the front-end asks the daemon for the
 connected mod's capability surface and registers only the operations that
 instance can serve. A server-vantage session therefore never advertises
-client-only tools such as ``mc_screen`` or ``mc_connect``, and the unmerged
+client-only tools such as ``mc_screen`` or ``mc_connect``, and the
 per-player/context operations appear only once the mod advertises them.
 
 Requires the optional dependency: ``pip install "mc-agent-bridge[mcp]"``.
@@ -234,8 +234,10 @@ async def _mc_events(since: int = 0, limit: int = 200, category: str = "") -> An
     """Replay buffered events (chat, game, mark, sample, error) after a cursor.
 
     Pass the returned ``next`` value back as ``since`` to poll incrementally.
-    Chat events may carry ``contextId``: feed it to ``mc_context`` to get the
-    sender's context at the moment the server received the message.
+    Chat events may carry ``contextId``: feed it to ``mc_context`` for the
+    sender's context bundle. The bundle's ``timing`` field says whether it was
+    frozen when a network chat packet arrived (``receipt``) or when a server-
+    side broadcast was captured (``broadcast``).
     """
     return await call(
         "events",
@@ -246,8 +248,11 @@ async def _mc_events(since: int = 0, limit: int = 200, category: str = "") -> An
 async def _mc_context(context_id: str) -> Any:
     """Retrieve a chat-time context bundle by the id on its chat event.
 
-    The bundle is the sender's server-known context when the message arrived:
-    dimension, position, rotation, view target, tick, and a schema version.
+    The bundle is the sender's server-known context frozen for that message:
+    dimension, position, rotation, view target, tick, schema, and a ``timing``
+    label - ``receipt`` for a network chat packet, ``broadcast`` for a
+    server-side ``say`` (for example a Carpet fake player). The bundle is not
+    recomputed, so read ``timing`` before calling it packet-time history.
     This is an adaptive operation: it appears only when the connected mod
     advertises the capability from mc-agent-interface-mod#2. Unknown or expired
     ids come back as ``{"found": false, "status": ...}``, never as another
