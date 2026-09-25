@@ -9,8 +9,10 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import time
-from typing import Any
+import uuid as uuid_module
+from typing import Any, Callable
 
 from mc_agent_bridge.fork import order_hash
 
@@ -83,6 +85,19 @@ class FakeMod:
         #: Entity records, in tick order, that SNAPSHOT writes out.
         self.entity_records = list(entities or [])
         self.tick = tick
+        #: The dimension the fake reports in STATE/SNAPSHOT; tests flip it to
+        #: exercise the bridge's wrong-dimension refusal.
+        self.dimension = "minecraft:overworld"
+        #: ``/tick freeze`` state, so ``/tick query`` answers truthfully.
+        self.tick_frozen = False
+        #: CMD substring -> message: the fake answers that command with the
+        #: message in its output instead of a silent success (server vantage).
+        self.failing_commands: dict[str, str] = {}
+        #: UUIDs handed to summons whose NBT carries no UUID (test fixtures).
+        self.summon_uuids: list[str] = []
+        #: Called with each CMD body before the reply is built; tests use it to
+        #: mutate ``entity_records`` mid-restore.
+        self.on_command: Callable[[str], None] | None = None
         #: Set to make SNAPSHOT answer with an error, for failure-path tests.
         self.snapshot_error: str | None = None
         #: The mod may name the listing reply either way; the bridge must take both.
@@ -212,10 +227,7 @@ class FakeMod:
         if upper.startswith("CHAT "):
             return {"type": "chat_ack", "detail": line[5:]}
         if upper.startswith("CMD "):
-            ack: dict[str, Any] = {"type": "cmd_ack", "detail": line[4:]}
-            if self.cmd_output is not None:
-                ack["output"] = list(self.cmd_output)
-            return ack
+            return self.command_reply(line[4:].strip())
         if upper.startswith("SAMPLE_START"):
             return {"type": "sample_start_ack", "detail": "ticks=10"}
         if upper == "SAMPLE_STOP":
@@ -223,6 +235,71 @@ class FakeMod:
         if upper.startswith("WAIT "):
             return {"type": "wait_ack", "detail": line[5:]}
         return {"type": "error", "message": f"unknown command: {line}"}
+
+    # ------------------------------------------------------------- commands
+
+    def command_reply(self, command: str) -> dict[str, Any]:
+        """A CMD ack, with the fake game's tick/summon side effects applied.
+
+        The bridge sends ``CMD /line``; the real mod strips the slash before
+        running the vanilla command, so the fake does too.
+        """
+        detail = command
+        if command.startswith("/"):
+            command = command[1:]
+        if self.on_command is not None:
+            self.on_command(command)
+        if command.startswith("tick query"):
+            return {
+                "type": "cmd_ack",
+                "detail": detail,
+                "output": [
+                    "The game is frozen." if self.tick_frozen else "The game is running normally."
+                ],
+            }
+        if command.startswith("tick freeze"):
+            self.tick_frozen = True
+        elif command.startswith("tick unfreeze"):
+            self.tick_frozen = False
+        for marker, message in self.failing_commands.items():
+            if marker in command:
+                return {"type": "cmd_ack", "detail": detail, "output": [message]}
+        if command.startswith("summon "):
+            self._simulate_summon(command)
+        ack: dict[str, Any] = {"type": "cmd_ack", "detail": detail}
+        if self.cmd_output is not None:
+            ack["output"] = list(self.cmd_output)
+        return ack
+
+    def _simulate_summon(self, command: str) -> None:
+        """Append what a successful ``/summon <type> <x> <y> <z> <nbt>`` created."""
+        tokens = command.split(" ", 5)
+        if len(tokens) < 6:
+            return
+        entity_type = tokens[1]
+        try:
+            x, y, z = (float(value) for value in tokens[2:5])
+        except ValueError:
+            return
+        nbt = tokens[5].strip()
+        entity_uuid = _uuid_from_nbt(nbt)
+        if entity_uuid is None and self.summon_uuids:
+            entity_uuid = self.summon_uuids.pop(0)
+        if entity_uuid is None:
+            entity_uuid = str(uuid_module.uuid4())
+        self.entity_records.append(
+            {
+                "order": len(self.entity_records),
+                "uuid": entity_uuid,
+                "type": entity_type,
+                "pos": [x, y, z],
+                "vel": _motion_from_nbt(nbt),
+                "nbt": nbt,
+                "passengers": [],
+                "vehicle": None,
+                "restorable": True,
+            }
+        )
 
     # ------------------------------------------------------------- snapshots
 
@@ -251,7 +328,7 @@ class FakeMod:
             "modVersion": "0.1.0",
             "minecraft": "test",
             "tick": self.tick,
-            "dimension": "minecraft:overworld",
+            "dimension": self.dimension,
             "radius": radius,
             "entities": len(self.entity_records),
             "orderHash": hash_value,
@@ -270,7 +347,7 @@ class FakeMod:
             "entities": len(self.entity_records),
             "orderHash": hash_value,
             "tick": self.tick,
-            "dimension": "minecraft:overworld",
+            "dimension": self.dimension,
             "bytes": os.path.getsize(entities_path),
             "replaced": replaced,
         }
@@ -296,3 +373,25 @@ def _is_number(token: str) -> bool:
     except ValueError:
         return False
     return True
+
+
+def _uuid_from_nbt(nbt: str) -> str | None:
+    """The canonical UUID string for an SNBT ``"UUID":[I;a,b,c,d]``, if present."""
+    match = re.search(r'"?UUID"?:\[I;(-?\d+),(-?\d+),(-?\d+),(-?\d+)\]', nbt)
+    if not match:
+        return None
+    parts = [int(value) & 0xFFFFFFFF for value in match.groups()]
+    hexed = "".join(f"{value:08x}" for value in parts)
+    return f"{hexed[0:8]}-{hexed[8:12]}-{hexed[12:16]}-{hexed[16:20]}-{hexed[20:32]}"
+
+
+def _motion_from_nbt(nbt: str) -> list[float]:
+    match = re.search(
+        r'"?Motion"?:\[(-?[\d.eE+]+)d,(-?[\d.eE+]+)d,(-?[\d.eE+]+)d\]', nbt
+    )
+    if not match:
+        return [0.0, 0.0, 0.0]
+    try:
+        return [float(match.group(index)) for index in (1, 2, 3)]
+    except ValueError:
+        return [0.0, 0.0, 0.0]

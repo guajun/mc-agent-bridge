@@ -225,7 +225,8 @@ the current connection supports.
 | `context` | `{found, context: {...}}` or `{found: false, status: "expired"}` (adaptive) |
 | `save` | `{levelName, worldDir, worldDirExistsOnBridgeHost, players, levels, tick}` |
 | `snapshot` / `snapshots` | entity set in tick order (`orderHash`, `dir`) / what is on disk |
-| `fork` / `restore` / `order` | world copy + manifest / dry-run summons / order comparison |
+| `fork` / `restore` | world copy + manifest / guarded dry-run-or-apply summon with full-state verification |
+| `verify` / `order` | full-state comparison (UUID order, counts, pos, vel, NBT) / `orderHash` comparison |
 
 ## 8. Troubleshooting
 

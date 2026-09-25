@@ -11,13 +11,14 @@ without ever touching the Minecraft process.
 from __future__ import annotations
 
 import asyncio
+import math
 import os
 import time
 import uuid
 from collections import deque
 from typing import Any
 
-from . import adapters, fork
+from . import adapters, fork, restore
 from .discovery import VANTAGE_SERVER, PortResolution, resolve_port
 from .local_api import LocalApiServer
 from .protocol import ModClient
@@ -539,38 +540,372 @@ class BridgeDaemon:
             return outcome
 
     async def _m_restore(self, params: dict[str, Any]) -> dict[str, Any]:
-        """Summon the snapshot's entities back, in recorded order (dry run by default).
+        """Restore a fork under guard, then prove the result (dry run by default).
 
-        The commands are the whole restore: vanilla appends each summoned entity
-        to the level's tick list as it is created, so issuing them in file order
-        is what reproduces the order the fork was taken from.
+        The old behaviour was "send one ``/summon`` per entity and count the
+        acks". That cannot tell commands issued from state restored, so the
+        apply path now validates the recording first, proves which instance and
+        world it is about to write to, loads the recorded chunks, refuses to
+        duplicate leftovers (or clears them explicitly), freezes the tick, then
+        re-snapshots and compares full state before unfreezing. ``target`` stays
+        a label: the destination is proven with ``expect_instance`` /
+        ``expect_world_dir`` / ``expect_level`` and the recorded dimension,
+        never by routing on a name this daemon cannot resolve.
         """
         directory = str(params.get("directory") or params.get("dir") or "").strip()
         if not directory:
             raise ValueError("restore needs a directory: the snapshot mc_fork returned")
         dry_run = _as_bool(params.get("dry_run"), default=True)
         target = str(params.get("target") or "").strip() or None
+        expect_instance = _text(params.get("expect_instance"))
+        expect_world_dir = _text(params.get("expect_world_dir"))
+        expect_level = _text(params.get("expect_level"))
+        expect_dimension = _text(params.get("expect_dimension"))
+        freeze = _as_bool(params.get("freeze"), default=True)
+        forceload = _as_bool(params.get("forceload"), default=True)
+        release_forceload = _as_bool(params.get("release_forceload"), default=False)
+        check_existing = _as_bool(params.get("check_existing"), default=True)
+        replace_existing = _as_bool(params.get("replace_existing"), default=False)
+        keep_going = _as_bool(params.get("keep_going"), default=False)
+        verify = _as_bool(params.get("verify"), default=True)
+        strict = _as_bool(params.get("strict"), default=True)
+        verify_radius = params.get("verify_radius")
+        pos_tolerance = _number(params.get("pos_tolerance"), restore.POS_TOLERANCE, "pos_tolerance")
+        vel_tolerance = _number(params.get("vel_tolerance"), restore.VEL_TOLERANCE, "vel_tolerance")
+        collision_radius = _number(
+            params.get("collision_radius"), restore.COLLISION_RADIUS, "collision_radius"
+        )
+        ignore_nbt_keys = _as_list(params.get("ignore_nbt_keys"), "ignore_nbt_keys")
 
         meta, entities = fork.read_snapshot(directory)
-        commands = fork.summon_commands(entities)
+        issues = restore.validate_snapshot(meta, entities)
+        blockers = restore.blocking_issues(issues)
+        if blockers:
+            raise restore.RestoreError(restore.describe_blockers(directory, blockers))
+        plan = restore.restore_plan(entities)
+
+        endpoint = await self._destination_endpoint()
         result: dict[str, Any] = {
             "directory": directory,
             "target": target,
+            "targetIsLabel": True,
             "orderHash": meta.get("orderHash"),
-            "count": len(commands),
+            "dimension": meta.get("dimension"),
+            "levelName": meta.get("levelName"),
+            "count": len(entities),
+            "summonable": len(plan["items"]),
+            "skipped": plan["skipped"],
+            "playersExcluded": meta.get("playersSkipped"),
+            "warnings": [issue.as_dict() for issue in issues if not issue.blocking],
+            "endpoint": endpoint,
+            "checks": {
+                "endpoint": restore.endpoint_checks(
+                    endpoint,
+                    expect_instance=expect_instance,
+                    expect_world_dir=expect_world_dir,
+                    expect_level=expect_level,
+                ),
+                "dimension": None,
+                "existing": None,
+                "tick": None,
+            },
         }
         if dry_run:
             result["dryRun"] = True
-            result["commands"] = commands
+            result["commands"] = plan["commands"]
+            result["ok"] = True
             return result
 
+        box = restore.bounding_box(entities)
+        try:
+            if forceload and box is not None:
+                await self._call_mod(f"CMD {restore.forceload_add_command(box)}")
+            _, baseline_meta, baseline_entities, baseline_dir = await self._take_snapshot(
+                restore.snapshot_name("pre", target)
+            )
+            result["baselineSnapshotDir"] = baseline_dir
+
+            dimension = restore.dimension_check(meta, baseline_meta, expect_dimension)
+            result["checks"]["dimension"] = dimension
+            if not dimension["ok"]:
+                raise restore.RestoreError(
+                    "destination dimension check failed: "
+                    f"{dimension.get('reason')}. Nothing was restored - the summons would land in "
+                    "the wrong dimension. Point the bridge at the intended instance, or pass "
+                    "expect_dimension explicitly if that is really the destination you mean."
+                )
+
+            found = restore.collisions(entities, baseline_entities, collision_radius)
+            existing = {
+                "destinationEntities": len(baseline_entities),
+                "collisions": found["count"],
+                "uuidCollisions": found["uuidCollisions"],
+                "spatialCollisions": found["spatialCollisions"],
+                "action": "none",
+            }
+            result["checks"]["existing"] = existing
+            if found["count"] and check_existing and not replace_existing:
+                raise restore.RestoreError(
+                    f"destination already holds {found['count']} entity/entities that the restore "
+                    f"would duplicate (uuid collisions: {found['uuidCollisions']['count']}, "
+                    f"same-type-at-recorded-position: {found['spatialCollisions']['count']}). "
+                    "Nothing was restored. Clear the copied world first (kill in the recorded box, "
+                    "then save-all flush) or pass replace_existing=true to let the bridge do it."
+                )
+            if found["count"] and check_existing and replace_existing:
+                # Two passes: the first kill of a chest minecart drops its
+                # inventory as item entities, and the second removes those
+                # drops. The box is supposed to hold the recording, not the
+                # recording plus its popped-out contents.
+                await self._call_mod(f"CMD {restore.clear_box_command(box)}")
+                await self._call_mod(f"CMD {restore.clear_box_command(box)}")
+                await self._call_mod("CMD /save-all flush")
+                _, recheck_meta, recheck_entities, recheck_dir = await self._take_snapshot(
+                    restore.snapshot_name("pre-cleared", target)
+                )
+                remaining = restore.collisions(entities, recheck_entities, collision_radius)
+                inside = restore.entities_in_box(recheck_entities, box)
+                existing["action"] = "cleared+flushed"
+                existing["clearedSnapshotDir"] = recheck_dir
+                existing["remainingCollisions"] = remaining["count"]
+                existing["remainingInBox"] = len(inside)
+                if remaining["count"] or inside:
+                    raise restore.RestoreError(
+                        "replace_existing cleared the recorded box but "
+                        f"{len(inside) or remaining['count']} entity/entities are still there after "
+                        "save-all flush; refusing a restore that would duplicate or collide. "
+                        "Leftovers: "
+                        f"{inside[:5] or remaining['uuidCollisions']['sample'] or remaining['spatialCollisions']['sample']}"
+                    )
+                if recheck_entities:
+                    existing["note"] = (
+                        f"{len(recheck_entities)} pre-existing entity/entities outside the recording "
+                        "were left in place"
+                    )
+                baseline_meta, baseline_entities = recheck_meta, recheck_entities
+            elif baseline_entities:
+                if not found["count"]:
+                    existing["action"] = "none (no collisions)"
+                    existing["note"] = "destination entities do not collide with the recording"
+                else:
+                    existing["action"] = "allowed (check_existing=false)"
+                    existing["note"] = (
+                        f"{found['count']} duplicate(s) allowed by check_existing=false and left in place"
+                    )
+        except BaseException:
+            if release_forceload and box is not None:
+                await self._forceload_remove_best_effort(box)
+            raise
+
+        tick: dict[str, Any] = {"prior": "unknown", "frozenByBridge": False, "restored": None}
+        frozen_by_bridge = False
+        if freeze:
+            prior = await self._tick_query()
+            tick["prior"] = "frozen" if prior is True else "running" if prior is False else "unknown"
+            if prior is not True:
+                await self._call_mod("CMD /tick freeze")
+                frozen_by_bridge = True
+            tick["frozenByBridge"] = frozen_by_bridge
+        result["checks"]["tick"] = tick
+
         issued = 0
-        for command in commands:
-            await self._call_mod(f"CMD {_one_line(command)}")
-            issued += 1
+        attempted: list[dict[str, Any]] = []
+        failed: list[dict[str, Any]] = []
+        outputs: dict[int, list[str]] = {}
+        verification: dict[str, Any] | None = None
+        try:
+            for item in plan["items"]:
+                if failed and not keep_going:
+                    break
+                attempted.append(item)
+                try:
+                    ack = await self._call_mod(f"CMD {_one_line(str(item['command']))}")
+                except Exception as error:  # noqa: BLE001 - one entity must not hide the rest
+                    failed.append({**_failed_item(item), "error": str(error)})
+                    continue
+                issued += 1
+                # The game reports both success ("Summoned new ...") and
+                # failure through the collected output, and the text is
+                # locale-dependent, so output is evidence, not a verdict: the
+                # verification snapshot decides whether the entity is there.
+                output = ack.get("output") if isinstance(ack, dict) else None
+                messages = (
+                    [str(line) for line in output if str(line).strip()]
+                    if isinstance(output, list)
+                    else []
+                )
+                if messages:
+                    outputs[int(item["index"])] = messages
+
+            if verify:
+                try:
+                    _, actual_meta, actual, actual_dir = await self._take_snapshot(
+                        restore.snapshot_name("check", target), verify_radius
+                    )
+                    result["verifiedSnapshotDir"] = actual_dir
+                    verification = restore.compare_snapshots(
+                        meta,
+                        entities,
+                        actual_meta,
+                        actual,
+                        strict=strict,
+                        pos_tolerance=pos_tolerance,
+                        vel_tolerance=vel_tolerance,
+                        ignore_nbt_keys=ignore_nbt_keys,
+                    )
+                    actual_uuids = {str(entity.get("uuid") or "") for entity in actual}
+                    already_failed = {int(failure["index"]) for failure in failed}
+                    for item in attempted:
+                        if int(item["index"]) in already_failed:
+                            continue
+                        if str(item["uuid"]) in actual_uuids:
+                            continue
+                        failure = {
+                            **_failed_item(item),
+                            "error": "the entity is not present in the post-restore snapshot",
+                        }
+                        if outputs.get(int(item["index"])):
+                            failure["gameOutput"] = outputs[int(item["index"])]
+                        failed.append(failure)
+                except Exception as error:  # noqa: BLE001 - report, do not lose the issued count
+                    verification = {"ok": False, "error": f"verification snapshot failed: {error}"}
+        finally:
+            if frozen_by_bridge:
+                try:
+                    await self._call_mod("CMD /tick unfreeze")
+                    tick["restored"] = True
+                except Exception as error:  # noqa: BLE001 - the issued/failed counts matter more
+                    tick["restored"] = False
+                    tick["unfreezeError"] = str(error)
+            if release_forceload and box is not None:
+                tick["forceloadReleased"] = await self._forceload_remove_best_effort(box)
+
         result["dryRun"] = False
         result["issued"] = issued
+        result["failed"] = failed
+        result["notAttempted"] = len(plan["items"]) - len(attempted)
+        result["partial"] = bool(failed)
+        result["verification"] = verification
+        result["tick"] = tick
+        result["ok"] = not failed and bool((verification or {}).get("ok", True))
         return result
+
+    async def _m_verify(self, params: dict[str, Any]) -> dict[str, Any]:
+        """Compare a fork with the connected destination, full state and all.
+
+        This is the post-restore check without the restore: take a fresh
+        snapshot of the connected instance and compare UUID order, counts,
+        positions, velocities and NBT - not just ``orderHash``, because an
+        inventory can change while the order hash stays identical.
+        """
+        directory = str(params.get("directory") or params.get("dir") or "").strip()
+        if not directory:
+            raise ValueError("verify needs a directory: the snapshot mc_fork returned")
+        target = str(params.get("target") or "").strip() or None
+        strict = _as_bool(params.get("strict"), default=True)
+        radius = params.get("snapshot_radius")
+        pos_tolerance = _number(params.get("pos_tolerance"), restore.POS_TOLERANCE, "pos_tolerance")
+        vel_tolerance = _number(params.get("vel_tolerance"), restore.VEL_TOLERANCE, "vel_tolerance")
+        ignore_nbt_keys = _as_list(params.get("ignore_nbt_keys"), "ignore_nbt_keys")
+
+        meta, entities = fork.read_snapshot(directory)
+        issues = restore.validate_snapshot(meta, entities)
+        blockers = restore.blocking_issues(issues)
+        if blockers:
+            raise restore.RestoreError(restore.describe_blockers(directory, blockers))
+        _, actual_meta, actual, actual_dir = await self._take_snapshot(
+            restore.snapshot_name("check", target), radius
+        )
+        report = restore.compare_snapshots(
+            meta,
+            entities,
+            actual_meta,
+            actual,
+            strict=strict,
+            pos_tolerance=pos_tolerance,
+            vel_tolerance=vel_tolerance,
+            ignore_nbt_keys=ignore_nbt_keys,
+        )
+        return {
+            "directory": directory,
+            "target": target,
+            "targetIsLabel": True,
+            "snapshotDir": actual_dir,
+            "expected": {
+                "orderHash": report["orderHash"]["expected"],
+                "count": len(entities),
+                "dimension": meta.get("dimension"),
+            },
+            "actual": {
+                "orderHash": report["orderHash"]["actual"],
+                "count": len(actual),
+                "dimension": actual_meta.get("dimension"),
+            },
+            "warnings": [issue.as_dict() for issue in issues if not issue.blocking],
+            "verification": report,
+            "ok": report["ok"],
+        }
+
+    async def _take_snapshot(
+        self, name: str, radius: Any = None
+    ) -> tuple[dict[str, Any], dict[str, Any], list[dict[str, Any]], str]:
+        """``SNAPSHOT`` on the connected instance, read back from disk.
+
+        The reply is only a pointer: the file the mod wrote is what a later
+        restore would consume, so the meta and entities come from disk.
+        """
+        ack = await self._call_mod(fork.snapshot_line(radius, name), timeout=SNAPSHOT_TIMEOUT)
+        snapshot_dir = str(ack.get("dir") or "").strip()
+        if not snapshot_dir:
+            raise RuntimeError(f"SNAPSHOT {name!r} answered without a dir: {ack!r}")
+        meta, entities = fork.read_snapshot(snapshot_dir)
+        return ack, meta, entities, snapshot_dir
+
+    async def _destination_endpoint(self) -> dict[str, Any]:
+        """What the connected instance reports about itself, for endpoint proofs."""
+        endpoint: dict[str, Any] = {"instance": self.instance, "modPort": self.mod_port}
+        try:
+            state = await self._call_mod("STATE")
+        except Exception as error:  # noqa: BLE001 - a missing STATE is reported, not fatal
+            endpoint["error"] = str(error)
+            return endpoint
+        if not isinstance(state, dict):
+            endpoint["error"] = f"STATE answered {type(state).__name__}, not an object"
+            return endpoint
+        endpoint.update(
+            {
+                "worldDir": state.get("worldDir"),
+                "levelName": state.get("levelName"),
+                "serverVersion": state.get("serverVersion"),
+                "tick": state.get("tick"),
+                "players": state.get("players"),
+                "dimensions": [
+                    entry.get("dimension")
+                    for entry in (state.get("levels") or [])
+                    if isinstance(entry, dict)
+                ],
+            }
+        )
+        return endpoint
+
+    async def _tick_query(self) -> bool | None:
+        """``/tick query`` as a tri-state: frozen, running, or unknown."""
+        try:
+            reply = await self._call_mod("CMD /tick query")
+        except Exception:  # noqa: BLE001 - unknown is a valid, reportable answer
+            return None
+        output = reply.get("output") if isinstance(reply, dict) else None
+        if not isinstance(output, list):
+            return None
+        return restore.tick_state_from_output(output)
+
+    async def _forceload_remove_best_effort(self, box: tuple[float, ...]) -> bool:
+        try:
+            await self._call_mod(f"CMD {restore.forceload_remove_command(box)}")
+            return True
+        except Exception as error:  # noqa: BLE001 - releasing the box is cleanup, not the result
+            print(f"[mc-agent-bridge] warning: could not release forceload: {error}", flush=True)
+            return False
 
     async def _m_order(self, params: dict[str, Any]) -> dict[str, Any]:
         """Re-snapshot the connected instance and compare its order hash with a fork.
@@ -667,6 +1002,38 @@ class BridgeDaemon:
 def _one_line(text: str) -> str:
     """The mod protocol is line based, so collapse anything that could break framing."""
     return text.replace("\r", " ").replace("\n", " ")
+
+
+def _text(value: Any) -> str | None:
+    text = str(value or "").strip()
+    return text or None
+
+
+def _number(value: Any, default: float, name: str) -> float:
+    if value is None or value == "":
+        return float(default)
+    try:
+        number = float(value)
+    except (TypeError, ValueError) as error:
+        raise ValueError(f"{name} must be a number, got {value!r}") from error
+    if not math.isfinite(number):
+        raise ValueError(f"{name} must be finite, got {value!r}")
+    return number
+
+
+def _as_list(value: Any, name: str) -> list[str]:
+    if value is None or value == "":
+        return []
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, (list, tuple)):
+        return [str(item) for item in value]
+    raise ValueError(f"{name} must be a string or a list of strings, got {value!r}")
+
+
+def _failed_item(item: dict[str, Any]) -> dict[str, Any]:
+    """The stable identity of one planned summon, for a failure record."""
+    return {"index": item["index"], "uuid": item["uuid"], "command": item["command"]}
 
 
 def _snapshot_name(value: Any) -> str:
