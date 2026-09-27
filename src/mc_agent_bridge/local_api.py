@@ -137,6 +137,7 @@ class LocalApiClient:
         self._pending: dict[str, asyncio.Future[Any]] = {}
         self._events: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
         self._reader_task: asyncio.Task[None] | None = None
+        self._closed = asyncio.Event()
 
     async def connect(self, retry: bool = True) -> None:
         while True:
@@ -144,12 +145,21 @@ class LocalApiClient:
                 self.reader, self.writer = await asyncio.open_connection(
                     self.host, self.port, limit=MAX_LINE_BYTES
                 )
+                self._closed.clear()
                 self._reader_task = asyncio.create_task(self._read_loop())
                 return
             except OSError:
                 if not retry:
                     raise
                 await asyncio.sleep(2)
+
+    async def wait_closed(self) -> None:
+        """Wait until the read loop ends or the connection is closed explicitly."""
+        await self._closed.wait()
+
+    @property
+    def closed(self) -> bool:
+        return self._closed.is_set()
 
     async def call(self, method: str, params: dict[str, Any] | None = None, timeout: float = 30.0) -> Any:
         if self.writer is None:
@@ -192,8 +202,11 @@ class LocalApiClient:
             pass
         except Exception as error:  # noqa: BLE001
             print(f"[mc-agent-bridge] local API read loop stopped: {error!r}")
+        finally:
+            self._closed.set()
 
     async def close(self) -> None:
+        self._closed.set()
         if self.writer is not None:
             self.writer.close()
             try:
