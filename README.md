@@ -4,9 +4,9 @@
 
 A small, Harness-neutral Minecraft Toolkit. It runs next to the game server,
 owns one connection to the `mc-agent-interface` mod, and exposes the game as a
-stable JSON surface any Harness can call over MCP or the CLI: health and
-capabilities, player context, entities, commands, chat, events, context
-bundles, snapshots and world-save metadata.
+stable JSON surface any Harness can call: health and capabilities, player
+context, entities, commands, chat, events, context bundles, snapshots and
+world-save metadata.
 
 The Toolkit contains no model calls, no agent loop and no conversation state,
 and it does not know what any particular Harness wants to do. It also does not
@@ -17,22 +17,24 @@ The default target is the mod's **server vantage** - the authoritative one, and
 the only one that can snapshot entity tick order.
 
 ```
- MCP client / CLI / loop  <->  bridge daemon  <->  server-vantage mod  <->  server
- (any Harness, no SDKs)        this repo          mc-agent-interface      (Fabric)
+    Go CLI / agent loop  <->  bridge daemon  <->  mod  <->  server
+    (any Harness)              (no model SDK)    mc-agent-interface (Fabric)
 ```
 
 See **[docs/toolkit.md](docs/toolkit.md)** for the install-and-use guide and
 the full tool reference.
 
-> **Go runtime (bridge #11).** The product CLI/daemon is now the single Go
-> binary in **[go/](go/README.md)**: `mc-agent daemon ...`, `mc-agent
-> capabilities|state|command|events|...`, the authenticated same-port TLS
-> transport plus the explicit legacy loopback adapter, a token-protected local
-> IPC boundary, an unknown-write ledger, and optional signed webhooks. The
-> Python bridge in `src/mc_agent_bridge/` remains as the legacy path (and the
-> local fork/restore tooling until it is migrated or explicitly retired); its
-> local API client now carries the Go daemon's IPC token. MCP is removed from
-> the product path in bridge #12. The per-operation migration table is in
+> **Go runtime (bridge #11) and MCP removal (bridge #12).** The product
+> CLI/daemon is the single Go binary in **[go/](go/README.md)**: `mc-agent
+> daemon ...`, `mc-agent capabilities|state|command|events|...`, the
+> authenticated same-port TLS transport plus the explicit legacy loopback
+> adapter, a token-protected local IPC boundary, an unknown-write ledger, and
+> optional signed webhooks. **MCP is removed**: there is no MCP server, no
+> `mcp` extra, no `mc-bridge mcp` subcommand, and no MCP configuration in the
+> install or smoke paths. The Python bridge in `src/mc_agent_bridge/` remains
+> the explicit legacy path (and the local fork/restore tooling until it is
+> migrated or retired); its local API client now carries the Go daemon's IPC
+> token. The per-operation migration table is in
 > [go/README.md](go/README.md#migration-matrix).
 
 ## Why a separate daemon
@@ -45,16 +47,16 @@ That buys three things:
 
 * **Swappable Harnesses.** Hermes today, Codex tomorrow, a shell script next
   week. They all speak the same API and none of them touch the game.
-* **Survivable Harness sessions.** A Harness that restarts, or an MCP server
-  that is spawned per session, does not disturb the game connection.
+* **Survivable Harness sessions.** A Harness that restarts does not disturb
+  the game connection; the daemon reconnects and reports gaps.
 * **Event replay.** The daemon keeps a ring buffer of recent events, so an agent
   can ask "what happened while I was thinking?" with a cursor instead of
   needing to be alive at the exact moment something happened.
 
-MCP is offered as an optional front-end (`mc-bridge mcp`), not as the core. MCP
-is a pull-based tool interface: a client spawns the server, so the game cannot
-wake an agent through it. Waking an agent on a game event is the job of an agent
-loop that subscribes to the daemon's event stream - see `mc-agent-loop`.
+There is no MCP front-end: MCP is pull-based and per-session, so it cannot wake
+an agent on a game event. Waking an agent is the job of an agent loop that
+subscribes to the daemon's event stream - the CLI and the optional webhook are
+the supported entries.
 
 ## Requirements
 
@@ -66,8 +68,7 @@ loop that subscribes to the daemon's event stream - see `mc-agent-loop`.
 ## Install
 
 ```bash
-pip install -e .            # core: daemon, local API, CLI
-pip install -e ".[mcp]"     # plus the MCP front-end
+pip install -e .            # legacy Python daemon, local API and CLI
 ```
 
 ## Quick start
@@ -177,41 +178,20 @@ or `*` for everything.
 Feed `next` back as `since` to poll incrementally; `dropped` warns that the
 ring buffer discarded events you never saw.
 
-## MCP front-end
+## Front-ends: Go CLI (product) and the legacy Python daemon
 
-```bash
-mc-bridge mcp                      # stdio, for MCP clients that spawn servers
-mc-bridge mcp --transport streamable-http
-```
-
-```bash
-mc-bridge mcp --vantage client     # legacy client surface only
-```
-
-The tool list is filtered by the connected instance's CAPS, so a server-vantage
-session gets only the operations it can serve: health, capabilities, state,
-entities, commands, command output, wait, mark, events, save, snapshots, fork,
-restore, verify and order - and `mc_player`/`mc_context` when the mod advertises
-them - and never `mc_chat`, `mc_screen`, `mc_connect` or the other client-only
-tools.
-Before the daemon answers, the front-end registers the documented default
-server surface; once it answers, the live CAPS reply wins. Callers should
-still start with `mc_capabilities`, which returns the raw CAPS list plus the
-filtered `surface.supported` / `surface.unsupported` view with reasons.
-
-`mc_command` and `mc_command_output` exist because a command's *answer* is chat,
-not a return value: the first one just sends it, the second sends it and returns
-the answer - from the command reply on the server vantage, or from game/chat
-events on the client vantage. Anything that reports data - `data get entity
-<name> Motion`, `player <name> ...`, mod commands - should use the second.
-
-Verified against `mcp` 2.x (where the SDK renamed `FastMCP` to `MCPServer`) and
-1.x; the front-end picks whichever class the installed SDK provides. It imports
-only the MCP SDK - no agent-framework SDK and no model client.
+MCP was removed in bridge #12. The product entry point is the Go binary -
+see [go/README.md](go/README.md) for `mc-agent daemon`, the CLI commands and
+the migration table. The Python `mc-bridge` commands in this repository
+(`run`, `call`, `watch`, `discover`, `forward`) remain for the legacy daemon
+and for local `fork`/`restore`, which the Go runtime deliberately refuses over
+the remote transport. The Python local API client already speaks the Go
+daemon's loopback API (including its IPC token), so a legacy Harness or an
+agent loop can attach to either daemon with the same JSON-lines API.
 
 The equivalent of the older `mc-codex-bridge` design was one special-purpose
 daemon per agent. Here the daemon is neutral and each agent attaches however it
-likes: MCP, the JSON-lines API, or a loop built on this package.
+likes: the CLI, the JSON-lines API, or an agent loop built on this package.
 
 ## Forwarding events to a webhook
 
@@ -378,8 +358,8 @@ if only the entities are interesting, pass `"regions": false`.
 | --- | --- | --- |
 | `MC_AGENT_PORT_FILE` | - | explicit path to the mod's `port.txt` |
 | `MC_AGENT_SERVER_DIR` | - | game/server directory for server-vantage discovery |
-| `MC_AGENT_API_HOST` | `127.0.0.1` | host the MCP front-end dials |
-| `MC_AGENT_API_PORT` | `8765` | port the MCP front-end dials |
+| `MC_AGENT_API_HOST` | `127.0.0.1` | host the CLI and agent loops dial |
+| `MC_AGENT_API_PORT` | `8765` | port the CLI and agent loops dial |
 | `MC_AGENT_WEBHOOK_URL` | - | receiver URL; forwarding needs this and a secret |
 | `MC_AGENT_WEBHOOK_SECRET` | - | shared secret for HMAC-SHA256 signing |
 | `MC_AGENT_WEBHOOK_EVENTS` | `chat,game,mark,error` | comma separated categories, `*` for all |

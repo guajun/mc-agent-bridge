@@ -54,7 +54,7 @@ COLLISION_RADIUS = 0.75
 class RestoreError(ValueError):
     """A guarded restore was refused before it could mutate the world.
 
-    Subclasses :class:`ValueError` so the local API, CLI and MCP layers turn it
+    Subclasses :class:`ValueError` so the local API and CLI turn it
     into the same plain error response they already return for bad parameters.
     """
 

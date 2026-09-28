@@ -146,7 +146,7 @@ commands failed or were not attempted after a failure.
 | `pos_tolerance` / `vel_tolerance` | `0.01` | Movement slack; a frozen restore reproduces the doubles. |
 | `ignore_nbt_keys` | `[]` | Explicit opt-out fields (e.g. tick counters); off by default. |
 
-`verify` (and the MCP `mc_verify` tool) runs the same comparison without
+`verify` runs the same comparison without
 restoring - use it after an externally driven restore, or to prove "the order
 hash matches but an inventory did not". It validates the destination snapshot
 itself too (counts/hash/malformed records) and fails on a dimension mismatch,

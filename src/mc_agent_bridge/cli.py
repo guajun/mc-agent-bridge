@@ -1,4 +1,8 @@
-"""``mc-bridge`` command line: run the daemon, poke it, or expose it over MCP."""
+"""``mc-bridge`` legacy command line: run the Python daemon or poke its local API.
+
+The product CLI is the Go binary (go/README.md); this Python entry point remains
+for the legacy bridge workflows and local fork/restore until they are migrated.
+"""
 
 from __future__ import annotations
 
@@ -90,13 +94,6 @@ def _cmd_watch(args: argparse.Namespace) -> int:
         asyncio.run(run())
     except KeyboardInterrupt:
         pass
-    return 0
-
-
-def _cmd_mcp(args: argparse.Namespace) -> int:
-    from .mcp_server import main as mcp_main
-
-    mcp_main(transport=args.transport, vantage=args.vantage)
     return 0
 
 
@@ -217,17 +214,6 @@ def build_parser() -> argparse.ArgumentParser:
     watch.add_argument("--since", type=int, default=None, help="replay buffered events after a cursor")
     watch.add_argument("--limit", type=int, default=200)
     watch.set_defaults(func=_cmd_watch)
-
-    mcp = sub.add_parser("mcp", help="serve the bridge over MCP (stdio by default)")
-    _add_api_options(mcp)
-    mcp.add_argument("--transport", default="stdio")
-    mcp.add_argument(
-        "--vantage",
-        choices=VANTAGES,
-        default=VANTAGE_SERVER,
-        help="surface registered before the daemon answers (default: server)",
-    )
-    mcp.set_defaults(func=_cmd_mcp)
 
     forward = sub.add_parser(
         "forward", help="POST selected bridge events to a signed webhook URL"
