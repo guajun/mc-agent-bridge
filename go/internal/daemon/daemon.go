@@ -308,15 +308,17 @@ func (ts *targetSession) run() {
 		}
 		var adapter session.Adapter
 		var err error
+		dialContext, cancelDial := context.WithTimeout(context.Background(), 15*time.Second)
 		switch ts.target.Transport {
 		case protocol.TransportRemote, protocol.TransportFake:
-			adapter, err = session.DialRemote(context.Background(), ts.target, token, ts.lastSequence())
+			adapter, err = session.DialRemote(dialContext, ts.target, token, ts.lastSequence())
 		case protocol.TransportLegacy:
-			adapter, err = session.DialLegacy(context.Background(), ts.target)
+			adapter, err = session.DialLegacy(dialContext, ts.target)
 		default:
 			err = &protocol.Error{Code: protocol.CodeUnsupportedTransport,
 				Message: "unknown transport " + ts.target.Transport}
 		}
+		cancelDial()
 		if err != nil {
 			code := protocol.CodeConnectionFailed
 			var protocolErr *protocol.Error

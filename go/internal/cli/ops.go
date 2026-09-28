@@ -70,7 +70,8 @@ func (a *app) cmdCall(ctx context.Context, args []string) (any, *protocol.Error)
 	timeout := flags.Float64("timeout", 0, "operation timeout in seconds")
 	var keyValues multiFlag
 	flags.Var(&keyValues, "param", "key=value parameter (repeatable)")
-	if err := flags.Parse(rest); err != nil {
+	if err := flags.Parse(reorderInterspersed(rest, map[string]bool{"params": true, "timeout": true,
+		"param": true})); err != nil {
 		return nil, protocol.NewError(protocol.CodeUsage, err.Error())
 	}
 	params := map[string]any{}
@@ -126,7 +127,8 @@ func (a *app) cmdEvents(ctx context.Context, args []string) (any, *protocol.Erro
 	limit := flags.Int("limit", 200, "maximum events to replay")
 	category := flags.String("category", "", "category filter")
 	follow := flags.Bool("follow", false, "keep streaming new events")
-	if err := flags.Parse(args); err != nil {
+	if err := flags.Parse(reorderInterspersed(args, map[string]bool{"since": true, "limit": true,
+		"category": true})); err != nil {
 		return nil, protocol.NewError(protocol.CodeUsage, err.Error())
 	}
 	client, failure := a.connectDaemon()
@@ -184,7 +186,9 @@ func (a *app) cmdConvenience(ctx context.Context, command string, args []string)
 	ticks := flags.Int("ticks", 200, "record ticks")
 	interval := flags.Int("interval", 1, "record interval")
 	ttl := flags.Int("ttl", 300, "lease ttl seconds")
-	if err := flags.Parse(args); err != nil {
+	if err := flags.Parse(reorderInterspersed(args, map[string]bool{"timeout": true, "radius": true,
+		"name": true, "dimension": true, "port": true, "wait": true, "ticks": true,
+		"interval": true, "ttl": true})); err != nil {
 		return nil, protocol.NewError(protocol.CodeUsage, err.Error())
 	}
 	positional := flags.Args()

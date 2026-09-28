@@ -172,6 +172,37 @@ func (a *app) printError(failure *protocol.Error) {
 	fmt.Fprintln(a.stderr, string(payload))
 }
 
+// reorderInterspersed moves flags before positional arguments so a subcommand
+// accepts `target add name --pin x` as well as `target add --pin x name`.
+// The Go flag package stops at the first positional argument by design.
+func reorderInterspersed(args []string, valueFlags map[string]bool) []string {
+	flagsPart := make([]string, 0, len(args))
+	positional := make([]string, 0, len(args))
+	for index := 0; index < len(args); index++ {
+		argument := args[index]
+		if strings.HasPrefix(argument, "-") && argument != "-" {
+			flagsPart = append(flagsPart, argument)
+			name := strings.TrimLeft(argument, "-")
+			if equals := strings.IndexByte(name, '='); equals >= 0 {
+				name = name[:equals]
+			}
+			if !strings.Contains(argument, "=") && valueFlags[name] && index+1 < len(args) {
+				index++
+				flagsPart = append(flagsPart, args[index])
+			}
+			continue
+		}
+		positional = append(positional, argument)
+	}
+	return append(flagsPart, positional...)
+}
+
+func flagSet(name string) (*flag.FlagSet, map[string]bool) {
+	flags := flag.NewFlagSet(name, flag.ContinueOnError)
+	flags.SetOutput(io.Discard)
+	return flags, map[string]bool{}
+}
+
 func (a *app) printUsage() {
 	fmt.Fprintln(a.stderr, `mc-agent - Go CLI/daemon for the mc-agent Minecraft Toolkit
 
@@ -504,8 +535,7 @@ func (a *app) cmdTarget(args []string) (any, *protocol.Error) {
 }
 
 func (a *app) targetAdd(args []string) (any, *protocol.Error) {
-	flags := flag.NewFlagSet("target add", flag.ContinueOnError)
-	flags.SetOutput(io.Discard)
+	flags, values := flagSet("target add")
 	transport := flags.String("transport", protocol.TransportRemote, "remote|legacy|fake")
 	address := flags.String("address", "", "host:port")
 	pin := flags.String("pin", "", "sha256:<hex> certificate pin")
@@ -519,7 +549,11 @@ func (a *app) targetAdd(args []string) (any, *protocol.Error) {
 	vantage := flags.String("vantage", "", "legacy vantage: client|server")
 	isDefault := flags.Bool("default", false, "make this the default target")
 	force := flags.Bool("force", false, "replace an existing target with the same name")
-	if err := flags.Parse(args); err != nil {
+	for _, name := range []string{"transport", "address", "pin", "ca", "server-name", "token-env",
+		"token-file", "port-file", "server-dir", "vantage"} {
+		values[name] = true
+	}
+	if err := flags.Parse(reorderInterspersed(args, values)); err != nil {
 		return nil, protocol.NewError(protocol.CodeUsage, err.Error())
 	}
 	if flags.NArg() != 1 {

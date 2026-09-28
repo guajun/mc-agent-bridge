@@ -82,8 +82,14 @@ func Dial(ctx context.Context, config Config) (*Client, *Welcome, error) {
 	if timeout == 0 {
 		timeout = 10 * time.Second
 	}
+	dialContext := ctx
+	if _, hasDeadline := ctx.Deadline(); !hasDeadline {
+		var cancel context.CancelFunc
+		dialContext, cancel = context.WithTimeout(ctx, timeout)
+		defer cancel()
+	}
 	dialer := &tls.Dialer{Config: tlsConfig, NetDialer: &net.Dialer{Timeout: timeout}}
-	conn, err := dialer.DialContext(ctx, "tcp", config.Address)
+	conn, err := dialer.DialContext(dialContext, "tcp", config.Address)
 	if err != nil {
 		return nil, nil, &protocol.Error{Code: protocol.CodeConnectionFailed,
 			Message: fmt.Sprintf("cannot reach %s over TLS: %v", config.Address, unwrapTLS(err))}
