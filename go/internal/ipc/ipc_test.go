@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"fmt"
 	"net"
 	"sync/atomic"
 	"testing"
@@ -270,4 +271,57 @@ func TestEventOverflowDoesNotBlockResponses(t *testing.T) {
 	if client.Dropped() == 0 {
 		t.Fatal("overflow was not counted; the queue policy silently lost events")
 	}
+}
+
+// Overflow must be observable without any subsequent event (the signal is
+// independent), and the first event enqueued after the gap must carry the
+// drop count so a consumer recovers before printing across the gap.
+func TestQueueOverflowSignalsAndTagsNextEvent(t *testing.T) {
+	server, err := ipc.Start("127.0.0.1:0", "token",
+		func(ctx context.Context, method string, params map[string]any) (any, *protocol.Error) {
+			return map[string]any{"ok": true}, nil
+		})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Stop()
+	client, err := ipc.Dial(context.Background(), server.Address(), "token")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	if _, failure := client.Call(context.Background(), "subscribe", map[string]any{"events": []string{"*"}}); failure != nil {
+		t.Fatal(failure)
+	}
+	floodDone := make(chan struct{})
+	go func() {
+		defer close(floodDone)
+		for index := 0; index < 600; index++ {
+			server.Broadcast("mark", map[string]any{"seq": index, "text": fmt.Sprintf("e-%d", index)})
+			if index%25 == 24 {
+				time.Sleep(2 * time.Millisecond)
+			}
+		}
+	}()
+	select {
+	case <-client.DropNotify():
+	case <-time.After(5 * time.Second):
+		t.Fatal("overflow was not signalled without a subsequent event")
+	}
+	<-floodDone
+	// Free one slot, then enqueue exactly one more event: it must carry the
+	// drop count accumulated while the queue was full.
+	<-client.Events()
+	server.Broadcast("mark", map[string]any{"seq": 600, "text": "tagged"})
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		select {
+		case event := <-client.Events():
+			if event.DroppedBefore > 0 {
+				return
+			}
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+	t.Fatal("the event after the overflow did not carry the drop count")
 }

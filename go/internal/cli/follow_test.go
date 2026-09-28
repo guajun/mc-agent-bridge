@@ -16,11 +16,18 @@ import (
 )
 
 type syncBuffer struct {
-	mu  sync.Mutex
-	buf bytes.Buffer
+	mu   sync.Mutex
+	buf  bytes.Buffer
+	gate chan struct{}
 }
 
 func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	gate := b.gate
+	b.mu.Unlock()
+	if gate != nil {
+		<-gate
+	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	return b.buf.Write(p)
@@ -32,12 +39,33 @@ func (b *syncBuffer) String() string {
 	return b.buf.String()
 }
 
+// stall blocks the next Write until release, so a test can overflow the live
+// queue while the consumer is stuck on stdout.
+func (b *syncBuffer) stall() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.gate == nil {
+		b.gate = make(chan struct{})
+	}
+}
+
+func (b *syncBuffer) release() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.gate != nil {
+		close(b.gate)
+		b.gate = nil
+	}
+}
+
 // scriptedDaemon serves the subset of the local API that events --follow
 // needs: a replay ring with paging/filtering plus paced live broadcasts.
 type scriptedDaemon struct {
 	mu         sync.Mutex
 	events     []map[string]any
 	stream     string
+	ringLimit  int
+	next       int64
 	delayFirst bool
 	firstCall  chan struct{}
 	release    chan struct{}
@@ -47,10 +75,11 @@ type scriptedDaemon struct {
 func (s *scriptedDaemon) append(category, target, text string) map[string]any {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.next++
 	event := map[string]any{
-		"seq":        int64(len(s.events) + 1),
+		"seq":        s.next,
 		"streamId":   s.stream,
-		"eventId":    fmt.Sprintf("%s:%d", s.stream, len(s.events)+1),
+		"eventId":    fmt.Sprintf("%s:%d", s.stream, s.next),
 		"category":   category,
 		"target":     target,
 		"type":       map[string]string{"mark": "mark", "game": "game"}[category],
@@ -58,6 +87,9 @@ func (s *scriptedDaemon) append(category, target, text string) map[string]any {
 		"receivedAt": time.Now().UnixMilli(),
 	}
 	s.events = append(s.events, event)
+	if s.ringLimit > 0 && len(s.events) > s.ringLimit {
+		s.events = s.events[len(s.events)-s.ringLimit:]
+	}
 	return event
 }
 
@@ -277,5 +309,164 @@ func TestFollowPagesWholeReplayWithoutFalseGaps(t *testing.T) {
 	}
 	if strings.Contains(output, `"event":"gap"`) {
 		t.Fatalf("a clean filtered replay produced a false gap marker:\n%s", output)
+	}
+}
+
+func waitForOutput(t *testing.T, output *syncBuffer, needle string, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if strings.Contains(output.String(), needle) {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("output never contained %q:\n%s", needle, output.String())
+}
+
+// After the replay handoff, a consumer stuck on stdout must not lose live
+// events silently: the overflow is reported and the recoverable range is
+// replayed from the last actually delivered sequence, exactly once.
+func TestFollowRecoversLiveOverflowAfterHandoff(t *testing.T) {
+	scripted := &scriptedDaemon{stream: "cli-stream-live"}
+	application, server := startScriptedCLI(t, scripted)
+	defer server.Stop()
+	output := application.stdout.(*syncBuffer)
+	for index := 0; index < 30; index++ {
+		scripted.append("mark", "scripted", fmt.Sprintf("pre-%d", index))
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		_, _ = application.cmdEvents(ctx, []string{"--follow", "--since", "0", "--limit", "50",
+			"--category", "mark"})
+		close(done)
+	}()
+	waitForOutput(t, output, `"event":"following"`, 10*time.Second)
+	output.stall()
+	for index := 0; index < 400; index++ {
+		event := scripted.append("mark", "scripted", fmt.Sprintf("flood-%d", index))
+		server.Broadcast("mark", event)
+		if index%25 == 24 {
+			time.Sleep(2 * time.Millisecond)
+		}
+	}
+	for index := 0; index < 20; index++ {
+		server.Broadcast("game", scripted.append("game", "scripted", fmt.Sprintf("g-%d", index)))
+	}
+	time.Sleep(300 * time.Millisecond)
+	output.release()
+	waitForOutput(t, output, "flood-399", 20*time.Second)
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the follow command did not stop after cancellation")
+	}
+	text := output.String()
+	if !strings.Contains(text, "clientDropped") {
+		t.Fatalf("live overflow was not reported as a gap:\n%s", text)
+	}
+	texts := parsedTexts(text)
+	for index := 0; index < 30; index++ {
+		needle := fmt.Sprintf("pre-%d", index)
+		if texts[needle] != 1 {
+			t.Fatalf("replay event %s appeared %d times", needle, texts[needle])
+		}
+	}
+	for index := 0; index < 400; index++ {
+		needle := fmt.Sprintf("flood-%d", index)
+		if texts[needle] != 1 {
+			t.Fatalf("live event %s appeared %d times", needle, texts[needle])
+		}
+	}
+	for index := 0; index < 20; index++ {
+		if needle := fmt.Sprintf("g-%d", index); texts[needle] != 0 {
+			t.Fatalf("game event %s leaked into a mark-only follow", needle)
+		}
+	}
+}
+
+// When the daemon ring expired past the overflow, the follow stream must say
+// so explicitly (a daemon gap marker, not only the client drop marker) and
+// print exactly the still-recoverable events.
+func TestFollowReportsLiveOverflowWhenRingExpired(t *testing.T) {
+	scripted := &scriptedDaemon{stream: "cli-stream-expired", ringLimit: 40}
+	application, server := startScriptedCLI(t, scripted)
+	defer server.Stop()
+	output := application.stdout.(*syncBuffer)
+	for index := 0; index < 20; index++ {
+		scripted.append("mark", "scripted", fmt.Sprintf("pre-%d", index))
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		_, _ = application.cmdEvents(ctx, []string{"--follow", "--since", "0", "--limit", "50",
+			"--category", "mark"})
+		close(done)
+	}()
+	waitForOutput(t, output, `"event":"following"`, 10*time.Second)
+	output.stall()
+	for index := 0; index < 300; index++ {
+		event := scripted.append("mark", "scripted", fmt.Sprintf("flood-%d", index))
+		server.Broadcast("mark", event)
+		if index%25 == 24 {
+			time.Sleep(2 * time.Millisecond)
+		}
+	}
+	time.Sleep(300 * time.Millisecond)
+	output.release()
+	// The ring keeps seq 281..320, that is flood-260..flood-299.
+	waitForOutput(t, output, "flood-299", 20*time.Second)
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the follow command did not stop after cancellation")
+	}
+	text := output.String()
+	if !strings.Contains(text, "clientDropped") {
+		t.Fatalf("live overflow was not reported as a gap:\n%s", text)
+	}
+	daemonGap := false
+	for _, line := range strings.Split(text, "\n") {
+		var value map[string]any
+		if json.Unmarshal([]byte(strings.TrimSpace(line)), &value) != nil {
+			continue
+		}
+		if value["event"] != "gap" {
+			continue
+		}
+		data, _ := value["data"].(map[string]any)
+		if data["dropped"] == true && data["clientDropped"] == nil {
+			daemonGap = true
+		}
+	}
+	if !daemonGap {
+		t.Fatalf("ring eviction was not reported as an explicit daemon gap:\n%s", text)
+	}
+	texts := parsedTexts(text)
+	for index := 0; index < 20; index++ {
+		needle := fmt.Sprintf("pre-%d", index)
+		if texts[needle] != 1 {
+			t.Fatalf("replay event %s appeared %d times", needle, texts[needle])
+		}
+	}
+	for index := 260; index <= 299; index++ {
+		needle := fmt.Sprintf("flood-%d", index)
+		if texts[needle] != 1 {
+			t.Fatalf("recoverable event %s appeared %d times", needle, texts[needle])
+		}
+	}
+	// flood-0 was delivered live before the queue filled (it was the event
+	// the stalled writer was holding); everything between it and the ring was
+	// evicted and must not be printed as if recovered.
+	if texts["flood-0"] != 1 {
+		t.Fatalf("the pre-gap live event appeared %d times", texts["flood-0"])
+	}
+	for index := 1; index < 260; index++ {
+		if needle := fmt.Sprintf("flood-%d", index); texts[needle] != 0 {
+			t.Fatalf("evicted event %s was printed as if recovered", needle)
+		}
 	}
 }

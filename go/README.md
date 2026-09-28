@@ -136,13 +136,17 @@ same stream binding exists on the remote transport (bound to the game
 `instanceId`/`runId`). `mc-agent events` returns the oldest events after
 `since`, so `next` (the highest delivered sequence) is a usable continuation,
 and reports `truncated: true` when the caller must ask again; `dropped` is
-reserved for buffer eviction and is also reported as a machine-readable gap
-marker by `--follow`. `--follow` subscribes before replaying, pages the whole
-buffer, then switches to live delivery with sequence de-duplication, keeping
-`--category` and `--target` filters and emitting `{"type":"stream",
-"event":"gap"}` when events were lost. A target whose reader cannot drain its
-socket is closed so the next reconnect produces a machine-readable replay/gap
-report.
+reserved for buffer eviction of events the caller actually asked for (an
+evicted unrelated category/target is not a loss for a filtered cursor) and is
+also reported as a machine-readable gap marker by `--follow`. `--follow`
+subscribes before replaying, pages the whole buffer, then switches to live
+delivery with sequence de-duplication, keeping `--category` and `--target`
+filters and emitting `{"type":"stream", "event":"gap"}` when events were lost.
+The bounded client queue is also observed after the handoff: an overflow emits
+a gap marker and replays from the last delivered sequence (so recoverable
+events arrive exactly once), or surfaces the daemon's `dropped` gap when the
+ring has already expired them. A target whose reader cannot drain its socket is
+closed so the next reconnect produces a machine-readable replay/gap report.
 
 Write calls get a stable end-to-end request id (`cli-<nonce>-<n>`, or an
 explicit `mc-agent call --request-id <id>`) before anything is sent. If the

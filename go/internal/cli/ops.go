@@ -170,28 +170,20 @@ func (a *app) cmdEvents(ctx context.Context, args []string) (any, *protocol.Erro
 		return client.Call(ctx, "events", pageParams(*since, *streamID))
 	}
 
-	// Subscribe before replaying so nothing is lost between the snapshot and
-	// the live stream; the server confirms the subscription synchronously.
-	subscription := []string{"*"}
-	if *category != "" {
-		subscription = []string{*category}
-	}
-	if _, failure := client.Call(ctx, "subscribe", map[string]any{"events": subscription}); failure != nil {
-		return nil, failure
-	}
-
 	cursor := *since
 	expectedStream := *streamID
 	var lastSeq int64
-	// Replay until a pass produces no overflow: live events can be dropped by
-	// the bounded CLI queue while a replay response is in flight, so each pass
-	// re-pages from the cursor to recover them from the daemon ring. If the
-	// ring no longer holds them the daemon's own dropped flag reports the gap.
-	for {
+
+	// recover pages the daemon ring from the paging cursor until the page is
+	// complete, printing every event once and moving the cursor to the highest
+	// delivered sequence. Initial replay and live recovery share this path: a
+	// live-queue drop and a ring eviction both replay from the last actually
+	// delivered sequence instead of skipping the lost range.
+	recover := func() *protocol.Error {
 		for {
 			result, failure := client.Call(ctx, "events", pageParams(cursor, expectedStream))
 			if failure != nil {
-				return nil, failure
+				return failure
 			}
 			object, _ := result.(map[string]any)
 			stream, _ := object["streamId"].(string)
@@ -223,29 +215,87 @@ func (a *app) cmdEvents(ctx context.Context, args []string) (any, *protocol.Erro
 				break
 			}
 		}
+		return nil
+	}
+
+	// recoverLive folds in live-queue overflow: report it, then replay from
+	// the last delivered sequence so recoverable events come back from the
+	// daemon ring and unrecoverable ones surface as its explicit gap marker.
+	recoverLive := func(dropped int64) *protocol.Error {
+		for {
+			if dropped > 0 {
+				a.print(clientGapMarker(expectedStream, lastSeq, dropped))
+			}
+			cursor = lastSeq
+			if failure := recover(); failure != nil {
+				return failure
+			}
+			dropped = client.TakeDropped()
+			if dropped == 0 {
+				return nil
+			}
+		}
+	}
+
+	// Subscribe before replaying so nothing is lost between the snapshot and
+	// the live stream; the server confirms the subscription synchronously.
+	subscription := []string{"*"}
+	if *category != "" {
+		subscription = []string{*category}
+	}
+	if _, failure := client.Call(ctx, "subscribe", map[string]any{"events": subscription}); failure != nil {
+		return nil, failure
+	}
+
+	// Replay until a pass observes no client-side overflow: live events can be
+	// dropped by the bounded queue while a replay response is in flight, so
+	// each pass re-pages from the cursor to recover them from the daemon ring.
+	for {
+		if failure := recover(); failure != nil {
+			return nil, failure
+		}
 		overflow := client.TakeDropped()
 		if overflow == 0 {
 			break
 		}
-		// The dropped live events were ingested by the daemon (they are in its
-		// ring unless evicted, which its own dropped flag reports), so another
-		// replay pass recovers them. Record the overflow so a consumer can see
-		// why the replay is longer than the page size.
-		a.print(map[string]any{"type": "stream", "event": "gap", "data": map[string]any{
-			"streamId": expectedStream, "from": 0, "to": lastSeq,
-			"dropped": true, "reset": false, "clientDropped": overflow}})
+		a.print(clientGapMarker(expectedStream, lastSeq, overflow))
+		cursor = lastSeq
 	}
 	a.print(map[string]any{"type": "stream", "event": "following", "data": map[string]any{
 		"streamId": expectedStream, "lastSeq": lastSeq}})
+
 	// Live delivery. A sequence jump is NOT evidence of loss when a category
 	// or target filter is active: unrelated events consume sequence numbers
-	// legitimately. Loss is only reported from explicit daemon/client metadata
-	// (reset/dropped/clientDropped) above.
+	// legitimately. Loss is reported only from explicit metadata: the queue
+	// drop tag/signal, or the daemon's reset/dropped flags during recovery.
 	for {
+		// Observe overflow before processing further events so a gap is
+		// recovered from the last delivered sequence instead of skipped.
 		select {
+		case <-client.DropNotify():
+			if dropped := client.TakeDropped(); dropped > 0 {
+				if failure := recoverLive(dropped); failure != nil {
+					return nil, failure
+				}
+			}
+			continue
+		default:
+		}
+		select {
+		case <-client.DropNotify():
+			if dropped := client.TakeDropped(); dropped > 0 {
+				if failure := recoverLive(dropped); failure != nil {
+					return nil, failure
+				}
+			}
 		case event, ok := <-client.Events():
 			if !ok {
 				return nil, protocol.NewError(protocol.CodeConnectionLost, "the daemon connection closed")
+			}
+			if event.DroppedBefore > 0 {
+				if failure := recoverLive(event.DroppedBefore); failure != nil {
+					return nil, failure
+				}
 			}
 			if a.target != "" {
 				if value, _ := event.Data["target"].(string); value != a.target {
@@ -254,7 +304,7 @@ func (a *app) cmdEvents(ctx context.Context, args []string) (any, *protocol.Erro
 			}
 			seq, hasSeq := eventSeq(event.Data)
 			if hasSeq && seq <= lastSeq {
-				continue // already delivered by the replay
+				continue // already delivered by a recovery pass
 			}
 			a.print(event.Data)
 			if hasSeq {
@@ -264,6 +314,14 @@ func (a *app) cmdEvents(ctx context.Context, args []string) (any, *protocol.Erro
 			return nil, nil
 		}
 	}
+}
+
+// clientGapMarker reports live events the bounded IPC queue dropped and the
+// recovery pass that follows from the last delivered sequence.
+func clientGapMarker(stream string, lastSeq int64, overflow int64) map[string]any {
+	return map[string]any{"type": "stream", "event": "gap", "data": map[string]any{
+		"streamId": stream, "from": 0, "to": lastSeq, "dropped": true,
+		"reset": false, "clientDropped": overflow}}
 }
 
 func gapMarker(stream string, from, to int64, dropped, reset bool) map[string]any {

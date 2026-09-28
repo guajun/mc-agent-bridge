@@ -47,6 +47,11 @@ type Event struct {
 	Type  string         `json:"type"`
 	Event string         `json:"event"`
 	Data  map[string]any `json:"data"`
+	// DroppedBefore is the number of live events the client queue dropped
+	// before this one was enqueued. The tag travels with the event so a
+	// consumer can recover from the last actually delivered sequence before
+	// processing an event that sits on the far side of the gap.
+	DroppedBefore int64 `json:"-"`
 }
 
 // Server serves the local JSON-lines API.
@@ -362,6 +367,7 @@ type Client struct {
 	closeOnce  sync.Once
 	stopOnce   sync.Once
 	dropped    atomic.Int64
+	dropNotify chan struct{}
 	errMu      sync.Mutex
 	err        error
 }
@@ -387,6 +393,7 @@ func Dial(ctx context.Context, address, token string) (*Client, error) {
 		token:      token,
 		pending:    map[string]chan response{},
 		events:     make(chan Event, 256),
+		dropNotify: make(chan struct{}, 1),
 		stop:       make(chan struct{}),
 		done:       make(chan struct{}),
 		writeToken: make(chan struct{}, 1),
@@ -562,6 +569,11 @@ func (c *Client) Close() {
 	<-c.done
 }
 
+// DropNotify is signalled when the live queue overflowed. It is independent of
+// new events, so a consumer that is not reading events can still learn about
+// loss (and recover from the daemon ring) without waiting for another event.
+func (c *Client) DropNotify() <-chan struct{} { return c.dropNotify }
+
 // Dropped is the number of live events dropped because the consumer could not
 // keep up. The caller reports it as an explicit gap and re-pages the daemon
 // ring to recover them.
@@ -608,11 +620,21 @@ func (c *Client) readLoop() {
 		case "event":
 			// Never block the read loop behind a full consumer queue: a
 			// blocked loop would also block response routing. Overflow is
-			// counted and the caller re-pages the daemon ring / reports a gap.
+			// counted, signalled for the no-subsequent-event case, and the
+			// first event enqueued after a gap carries the drop count so the
+			// consumer recovers before printing across the gap.
+			event := Event{Type: "event", Event: envelope.Event, Data: envelope.Data}
+			if pending := c.dropped.Swap(0); pending > 0 {
+				event.DroppedBefore = pending
+			}
 			select {
-			case c.events <- Event{Type: "event", Event: envelope.Event, Data: envelope.Data}:
+			case c.events <- event:
 			default:
 				c.dropped.Add(1)
+				select {
+				case c.dropNotify <- struct{}{}:
+				default:
+				}
 			}
 		}
 	}
