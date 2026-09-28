@@ -24,6 +24,17 @@ the only one that can snapshot entity tick order.
 See **[docs/toolkit.md](docs/toolkit.md)** for the install-and-use guide and
 the full tool reference.
 
+> **Go runtime (bridge #11).** The product CLI/daemon is now the single Go
+> binary in **[go/](go/README.md)**: `mc-agent daemon ...`, `mc-agent
+> capabilities|state|command|events|...`, the authenticated same-port TLS
+> transport plus the explicit legacy loopback adapter, a token-protected local
+> IPC boundary, an unknown-write ledger, and optional signed webhooks. The
+> Python bridge in `src/mc_agent_bridge/` remains as the legacy path (and the
+> local fork/restore tooling until it is migrated or explicitly retired); its
+> local API client now carries the Go daemon's IPC token. MCP is removed from
+> the product path in bridge #12. The per-operation migration table is in
+> [go/README.md](go/README.md#migration-matrix).
+
 ## Why a separate daemon
 
 The mod accepts exactly one kind of client: a TCP line connection. Rather than
