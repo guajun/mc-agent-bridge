@@ -615,8 +615,8 @@ func (d *Daemon) call(ctx context.Context, targetName, operation string, params 
 		if err := d.unknown.Resolve(target.Name, requestID); err != nil {
 			d.logger("cannot clear answered request %s: %v", requestID, err)
 		}
-	} else {
-		d.unknown.NoteUnknown(target.Name, requestID, failure.Message)
+	} else if err := d.unknown.NoteUnknown(target.Name, requestID, failure.Message); err != nil {
+		d.logger("target %s: cannot update unknown request %s: %v", target.Name, requestID, err)
 	}
 	return nil, failure
 }
@@ -714,7 +714,7 @@ func (d *Daemon) reconcileUnknown(ts *targetSession) {
 }
 
 // markUnresolved keeps a request visible and emits the machine-readable state.
-func (d *Daemon) markUnresolved(entry *UnknownWrite, message string) {
+func (d *Daemon) markUnresolved(entry UnknownWrite, message string) {
 	if err := d.unknown.MarkUnresolved(entry.Target, entry.RequestID, message); err != nil {
 		d.logger("cannot persist unresolved request %s: %v", entry.RequestID, err)
 	}
