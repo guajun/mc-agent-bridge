@@ -9,7 +9,9 @@
 #   curl -fsSL https://raw.githubusercontent.com/guajun/mc-agent-bridge/v0.5.0/install/install.sh \
 #       | sh -s -- --version 0.5.0 --skill-harness codex
 #
-# See docs/install.md for the full matrix and examples.
+# See docs/install.md for the full matrix and examples. The undocumented
+# MC_AGENT_INSTALL_FAULT environment variable injects a commit-stage failure
+# for the negative acceptance tests (after-binary, after-skill, at-manifest).
 set -eu
 
 PRODUCT="mc-agent"
@@ -19,6 +21,8 @@ ASSET_BINARY="mc-agent"
 MANIFEST_NAME="mc-agent.installed"
 PREVIOUS_NAME="mc-agent.previous"
 MANIFEST_VERSION="2"
+STATE_FILES="daemon.json targets.json secrets.json unknown_writes.json daemon.log"
+STATE_IDENTITY_FILES="daemon.json targets.json secrets.json"
 
 die() {
     printf 'error: %s\n' "$*" >&2
@@ -53,13 +57,14 @@ Install or upgrade:
 Uninstall:
   --uninstall             Remove the installed binary
   --remove-skill          With --uninstall: remove unchanged installed skill copies
-  --purge-state           With --uninstall: remove the product state directory
-  --force                 With --uninstall: allow a missing/modified manifest
+  --purge-state           With --uninstall: remove known product state files
+  --force                 With --uninstall: allow a missing/invalid manifest
 
 Every requested component (binary, skill) is staged and verified before the
-installation is touched; checksum, version and conflict failures leave the
-current installation unchanged. The skill bundle comes from the release's
-pinned mc-agent commit, not from the current working tree.
+installation is touched; checksum, version, manifest and conflict failures
+leave the current installation unchanged. The commit stage snapshots the
+binary, manifest and skill and rolls all of them back together if any step
+fails. The skill bundle comes from the release's pinned mc-agent commit.
 EOF
     exit 2
 }
@@ -140,6 +145,8 @@ if [ -z "$BASE_URL" ]; then
 fi
 MANIFEST="$INSTALL_DIR/$MANIFEST_NAME"
 BINARY="$INSTALL_DIR/$ASSET_BINARY"
+PREVIOUS="$INSTALL_DIR/$PREVIOUS_NAME"
+FAULT="${MC_AGENT_INSTALL_FAULT:-}"
 
 # ---------------------------------------------------------------- helpers
 
@@ -191,8 +198,20 @@ canonical_path() {
     printf '%s/%s\n' "$(canonical_path "$_parent")" "$_base"
 }
 
-# safe_remove_tree refuses to recursively delete anything that could be a user
-# home, a filesystem root, an ancestor of home, a symlink, or the install dir.
+# assert_no_symlink_ancestors refuses to touch a path whose existing ancestors
+# include a symlink, so a forged path cannot escape through a link.
+assert_no_symlink_ancestors() {
+    _parent="$(dirname "$1")"
+    while [ -n "$_parent" ] && [ "$_parent" != "/" ] && [ "$_parent" != "." ]; do
+        [ -L "$_parent" ] && die "refusing to touch a path through a symlinked ancestor: $_parent"
+        _next="$(dirname "$_parent")"
+        [ "$_next" = "$_parent" ] && break
+        _parent="$_next"
+    done
+}
+
+# safe_remove_tree refuses to recursively delete roots, home, home ancestors,
+# symlinks, symlinked ancestors or the install directory.
 safe_remove_tree() {
     _target="$1"
     [ -n "$_target" ] || die "refusing to remove an empty path"
@@ -204,9 +223,34 @@ safe_remove_tree() {
     case "$HOME/" in
         "$_canon"/*) die "refusing to remove an ancestor of the home directory" ;;
     esac
-    _install_canon="$(canonical_path "$INSTALL_DIR")"
-    [ "$_canon" = "$_install_canon" ] && die "refusing to remove the install directory"
+    [ "$_canon" = "$(canonical_path "$INSTALL_DIR")" ] && die "refusing to remove the install directory"
+    assert_no_symlink_ancestors "$_canon"
     rm -rf "$_target"
+}
+
+# purge_state_dir removes only known product-owned state files and keeps the
+# directory (and any unrelated files) unless it becomes empty.
+purge_state_dir() {
+    _dir="$1"
+    _found=0
+    for _name in $STATE_FILES; do
+        _file="$_dir/$_name"
+        if [ -L "$_file" ]; then
+            die "refusing to remove symlinked state file: $_file"
+        elif [ -d "$_file" ]; then
+            die "refusing to remove directory-valued state file: $_file"
+        elif [ -f "$_file" ]; then
+            rm -f "$_file"
+            info "removed state file $_file"
+            _found=1
+        fi
+    done
+    [ "$_found" = 1 ] || info "no known product state files found in $_dir"
+    if rmdir "$_dir" 2>/dev/null; then
+        info "removed empty state directory $_dir"
+    else
+        info "kept state directory with unrelated files: $_dir"
+    fi
 }
 
 fetch() {
@@ -252,8 +296,6 @@ verify_checksum() {
     [ "$_actual" = "$_expected" ] || die "checksum mismatch for $_name: expected $_expected, got $_actual"
 }
 
-# verify_binary_version refuses an archive whose binary does not report the
-# requested product version.
 verify_binary_version() {
     _binary="$1"
     _want="$2"
@@ -270,6 +312,23 @@ manifest_get() {
     sed -n "s/^${_key}=//p" "$_file" | head -n 1
 }
 
+# manifest_valid requires the product, format version and a well-formed
+# binary hash; an empty or unrelated file is never treated as ownership.
+manifest_valid() {
+    _file="$1"
+    [ -f "$_file" ] && [ -s "$_file" ] || return 1
+    [ "$(manifest_get "$_file" manifest_version)" = "$MANIFEST_VERSION" ] || return 1
+    [ "$(manifest_get "$_file" product)" = "$PRODUCT" ] || return 1
+    [ -n "$(manifest_get "$_file" version)" ] || return 1
+    [ -n "$(manifest_get "$_file" platform)" ] || return 1
+    _hash="$(manifest_get "$_file" binary_sha256)"
+    [ ${#_hash} -eq 64 ] || return 1
+    case "$_hash" in
+        *[!0-9a-f]*) return 1 ;;
+    esac
+    return 0
+}
+
 manifest_skill_dirs() {
     _file="$1"
     [ -f "$_file" ] || return 0
@@ -277,7 +336,6 @@ manifest_skill_dirs() {
 }
 
 manifest_skill_tree() {
-    # manifest_skill_tree FILE DIR -> prints the recorded tree hash for DIR
     awk -v dir="$2" '
         /^skill\.[0-9][0-9]*\.dir=/ {
             value = substr($0, index($0, "=") + 1)
@@ -311,6 +369,19 @@ manifest_max_skill_index() {
     printf '%s\n' "$_max"
 }
 
+# skill_entry_removable accepts only an absolute path whose leaf is the
+# install-owned minecraft-toolkit directory; forged manifest lines are refused
+# even with --force.
+skill_entry_removable() {
+    _dir="$1"
+    case "$_dir" in
+        /*) : ;;
+        *) return 1 ;;
+    esac
+    [ "$(basename "$_dir")" = "minecraft-toolkit" ] || return 1
+    return 0
+}
+
 state_dir() {
     if [ -n "${MC_AGENT_HOME:-}" ]; then
         printf '%s\n' "$MC_AGENT_HOME"
@@ -329,12 +400,10 @@ default_state_dir() {
     fi
 }
 
-# is_product_state_dir accepts the default product location or a directory that
-# already contains product-owned files.
 is_product_state_dir() {
     _dir="$1"
     [ "$_dir" = "$(default_state_dir)" ] && return 0
-    for _marker in daemon.json targets.json secrets.json daemon.log records.json unknown_writes.json; do
+    for _marker in $STATE_IDENTITY_FILES; do
         [ -f "$_dir/$_marker" ] && return 0
     done
     return 1
@@ -372,6 +441,7 @@ esac
 INSTALL_DIR="$(canonical_path "$INSTALL_DIR")"
 MANIFEST="$INSTALL_DIR/$MANIFEST_NAME"
 BINARY="$INSTALL_DIR/$ASSET_BINARY"
+PREVIOUS="$INSTALL_DIR/$PREVIOUS_NAME"
 ARCHIVE_NAME="$PRODUCT-$VERSION-$GOOS-$GOARCH.tar.gz"
 
 if [ "$DRY_RUN" = "1" ]; then
@@ -391,7 +461,11 @@ fi
 
 if [ "$UNINSTALL" = "1" ]; then
     [ -f "$BINARY" ] || [ -f "$MANIFEST" ] || die "no $PRODUCT installation found at $INSTALL_DIR"
+    [ -L "$BINARY" ] && [ "$FORCE" != "1" ] && die "refusing to remove a symlinked binary: $BINARY"
     if [ -f "$MANIFEST" ]; then
+        if ! manifest_valid "$MANIFEST" && [ "$FORCE" != "1" ]; then
+            die "$MANIFEST is not a valid $PRODUCT manifest; pass --force to remove anyway"
+        fi
         _recorded="$(manifest_get "$MANIFEST" binary_sha256)"
         if [ -f "$BINARY" ] && [ -n "$_recorded" ] && [ "$FORCE" != "1" ] \
             && [ "$(hash_file "$BINARY")" != "$_recorded" ]; then
@@ -412,9 +486,16 @@ if [ "$UNINSTALL" = "1" ]; then
         manifest_skill_dirs "$MANIFEST" >"$_skill_list"
         while IFS= read -r _dir; do
             [ -n "$_dir" ] || continue
+            if ! skill_entry_removable "$_dir"; then
+                info "refusing to remove a non-skill path from the manifest: $_dir"
+                continue
+            fi
             _recorded_tree="$(manifest_skill_tree "$MANIFEST" "$_dir")"
             if [ ! -d "$_dir" ]; then
                 info "skill directory is already gone: $_dir"
+            elif [ "$(canonical_path "$_dir")" != "$_dir" ]; then
+                info "refusing to remove a skill path that resolves through a symlink: $_dir"
+                continue
             elif [ "$FORCE" = "1" ] || { [ -n "$_recorded_tree" ] && [ "$(tree_hash "$_dir")" = "$_recorded_tree" ]; }; then
                 safe_remove_tree "$_dir"
                 info "removed skill $_dir"
@@ -427,15 +508,10 @@ if [ "$UNINSTALL" = "1" ]; then
         info "no install manifest: not removing any skill directory"
     fi
     [ -f "$BINARY" ] && rm -f "$BINARY"
-    rm -f "$INSTALL_DIR/$PRODUCT.previous" "$MANIFEST"
+    rm -f "$PREVIOUS" "$MANIFEST"
     info "removed the $PRODUCT binary from $INSTALL_DIR"
-    if [ "$PURGE_STATE" = "1" ]; then
-        if [ ! -d "$_purge_target" ]; then
-            info "state directory not present: $_purge_target"
-        else
-            safe_remove_tree "$_purge_target"
-            info "removed state $_purge_target"
-        fi
+    if [ "$PURGE_STATE" = "1" ] && [ -d "$_purge_target" ]; then
+        purge_state_dir "$_purge_target"
     fi
     info "uninstall complete"
     exit 0
@@ -468,14 +544,17 @@ chmod 755 "$WORK/extract/$ASSET_BINARY"
 verify_binary_version "$WORK/extract/$ASSET_BINARY" "$VERSION"
 
 # 2. Validate the existing installation before replacing it.
+if [ -L "$BINARY" ] && [ "$FORCE" != "1" ]; then
+    die "refusing to replace a symlinked binary: $BINARY (pass --force to replace the link)"
+fi
 if [ -f "$BINARY" ]; then
-    if [ -f "$MANIFEST" ]; then
+    if [ -f "$MANIFEST" ] && manifest_valid "$MANIFEST"; then
         _recorded="$(manifest_get "$MANIFEST" binary_sha256)"
-        if [ -n "$_recorded" ] && [ "$FORCE" != "1" ] && [ "$(hash_file "$BINARY")" != "$_recorded" ]; then
+        if [ "$FORCE" != "1" ] && [ "$(hash_file "$BINARY")" != "$_recorded" ]; then
             die "$BINARY was modified after installation; pass --force to replace it"
         fi
     elif [ "$FORCE" != "1" ]; then
-        die "$BINARY exists without a product manifest; pass --force to replace it"
+        die "$BINARY exists without a valid product manifest; pass --force to replace it"
     fi
 fi
 
@@ -497,6 +576,10 @@ if [ "$NO_SKILL" != "1" ]; then
         if [ -d "$SKILL_TARGET" ] && [ "$UPDATE_SKILL" != "1" ]; then
             die "$SKILL_TARGET already exists; pass --update-skill to replace it (a backup is kept)"
         fi
+        if [ -L "$SKILL_TARGET" ]; then
+            die "refusing to replace a symlinked skill directory: $SKILL_TARGET"
+        fi
+        assert_no_symlink_ancestors "$SKILL_TARGET"
         source_asset skill-pin.json "$WORK/skill-pin.json"
         SKILL_ASSET="$(sed -n 's/.*"asset"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$WORK/skill-pin.json" | head -n 1)"
         SKILL_COMMIT="$(sed -n 's/.*"commit"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$WORK/skill-pin.json" | head -n 1)"
@@ -512,39 +595,92 @@ if [ "$NO_SKILL" != "1" ]; then
 fi
 
 # ---------------------------------------------------------------- commit
+#
+# The commit stage snapshots the binary, previous binary, manifest and touched
+# skill, then applies every change. Any failure restores all four, so a failed
+# upgrade never leaves a half-installed product and a fresh failed install
+# never leaves an unmanaged binary.
 
-mkdir -p "$INSTALL_DIR"
-if [ -f "$BINARY" ]; then
-    cp -p "$BINARY" "$INSTALL_DIR/$PRODUCT.previous"
+SNAPSHOT="$WORK/snapshot"
+mkdir -p "$SNAPSHOT"
+HAD_BINARY=0
+HAD_MANIFEST=0
+HAD_PREVIOUS=0
+HAD_SKILL=0
+CREATED_INSTALL_DIR=0
+[ -d "$INSTALL_DIR" ] || CREATED_INSTALL_DIR=1
+[ -f "$BINARY" ] && { cp -p "$BINARY" "$SNAPSHOT/binary"; HAD_BINARY=1; }
+[ -f "$MANIFEST" ] && { cp -p "$MANIFEST" "$SNAPSHOT/manifest"; HAD_MANIFEST=1; }
+[ -f "$PREVIOUS" ] && { cp -p "$PREVIOUS" "$SNAPSHOT/previous"; HAD_PREVIOUS=1; }
+if [ -n "$SKILL_TARGET" ] && [ -d "$SKILL_TARGET" ]; then
+    cp -R "$SKILL_TARGET" "$SNAPSHOT/skill"
+    HAD_SKILL=1
 fi
-if ! mv -f "$WORK/extract/$ASSET_BINARY" "$BINARY"; then
-    if [ -f "$INSTALL_DIR/$PRODUCT.previous" ]; then
-        cp -p "$INSTALL_DIR/$PRODUCT.previous" "$BINARY" || true
+
+rollback_commit() {
+    if [ "$HAD_BINARY" = 1 ]; then
+        rm -f "$BINARY"
+        cp -p "$SNAPSHOT/binary" "$BINARY" || true
+    else
+        rm -f "$BINARY"
     fi
-    die "cannot replace $BINARY; the previous binary was restored"
+    if [ "$HAD_MANIFEST" = 1 ]; then
+        rm -f "$MANIFEST"
+        cp -p "$SNAPSHOT/manifest" "$MANIFEST" || true
+    else
+        rm -f "$MANIFEST"
+    fi
+    if [ "$HAD_PREVIOUS" = 1 ]; then
+        rm -f "$PREVIOUS"
+        cp -p "$SNAPSHOT/previous" "$PREVIOUS" || true
+    else
+        rm -f "$PREVIOUS"
+    fi
+    if [ -n "$SKILL_TARGET" ]; then
+        rm -rf "$SKILL_TARGET"
+        if [ "$HAD_SKILL" = 1 ]; then
+            mkdir -p "$SKILL_ROOT" || true
+            cp -R "$SNAPSHOT/skill" "$SKILL_TARGET" || true
+        fi
+    fi
+    [ "$CREATED_INSTALL_DIR" = 1 ] && rmdir "$INSTALL_DIR" 2>/dev/null || true
+}
+
+die_rollback() {
+    info "rolling back the installation: $1"
+    rollback_commit || true
+    die "$1"
+}
+
+inject_fault() {
+    if [ "$FAULT" = "$1" ]; then
+        die_rollback "injected failure: $1"
+    fi
+}
+
+mkdir -p "$INSTALL_DIR" || die "cannot create $INSTALL_DIR"
+if [ "$HAD_BINARY" = 1 ]; then
+    rm -f "$PREVIOUS"
+    cp -p "$BINARY" "$PREVIOUS" || die_rollback "cannot keep a copy of the previous binary"
 fi
+mv -f "$WORK/extract/$ASSET_BINARY" "$BINARY" || die_rollback "cannot replace $BINARY"
+inject_fault after-binary
 NEW_SHA="$(hash_file "$BINARY")"
 info "installed $PRODUCT $VERSION ($PLATFORM) to $BINARY"
 
 if [ -n "$SKILL_TARGET" ]; then
-    _skill_backup=""
-    if [ -d "$SKILL_TARGET" ]; then
-        _skill_backup="$SKILL_TARGET.backup-$(date -u +%Y%m%d%H%M%S)"
-        cp -R "$SKILL_TARGET" "$_skill_backup" || die "cannot back up $SKILL_TARGET"
-        info "kept a backup at $_skill_backup"
-        rm -rf "$SKILL_TARGET"
-    fi
-    mkdir -p "$SKILL_ROOT"
-    if ! cp -R "$WORK/skill/minecraft-toolkit" "$SKILL_TARGET"; then
-        [ -n "$_skill_backup" ] && mv "$_skill_backup" "$SKILL_TARGET"
-        die "cannot install the skill to $SKILL_TARGET; the previous copy was restored"
-    fi
+    mkdir -p "$SKILL_ROOT" || die_rollback "cannot create $SKILL_ROOT"
+    rm -rf "$SKILL_TARGET" || die_rollback "cannot replace $SKILL_TARGET"
+    cp -R "$WORK/skill/minecraft-toolkit" "$SKILL_TARGET" || die_rollback "cannot install the skill to $SKILL_TARGET"
+    inject_fault after-skill
     info "installed skill $SKILL_VERSION to $SKILL_TARGET"
 fi
 
-# ---------------------------------------------------------------- manifest
-
 SKILL_INDEX="$(manifest_max_skill_index "$MANIFEST")"
+if [ -n "$SKILL_TARGET" ]; then
+    SKILL_INDEX=$((SKILL_INDEX + 1))
+fi
+MANIFEST_TMP="$INSTALL_DIR/$MANIFEST_NAME.new.$$"
 {
     printf 'manifest_version=%s\n' "$MANIFEST_VERSION"
     printf 'product=%s\n' "$PRODUCT"
@@ -563,13 +699,25 @@ SKILL_INDEX="$(manifest_max_skill_index "$MANIFEST")"
         ' "$MANIFEST"
     fi
     if [ -n "$SKILL_TARGET" ]; then
-        SKILL_INDEX=$((SKILL_INDEX + 1))
         printf 'skill.%s.dir=%s\n' "$SKILL_INDEX" "$SKILL_TARGET"
         printf 'skill.%s.version=%s\n' "$SKILL_INDEX" "$SKILL_VERSION"
         printf 'skill.%s.commit=%s\n' "$SKILL_INDEX" "$SKILL_COMMIT"
         printf 'skill.%s.tree_sha256=%s\n' "$SKILL_INDEX" "$(tree_hash "$SKILL_TARGET")"
     fi
-} >"$MANIFEST.new" && mv -f "$MANIFEST.new" "$MANIFEST"
+} >"$MANIFEST_TMP" || die_rollback "cannot write the install manifest"
+inject_fault at-manifest
+mv -f "$MANIFEST_TMP" "$MANIFEST" || { rm -f "$MANIFEST_TMP"; die_rollback "cannot replace $MANIFEST"; }
+
+# The commit is complete; keep a user-visible backup of the replaced skill
+# (best effort: a failed backup copy must not undo a successful install).
+if [ -n "$SKILL_TARGET" ] && [ "$HAD_SKILL" = 1 ]; then
+    _backup="$SKILL_TARGET.backup-$(date -u +%Y%m%d%H%M%S)"
+    if cp -R "$SNAPSHOT/skill" "$_backup" 2>/dev/null; then
+        info "kept a backup of the previous skill at $_backup"
+    else
+        info "warning: could not keep a skill backup at $_backup"
+    fi
+fi
 
 # ---------------------------------------------------------------- PATH
 
@@ -579,9 +727,25 @@ if [ "$ADD_TO_PATH" = "1" ]; then
     if [ -f "$PROFILE" ] && grep -qF "$MARKER" "$PROFILE" 2>/dev/null; then
         info "PATH entry already present in $PROFILE"
     else
+        # Shell-quote the literal directory: quotes, $ and backticks in a
+        # path must never be interpreted when the profile is sourced later.
+        _quoted=""
+        _rest="$INSTALL_DIR"
+        while :; do
+            case "$_rest" in
+                *"'"*)
+                    _quoted="$_quoted${_rest%%\'*}'\\''"
+                    _rest="${_rest#*\'}"
+                    ;;
+                *)
+                    _quoted="$_quoted$_rest"
+                    break
+                    ;;
+            esac
+        done
         {
             printf '\n%s\n' "$MARKER"
-            printf '%s\n' "export PATH=\"$INSTALL_DIR:\$PATH\""
+            printf "export PATH='%s':\"\$PATH\"\n" "$_quoted"
         } >>"$PROFILE"
         info "added $INSTALL_DIR to PATH in $PROFILE (open a new shell or run: . \"$PROFILE\")"
     fi

@@ -1,6 +1,6 @@
 {
-  "commit": "718fcedf3b257ba7a02e11a39542d68ed73e882e",
+  "commit": "fab7eef42b6e204dad8ea8484cda5fbf9ca903b4",
   "path": "skills/minecraft-toolkit",
   "repository": "guajun/mc-agent",
-  "skillVersion": "0.3.0"
+  "skillVersion": "0.3.1"
 }

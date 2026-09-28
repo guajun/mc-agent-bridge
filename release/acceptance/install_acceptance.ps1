@@ -43,9 +43,25 @@ function Check([string]$Name, [bool]$Ok) {
 function Skip([string]$Name) { Write-Host "SKIP  $Name" }
 function HashFile([string]$Path) { (Get-FileHash -Algorithm SHA256 -LiteralPath $Path).Hash.ToLowerInvariant() }
 
-function Invoke-Installer([string[]]$Arguments) {
+function Get-TreeHash([string]$Directory) {
+    $lines = Get-ChildItem -LiteralPath $Directory -Recurse -File | Sort-Object FullName | ForEach-Object {
+        $relative = $_.FullName.Substring($Directory.Length).TrimStart("\", "/").Replace("\", "/")
+        "$(HashFile $_.FullName) $relative"
+    }
+    $joined = ($lines -join "`n") + "`n"
+    $bytes = [System.Text.Encoding]::UTF8.GetBytes($joined)
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try { ($sha.ComputeHash($bytes) | ForEach-Object { $_.ToString("x2") }) -join "" }
+    finally { $sha.Dispose() }
+}
+
+function Invoke-Installer([string[]]$Arguments, [string]$Fault = "") {
+    if ($Fault) { $env:MC_AGENT_INSTALL_FAULT = $Fault }
+    else { Remove-Item Env:MC_AGENT_INSTALL_FAULT -ErrorAction SilentlyContinue }
     & pwsh -NoProfile -File $Installer @Arguments 2>&1 | Out-Null
-    return $LASTEXITCODE
+    $code = $LASTEXITCODE
+    Remove-Item Env:MC_AGENT_INSTALL_FAULT -ErrorAction SilentlyContinue
+    return $code
 }
 
 function New-Checksums([string]$Directory, [string[]]$Patterns) {
@@ -67,27 +83,36 @@ function Wait-BinaryIdle {
     }
 }
 
-# The previous-version fixtures are stage-only; give them a checksums.txt.
+# The previous-version fixtures are stage-only; give them the checksums and
+# skill files the installer expects.
 if ($PreviousAssets) {
     $PreviousAssets = (Resolve-Path -LiteralPath $PreviousAssets).Path
     $stage = Join-Path $Work "previous-assets"
     New-Item -ItemType Directory -Path $stage -Force | Out-Null
     Copy-Item -Path (Join-Path $PreviousAssets '*') -Destination $stage -Force
-    New-Checksums $stage @("*.zip", "*.tar.gz")
+    Copy-Item -LiteralPath (Join-Path $Assets "skill-pin.json") -Destination $stage -Force
+    $pin = Get-Content -LiteralPath (Join-Path $Assets "skill-pin.json") -Raw -Encoding UTF8 | ConvertFrom-Json
+    Copy-Item -LiteralPath (Join-Path $Assets $pin.asset) -Destination $stage -Force
+    New-Checksums $stage @("*.zip", "*.tar.gz", "*.tgz")
     $PreviousAssets = $stage
 }
 
 # ---------------------------------------------------------- baseline install
 
 if ($PreviousAssets) {
-    $null = Invoke-Installer @("-Version", $PreviousVersion, "-FromDir", $PreviousAssets, "-InstallDir", $BinDir, "-NoSkill")
+    $null = Invoke-Installer @("-Version", $PreviousVersion, "-FromDir", $PreviousAssets, "-InstallDir", $BinDir, "-SkillDir", (Join-Path $Work "skills"))
     $baselineVersion = $PreviousVersion
 }
 else {
-    $null = Invoke-Installer @("-Version", $Version, "-FromDir", $Assets, "-InstallDir", $BinDir, "-NoSkill")
+    $null = Invoke-Installer @("-Version", $Version, "-FromDir", $Assets, "-InstallDir", $BinDir, "-SkillDir", (Join-Path $Work "skills"))
     $baselineVersion = $Version
 }
 Check "installed binary reports version $baselineVersion" ((& $Binary version) -match "mc-agent $([regex]::Escape($baselineVersion)) ")
+$baseSkill = Join-Path $Work "skills\minecraft-toolkit"
+Check "baseline skill installed" (Test-Path -LiteralPath (Join-Path $baseSkill "SKILL.md"))
+$baseBinaryHash = HashFile $Binary
+$baseManifestHash = HashFile $Manifest
+$baseSkillHash = Get-TreeHash $baseSkill
 
 $null = & $Binary daemon start --fake
 Check "capabilities lists state through the daemon" ((& $Binary capabilities | Out-String) -match '"state"')
@@ -98,10 +123,30 @@ Check "doctor sees the running daemon" ($doctor -match '"check":"daemon","detail
 $null = & $Binary daemon stop
 Wait-BinaryIdle
 
+# ------------------------------------------------- injected commit failures
+
+if ($PreviousAssets) {
+    foreach ($fault in @("after-binary", "after-skill", "at-manifest")) {
+        $null = Invoke-Installer -Arguments @("-Version", $Version, "-FromDir", $Assets, "-InstallDir", $BinDir, "-SkillDir", (Join-Path $Work "skills"), "-UpdateSkill") -Fault $fault
+        Check "injected $fault failure aborts the install" ($LASTEXITCODE -ne 0)
+        Check "$fault`: original binary preserved" ((HashFile $Binary) -eq $baseBinaryHash)
+        Check "$fault`: original manifest preserved" ((HashFile $Manifest) -eq $baseManifestHash)
+        Check "$fault`: original skill tree preserved" ((Get-TreeHash $baseSkill) -eq $baseSkillHash)
+    }
+    $null = Invoke-Installer @("-Version", $Version, "-FromDir", $Assets, "-InstallDir", (Join-Path $Work "fresh\bin"), "-NoSkill") "after-binary"
+    Check "fresh injected failure aborts the install" ($LASTEXITCODE -ne 0)
+    Check "fresh failed install left no binary or manifest" (
+        (-not (Test-Path -LiteralPath (Join-Path $Work "fresh\bin\mc-agent.exe"))) -and
+        (-not (Test-Path -LiteralPath (Join-Path $Work "fresh\bin\mc-agent.installed"))))
+}
+else {
+    Skip "injected commit-failure tests need -PreviousAssets"
+}
+
 # ------------------------------------------------------------------- upgrade
 
 if ($PreviousAssets) {
-    $null = Invoke-Installer @("-Version", $Version, "-FromDir", $Assets, "-InstallDir", $BinDir, "-NoSkill")
+    $null = Invoke-Installer @("-Version", $Version, "-FromDir", $Assets, "-InstallDir", $BinDir, "-SkillDir", (Join-Path $Work "skills"), "-UpdateSkill")
     Check "upgrade updated the install manifest" ((Get-Content -LiteralPath $Manifest) -contains "version=$Version")
     Check "upgraded binary reports the new version" ((& $Binary version) -match "mc-agent $([regex]::Escape($Version)) ")
     Check "upgrade kept the previous binary" (Test-Path -LiteralPath (Join-Path $BinDir "mc-agent.previous.exe"))
@@ -119,26 +164,33 @@ else {
     Skip "version mismatch refusal needs -PreviousAssets"
 }
 
-# A modified managed binary must be refused without -Force, then replaced with -Force.
+# A modified managed binary must be refused without -Force; an empty manifest
+# is not ownership. Then -Force replaces both.
 Add-Content -LiteralPath $Binary -Value "modified"
 $null = Invoke-Installer @("-Version", $Version, "-FromDir", $Assets, "-InstallDir", $BinDir, "-NoSkill")
 Check "modified managed binary is refused" ($LASTEXITCODE -ne 0)
+Set-Content -LiteralPath $Manifest -Value "" -Encoding ASCII
+$null = Invoke-Installer @("-Version", $Version, "-FromDir", $Assets, "-InstallDir", $BinDir, "-NoSkill")
+Check "empty manifest is not treated as ownership" ($LASTEXITCODE -ne 0)
+$null = Invoke-Installer @("-Uninstall", "-InstallDir", $BinDir)
+Check "uninstall with an empty manifest is refused" ($LASTEXITCODE -ne 0)
 $null = Invoke-Installer @("-Version", $Version, "-FromDir", $Assets, "-InstallDir", $BinDir, "-NoSkill", "-Force")
-Check "-Force replaced the modified binary" ((& $Binary version) -match "mc-agent $([regex]::Escape($Version)) ")
+Check "-Force replaced the modified binary and manifest" ((& $Binary version) -match "mc-agent $([regex]::Escape($Version)) ")
 
 # ---------------------------------------------------------------- skill safety
 
-$null = Invoke-Installer @("-Version", $Version, "-FromDir", $Assets, "-InstallDir", $BinDir, "-SkillDir", (Join-Path $Work "skills"))
-$skillMd = Join-Path $Work "skills\minecraft-toolkit\SKILL.md"
+$skillEdit = Join-Path $Work "skills-edit"
+$null = Invoke-Installer @("-Version", $Version, "-FromDir", $Assets, "-InstallDir", $BinDir, "-SkillDir", $skillEdit)
+$skillMd = Join-Path $skillEdit "minecraft-toolkit\SKILL.md"
 Check "skill installed to the explicit directory" (Test-Path -LiteralPath $skillMd)
 Add-Content -LiteralPath $skillMd -Value "`nuser edit marker"
-$null = Invoke-Installer @("-Version", $Version, "-FromDir", $Assets, "-InstallDir", $BinDir, "-SkillDir", (Join-Path $Work "skills"))
+$null = Invoke-Installer @("-Version", $Version, "-FromDir", $Assets, "-InstallDir", $BinDir, "-SkillDir", $skillEdit)
 Check "existing skill is not overwritten without -UpdateSkill" ($LASTEXITCODE -ne 0)
 Check "user edit survived the refused install" ((Get-Content -LiteralPath $skillMd -Raw) -match "user edit marker")
 
 if ($PreviousAssets) {
     $hashBefore = HashFile $Binary
-    $null = Invoke-Installer @("-Version", $PreviousVersion, "-FromDir", $PreviousAssets, "-InstallDir", $BinDir, "-SkillDir", (Join-Path $Work "skills"))
+    $null = Invoke-Installer @("-Version", $PreviousVersion, "-FromDir", $PreviousAssets, "-InstallDir", $BinDir, "-SkillDir", $skillEdit)
     Check "skill conflict aborts the upgrade before the binary changes" ($LASTEXITCODE -ne 0)
     Check "aborted upgrade left the binary unchanged" ((HashFile $Binary) -eq $hashBefore)
     Check "aborted upgrade left the manifest unchanged" ((Get-Content -LiteralPath $Manifest) -contains "version=$Version")
@@ -147,14 +199,14 @@ else {
     Skip "transaction-order test needs -PreviousAssets"
 }
 
-$null = Invoke-Installer @("-Version", $Version, "-FromDir", $Assets, "-InstallDir", $BinDir, "-SkillDir", (Join-Path $Work "skills"), "-UpdateSkill")
+$null = Invoke-Installer @("-Version", $Version, "-FromDir", $Assets, "-InstallDir", $BinDir, "-SkillDir", $skillEdit, "-UpdateSkill")
 Check "(-UpdateSkill) replaced the edited copy" (-not ((Get-Content -LiteralPath $skillMd -Raw) -match "user edit marker"))
-Check "(-UpdateSkill) kept a backup" (([System.IO.Directory]::GetDirectories((Join-Path $Work "skills"), "minecraft-toolkit.backup-*")).Count -gt 0)
+Check "(-UpdateSkill) kept a backup" (([System.IO.Directory]::GetDirectories($skillEdit, "minecraft-toolkit.backup-*")).Count -gt 0)
 
 $null = Invoke-Installer @("-Version", $Version, "-FromDir", $Assets, "-InstallDir", $BinDir, "-NoSkill")
-Check "binary-only reinstall preserved the skill record" (($null -ne (Get-Content -LiteralPath $Manifest | Where-Object { $_ -like "skill.*.dir=*" -and $_ -match [regex]::Escape((Join-Path $Work "skills\minecraft-toolkit")) } | Select-Object -First 1)))
+Check "binary-only reinstall preserved the skill record" (($null -ne (Get-Content -LiteralPath $Manifest | Where-Object { $_ -like "skill.*.dir=*" -and $_ -match [regex]::Escape((Join-Path $skillEdit "minecraft-toolkit")) } | Select-Object -First 1)))
 $null = Invoke-Installer @("-Uninstall", "-InstallDir", $BinDir, "-RemoveSkill")
-Check "(-RemoveSkill) removed the preserved skill" (-not (Test-Path -LiteralPath (Join-Path $Work "skills\minecraft-toolkit")))
+Check "(-RemoveSkill) removed the preserved skill" (-not (Test-Path -LiteralPath (Join-Path $skillEdit "minecraft-toolkit")))
 
 # Several explicit targets, including a relative path and non-ASCII/space names.
 $null = Invoke-Installer @("-Version", $Version, "-FromDir", $Assets, "-InstallDir", $BinDir, "-SkillDir", (Join-Path $Work "skillsA"))
@@ -181,20 +233,73 @@ Check "uninstall without a manifest is refused" ($LASTEXITCODE -ne 0)
 $null = Invoke-Installer @("-Uninstall", "-InstallDir", $BinDir, "-Force")
 Check "(-Force) uninstall removed the unowned binary" (-not (Test-Path -LiteralPath $Binary))
 
-# -PurgeState only removes a recognized product state directory.
+# -PurgeState removes known files, preserves unrelated ones and keeps a
+# nonempty directory.
 $null = Invoke-Installer @("-Version", $Version, "-FromDir", $Assets, "-InstallDir", $BinDir, "-NoSkill")
-$emptyState = Join-Path $Work "empty-state"
-New-Item -ItemType Directory -Path $emptyState -Force | Out-Null
-Set-Content -LiteralPath (Join-Path $emptyState "sentinel") -Value "keep"
-$env:MC_AGENT_HOME = $emptyState
+$stateMixed = Join-Path $Work "state-mixed"
+New-Item -ItemType Directory -Path $stateMixed -Force | Out-Null
+Set-Content -LiteralPath (Join-Path $stateMixed "daemon.json") -Value "{}"
+Set-Content -LiteralPath (Join-Path $stateMixed "notes.txt") -Value "keep me"
+$env:MC_AGENT_HOME = $stateMixed
+$null = Invoke-Installer @("-Uninstall", "-InstallDir", $BinDir, "-PurgeState")
+Check "purge removed the known state file" (-not (Test-Path -LiteralPath (Join-Path $stateMixed "daemon.json")))
+Check "purge preserved an unrelated file" (Test-Path -LiteralPath (Join-Path $stateMixed "notes.txt"))
+Check "purge kept the nonempty directory" (Test-Path -LiteralPath $stateMixed)
+
+$null = Invoke-Installer @("-Version", $Version, "-FromDir", $Assets, "-InstallDir", $BinDir, "-NoSkill")
+$stateEmpty = Join-Path $Work "state-empty"
+New-Item -ItemType Directory -Path $stateEmpty -Force | Out-Null
+Set-Content -LiteralPath (Join-Path $stateEmpty "daemon.json") -Value "{}"
+$env:MC_AGENT_HOME = $stateEmpty
+$null = Invoke-Installer @("-Uninstall", "-InstallDir", $BinDir, "-PurgeState")
+Check "purge removed the empty product state directory" (-not (Test-Path -LiteralPath $stateEmpty))
+
+$null = Invoke-Installer @("-Version", $Version, "-FromDir", $Assets, "-InstallDir", $BinDir, "-NoSkill")
+$stateUnowned = Join-Path $Work "state-unowned"
+New-Item -ItemType Directory -Path $stateUnowned -Force | Out-Null
+Set-Content -LiteralPath (Join-Path $stateUnowned "notes.txt") -Value "keep me"
+$env:MC_AGENT_HOME = $stateUnowned
 $null = Invoke-Installer @("-Uninstall", "-InstallDir", $BinDir, "-PurgeState")
 Check "purge-state refuses a directory without product ownership" ($LASTEXITCODE -ne 0)
-Check "refused purge-state left the directory untouched" (Test-Path -LiteralPath (Join-Path $emptyState "sentinel"))
-Set-Content -LiteralPath (Join-Path $emptyState "daemon.json") -Value "{}"
-$null = Invoke-Installer @("-Version", $Version, "-FromDir", $Assets, "-InstallDir", $BinDir, "-NoSkill")
-$null = Invoke-Installer @("-Uninstall", "-InstallDir", $BinDir, "-PurgeState")
-Check "purge-state removed a product-owned state directory" (-not (Test-Path -LiteralPath $emptyState))
+Check "refused purge-state left the directory untouched" (Test-Path -LiteralPath (Join-Path $stateUnowned "notes.txt"))
 $env:MC_AGENT_HOME = Join-Path $Work "home"
+
+# A forged skill entry (not leaf minecraft-toolkit) is refused even with -Force.
+$null = Invoke-Installer @("-Version", $Version, "-FromDir", $Assets, "-InstallDir", $BinDir, "-NoSkill")
+$evil = Join-Path $Work "evil"
+New-Item -ItemType Directory -Path $evil -Force | Out-Null
+Set-Content -LiteralPath (Join-Path $evil "file.txt") -Value "do not delete"
+$manifestLines = @(
+    "manifest_version=2", "product=mc-agent", "version=$Version", "platform=windows/amd64",
+    "binary_sha256=$(HashFile $Binary)",
+    "skill.1.dir=$evil", "skill.1.version=0.3.0", "skill.1.commit=deadbeef",
+    "skill.1.tree_sha256=$(Get-TreeHash $evil)"
+)
+Set-Content -LiteralPath $Manifest -Value $manifestLines -Encoding UTF8
+$null = Invoke-Installer @("-Uninstall", "-InstallDir", $BinDir, "-RemoveSkill", "-Force")
+Check "forged non-skill manifest entry is never removed" (Test-Path -LiteralPath (Join-Path $evil "file.txt"))
+
+# A forged skill entry that resolves through a link is refused.
+$null = Invoke-Installer @("-Version", $Version, "-FromDir", $Assets, "-InstallDir", $BinDir, "-NoSkill")
+$realSkills = Join-Path $Work "real-skills"
+New-Item -ItemType Directory -Path (Join-Path $realSkills "minecraft-toolkit") -Force | Out-Null
+Set-Content -LiteralPath (Join-Path $realSkills "minecraft-toolkit\SKILL.md") -Value "real"
+$linkSkills = Join-Path $Work "link-skills"
+$linkCreated = $true
+try { New-Item -ItemType Junction -Path $linkSkills -Target $realSkills -ErrorAction Stop | Out-Null }
+catch { $linkCreated = $false }
+if ($linkCreated) {
+    $manifestLines = @(
+        "manifest_version=2", "product=mc-agent", "version=$Version", "platform=windows/amd64",
+        "binary_sha256=$(HashFile $Binary)",
+        "skill.1.dir=$linkSkills\minecraft-toolkit", "skill.1.version=0.3.0", "skill.1.commit=deadbeef",
+        "skill.1.tree_sha256=$(Get-TreeHash (Join-Path $realSkills 'minecraft-toolkit'))"
+    )
+    Set-Content -LiteralPath $Manifest -Value $manifestLines -Encoding UTF8
+    $null = Invoke-Installer @("-Uninstall", "-InstallDir", $BinDir, "-RemoveSkill", "-Force")
+    Check "linked skill path is never removed" (Test-Path -LiteralPath (Join-Path $realSkills "minecraft-toolkit\SKILL.md"))
+}
+else { Skip "junction/link test needs junction privileges" }
 
 # -DryRun must not create install/skill/state directories or the profile entry.
 $dry = Join-Path $Work "dry"
