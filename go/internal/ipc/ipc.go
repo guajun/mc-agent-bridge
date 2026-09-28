@@ -16,6 +16,7 @@ import (
 	"net"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/guajun/mc-agent-bridge/internal/protocol"
@@ -36,6 +37,9 @@ type Request struct {
 	Method string         `json:"method"`
 	Params map[string]any `json:"params,omitempty"`
 	Auth   string         `json:"auth,omitempty"`
+	// RequestID is the end-to-end id forwarded to the daemon so a write keeps
+	// one stable identity from the CLI through the daemon to the mod.
+	RequestID string `json:"requestId,omitempty"`
 }
 
 // Event is one pushed event frame.
@@ -43,6 +47,11 @@ type Event struct {
 	Type  string         `json:"type"`
 	Event string         `json:"event"`
 	Data  map[string]any `json:"data"`
+	// DroppedBefore is the number of live events the client queue dropped
+	// before this one was enqueued. The tag travels with the event so a
+	// consumer can recover from the last actually delivered sequence before
+	// processing an event that sits on the far side of the gap.
+	DroppedBefore int64 `json:"-"`
 }
 
 // Server serves the local JSON-lines API.
@@ -54,6 +63,8 @@ type Server struct {
 	mu      sync.Mutex
 	clients map[*client]struct{}
 	closed  bool
+	ctx     context.Context
+	cancel  context.CancelFunc
 }
 
 // Start binds the loopback listener. An empty address uses 127.0.0.1 with an
@@ -67,6 +78,7 @@ func Start(address, token string, handler Handler) (*Server, error) {
 		return nil, err
 	}
 	server := &Server{listener: listener, token: token, handler: handler, clients: map[*client]struct{}{}}
+	server.ctx, server.cancel = context.WithCancel(context.Background())
 	go server.acceptLoop()
 	return server, nil
 }
@@ -95,8 +107,11 @@ func (s *Server) Stop() {
 	}
 	s.mu.Unlock()
 	s.listener.Close()
+	if s.cancel != nil {
+		s.cancel()
+	}
 	for _, c := range clients {
-		c.conn.Close()
+		c.close()
 	}
 }
 
@@ -191,10 +206,14 @@ func (c *client) readLoop() {
 			c.send(map[string]any{"type": "response", "id": request.ID, "ok": true,
 				"result": map[string]any{"pong": true}})
 		default:
-			c.dispatcher <- struct{}{}
+			select {
+			case c.dispatcher <- struct{}{}:
+			case <-c.done:
+				return
+			}
 			go func(request Request) {
 				defer func() { <-c.dispatcher }()
-				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+				ctx, cancel := context.WithTimeout(c.server.ctx, 5*time.Minute)
 				defer cancel()
 				result, failure := c.server.handler(ctx, request.Method, request.Params)
 				if failure != nil {
@@ -339,10 +358,18 @@ type Client struct {
 	pending map[string]chan response
 	events  chan Event
 
-	done      chan struct{}
-	closeOnce sync.Once
-	errMu     sync.Mutex
-	err       error
+	// stop is closed by Close independent of the read loop, so a read loop
+	// blocked on a full event channel can always be released.
+	stop       chan struct{}
+	done       chan struct{}
+	writeToken chan struct{}
+	ioTimeout  time.Duration
+	closeOnce  sync.Once
+	stopOnce   sync.Once
+	dropped    atomic.Int64
+	dropNotify chan struct{}
+	errMu      sync.Mutex
+	err        error
 }
 
 type response struct {
@@ -360,17 +387,22 @@ func Dial(ctx context.Context, address, token string) (*Client, error) {
 			Message: fmt.Sprintf("no daemon on %s: %v", address, err)}
 	}
 	client := &Client{
-		conn:    conn,
-		reader:  bufio.NewReaderSize(conn, 64*1024),
-		writer:  bufio.NewWriterSize(conn, 64*1024),
-		token:   token,
-		pending: map[string]chan response{},
-		events:  make(chan Event, 256),
-		done:    make(chan struct{}),
+		conn:       conn,
+		reader:     bufio.NewReaderSize(conn, 64*1024),
+		writer:     bufio.NewWriterSize(conn, 64*1024),
+		token:      token,
+		pending:    map[string]chan response{},
+		events:     make(chan Event, 256),
+		dropNotify: make(chan struct{}, 1),
+		stop:       make(chan struct{}),
+		done:       make(chan struct{}),
+		writeToken: make(chan struct{}, 1),
+		ioTimeout:  15 * time.Second,
 	}
+	client.writeToken <- struct{}{}
 	go client.readLoop()
 	if _, failure := client.Call(ctx, "ping", nil); failure != nil {
-		conn.Close()
+		client.Close()
 		return nil, failure
 	}
 	return client, nil
@@ -382,32 +414,89 @@ func (c *Client) Events() <-chan Event { return c.events }
 // Done closes when the IPC connection ends.
 func (c *Client) Done() <-chan struct{} { return c.done }
 
-// Call runs one method.
+// Call runs one method with no end-to-end request id.
 func (c *Client) Call(ctx context.Context, method string, params map[string]any) (any, *protocol.Error) {
+	return c.CallWithID(ctx, method, params, "")
+}
+
+// CallWithID runs one method. When requestID is non-empty it is forwarded to
+// the daemon so a write keeps one stable identity from the CLI to the mod; a
+// timeout or connection loss after dispatch is then reported result-unknown
+// with that id instead of a generic error.
+func (c *Client) CallWithID(ctx context.Context, method string, params map[string]any,
+	requestID string) (any, *protocol.Error) {
 	c.mu.Lock()
 	c.nextID++
 	id := fmt.Sprintf("%d", c.nextID)
 	channel := make(chan response, 1)
 	c.pending[id] = channel
-	writer := c.writer
 	c.mu.Unlock()
+	defer c.forget(id)
 
-	request := Request{ID: id, Method: method, Params: params, Auth: c.token}
+	if err := ctx.Err(); err != nil {
+		return nil, notSent(method, requestID, err)
+	}
+	// Acquire the writer slot cancellably: a cancelled call must never send.
+	select {
+	case <-c.writeToken:
+	case <-ctx.Done():
+		return nil, notSent(method, requestID, ctx.Err())
+	case <-c.stop:
+		return nil, notSent(method, requestID, errors.New("the daemon connection is closed"))
+	}
+	released := false
+	release := func() {
+		if !released {
+			released = true
+			c.writeToken <- struct{}{}
+		}
+	}
+	defer release()
+	if err := ctx.Err(); err != nil {
+		return nil, notSent(method, requestID, err)
+	}
+
+	request := Request{ID: id, Method: method, Params: params, Auth: c.token, RequestID: requestID}
 	payload, err := json.Marshal(request)
 	if err != nil {
-		c.forget(id)
 		return nil, protocol.NewError(protocol.CodeInternal, err.Error())
 	}
 	payload = append(payload, '\n')
-	c.mu.Lock()
-	_, writeErr := writer.Write(payload)
-	if writeErr == nil {
-		writeErr = writer.Flush()
+	writeDeadline := time.Now().Add(c.ioTimeout)
+	if deadline, ok := ctx.Deadline(); ok && deadline.Before(writeDeadline) {
+		writeDeadline = deadline
 	}
-	c.mu.Unlock()
+	if err := c.conn.SetWriteDeadline(writeDeadline); err != nil {
+		return nil, notSent(method, requestID, err)
+	}
+	// Abort a blocked socket write on ctx.Done, not only on the deadline; join
+	// the watcher before clearing the deadline and freeing the slot.
+	watcherStop := make(chan struct{})
+	watcherDone := make(chan struct{})
+	go func() {
+		defer close(watcherDone)
+		select {
+		case <-ctx.Done():
+			_ = c.conn.SetWriteDeadline(time.Now())
+		case <-watcherStop:
+		}
+	}()
+	_, writeErr := c.writer.Write(payload)
+	if writeErr == nil {
+		writeErr = c.writer.Flush()
+	}
+	close(watcherStop)
+	<-watcherDone
+	_ = c.conn.SetWriteDeadline(time.Time{})
+	release()
 	if writeErr != nil {
-		c.forget(id)
-		return nil, protocol.NewError(protocol.CodeDaemonNotRunning, writeErr.Error())
+		// A partial request line may be on the wire; poison synchronously
+		// before freeing the writer slot so another sender cannot acquire it
+		// and flush buffered remains. The caller gets a possibly-dispatched
+		// classification.
+		c.poison()
+		release()
+		return nil, possiblyDispatched(method, requestID, writeErr)
 	}
 
 	select {
@@ -424,11 +513,32 @@ func (c *Client) Call(ctx context.Context, method string, params map[string]any)
 		}
 		return value, nil
 	case <-ctx.Done():
-		c.forget(id)
-		return nil, protocol.NewError(protocol.CodeTimeout, "the daemon did not answer in time")
-	case <-c.done:
-		c.forget(id)
-		return nil, protocol.NewError(protocol.CodeDaemonNotRunning, "the daemon connection closed")
+		return nil, possiblyDispatched(method, requestID, ctx.Err())
+	case <-c.stop:
+		return nil, possiblyDispatched(method, requestID, errors.New("the daemon connection closed"))
+	}
+}
+
+func notSent(method, requestID string, cause error) *protocol.Error {
+	return &protocol.Error{
+		Code:          protocol.CodeDaemonNotRunning,
+		Message:       fmt.Sprintf("the local request %s was not sent: %v", method, cause),
+		Retryable:     true,
+		ResultUnknown: false,
+		RequestID:     requestID,
+		Operation:     method,
+	}
+}
+
+func possiblyDispatched(method, requestID string, cause error) *protocol.Error {
+	unknown := requestID != ""
+	return &protocol.Error{
+		Code:          protocol.CodeConnectionLost,
+		Message:       fmt.Sprintf("the local request %s may have reached the daemon: %v", method, cause),
+		Retryable:     !unknown,
+		ResultUnknown: unknown,
+		RequestID:     requestID,
+		Operation:     method,
 	}
 }
 
@@ -438,15 +548,44 @@ func (c *Client) forget(id string) {
 	c.mu.Unlock()
 }
 
-// Close ends the connection.
+// signalStop closes stop exactly once; it is the transport-failure signal for
+// both the read loop and pending calls.
+func (c *Client) signalStop() {
+	c.stopOnce.Do(func() { close(c.stop) })
+}
+
+// poison marks the connection failed and closes it without waiting.
+func (c *Client) poison() {
+	c.signalStop()
+	_ = c.conn.SetDeadline(time.Now())
+	c.conn.Close()
+}
+
+// Close ends the connection. It is safe with a full event channel and no
+// consumer: the independent stop closes first, so the read loop can abandon a
+// blocked delivery instead of deadlocking Close.
 func (c *Client) Close() {
-	c.closeOnce.Do(func() { c.conn.Close() })
+	c.closeOnce.Do(c.poison)
 	<-c.done
 }
+
+// DropNotify is signalled when the live queue overflowed. It is independent of
+// new events, so a consumer that is not reading events can still learn about
+// loss (and recover from the daemon ring) without waiting for another event.
+func (c *Client) DropNotify() <-chan struct{} { return c.dropNotify }
+
+// Dropped is the number of live events dropped because the consumer could not
+// keep up. The caller reports it as an explicit gap and re-pages the daemon
+// ring to recover them.
+func (c *Client) Dropped() int64 { return c.dropped.Load() }
+
+// TakeDropped returns and resets the overflow counter.
+func (c *Client) TakeDropped() int64 { return c.dropped.Swap(0) }
 
 func (c *Client) readLoop() {
 	defer close(c.done)
 	defer close(c.events)
+	defer c.signalStop()
 	for {
 		line, err := readLine(c.reader, MaxLineBytes)
 		if err != nil {
@@ -479,10 +618,23 @@ func (c *Client) readLoop() {
 				channel <- response{OK: envelope.OK, Result: envelope.Result, Error: envelope.Error}
 			}
 		case "event":
+			// Never block the read loop behind a full consumer queue: a
+			// blocked loop would also block response routing. Overflow is
+			// counted, signalled for the no-subsequent-event case, and the
+			// first event enqueued after a gap carries the drop count so the
+			// consumer recovers before printing across the gap.
+			event := Event{Type: "event", Event: envelope.Event, Data: envelope.Data}
+			if pending := c.dropped.Swap(0); pending > 0 {
+				event.DroppedBefore = pending
+			}
 			select {
-			case c.events <- Event{Type: "event", Event: envelope.Event, Data: envelope.Data}:
-			case <-c.done:
-				return
+			case c.events <- event:
+			default:
+				c.dropped.Add(1)
+				select {
+				case c.dropNotify <- struct{}{}:
+				default:
+				}
 			}
 		}
 	}
@@ -495,11 +647,8 @@ func (c *Client) finish(cause error) {
 	}
 	c.errMu.Unlock()
 	c.conn.Close()
-	c.mu.Lock()
-	for id, channel := range c.pending {
-		delete(c.pending, id)
-		channel <- response{OK: false, Error: protocol.NewError(protocol.CodeDaemonNotRunning,
-			"the daemon connection closed")}
-	}
-	c.mu.Unlock()
+	// Do not answer pending calls with a generic error: the transport failure
+	// must keep the end-to-end classification (possibly dispatched with a
+	// request id) that CallWithID derives from the stop signal.
+	c.signalStop()
 }

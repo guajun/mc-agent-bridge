@@ -9,6 +9,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -54,6 +55,14 @@ type Daemon struct {
 
 	eventsMu  sync.Mutex
 	eventRing []map[string]any
+	// Eviction bookkeeping: explicit loss evidence for cursors that fell
+	// behind the ring. The per-category/target/pair maxima let a filtered
+	// cursor report dropped only when events it actually asked for are gone
+	// (an unrelated category being evicted is not a loss for that cursor).
+	evictedThrough  int64
+	evictedCategory map[string]int64
+	evictedTarget   map[string]int64
+	evictedPair     map[string]int64
 
 	streamID  string
 	eventSeq  atomic.Int64
@@ -82,6 +91,7 @@ type targetSession struct {
 	generation         int64
 	everConnect        bool
 	stopCh             chan struct{}
+	finished           chan struct{}
 	stopped            bool
 }
 
@@ -114,16 +124,19 @@ func Run(ctx context.Context, options Options) error {
 	}
 
 	daemon := &Daemon{
-		home:           home,
-		apiAddress:     options.APIAddress,
-		bufferSize:     options.BufferSize,
-		reconnectDelay: options.ReconnectDelay,
-		logger:         options.Logger,
-		targets:        targets,
-		sessions:       map[string]*targetSession{},
-		streamID:       randomHex(16),
-		startedAt:      time.Now(),
-		stopCh:         make(chan struct{}),
+		home:            home,
+		apiAddress:      options.APIAddress,
+		bufferSize:      options.BufferSize,
+		reconnectDelay:  options.ReconnectDelay,
+		logger:          options.Logger,
+		targets:         targets,
+		sessions:        map[string]*targetSession{},
+		evictedCategory: map[string]int64{},
+		evictedTarget:   map[string]int64{},
+		evictedPair:     map[string]int64{},
+		streamID:        randomHex(16),
+		startedAt:       time.Now(),
+		stopCh:          make(chan struct{}),
 	}
 
 	if options.Fake {
@@ -290,7 +303,8 @@ func (d *Daemon) startAllSessions() {
 				Target:    name,
 				Transport: target.Transport,
 			},
-			stopCh: make(chan struct{}),
+			stopCh:   make(chan struct{}),
+			finished: make(chan struct{}),
 		}
 		d.sessions[name] = targetSession
 		go targetSession.run()
@@ -298,6 +312,7 @@ func (d *Daemon) startAllSessions() {
 }
 
 func (ts *targetSession) run() {
+	defer close(ts.finished)
 	daemon := ts.daemon
 	for {
 		select {
@@ -530,14 +545,30 @@ func (ts *targetSession) stop() {
 	adapter := ts.adapter
 	ts.mu.Unlock()
 	// Close outside the lock: session Close may wait for a pump that needs
-	// this lock to record the terminal state.
+	// this lock to record the terminal state. Then join the loop so a daemon
+	// shutdown (or target reload) cannot leave a goroutine still writing the
+	// cursor/ledger after Run returns.
 	if adapter != nil {
 		adapter.Close()
 	}
+	select {
+	case <-ts.finished:
+	case <-time.After(5 * time.Second):
+		ts.daemon.logger("target %s: session loop did not stop after close", ts.target.Name)
+	}
 }
 
-// call routes one operation to a target session.
+// call routes one operation to a target session with a daemon-generated id.
 func (d *Daemon) call(ctx context.Context, targetName, operation string, params map[string]any) (any, *protocol.Error) {
+	return d.callWithID(ctx, targetName, operation, params, "")
+}
+
+// callWithID routes one operation. A caller-provided requestID (the CLI/IPC
+// path) becomes the end-to-end write identity: the same value is persisted in
+// the recovery ledger and sent to the mod, so a crash or a lost reply can be
+// reconciled against exactly that write.
+func (d *Daemon) callWithID(ctx context.Context, targetName, operation string, params map[string]any,
+	requestID string) (any, *protocol.Error) {
 	if params == nil {
 		params = map[string]any{}
 	}
@@ -581,6 +612,9 @@ func (d *Daemon) call(ctx context.Context, targetName, operation string, params 
 		}
 		return result, nil
 	}
+	if requestID != "" && len(requestID) > 128 {
+		return nil, protocol.NewError(protocol.CodeBadRequest, "request id must be 1..128 characters")
+	}
 
 	// Persist the request identity before it can leave the process. A crash
 	// after this point leaves a visible unknown write; a persistence failure
@@ -589,15 +623,33 @@ func (d *Daemon) call(ctx context.Context, targetName, operation string, params 
 	if tokenErr != nil && target.Transport != protocol.TransportLegacy {
 		return nil, protocol.NewError(protocol.CodeUnauthorized, tokenErr.Error())
 	}
-	requestID := adapter.NextRequestID()
+	if requestID == "" {
+		requestID = adapter.NextRequestID()
+	}
 	if requestID == "" {
 		return nil, protocol.NewError(protocol.CodeInternal,
 			"the session cannot allocate a request id; refusing to send a non-idempotent write")
 	}
-	if err := d.unknown.Record(target.Name, operation, requestID,
-		state.InstanceID, state.RunID, credentialFingerprint(token)); err != nil {
+	existing, admitErr := d.unknown.Admit(target.Name, operation, requestID,
+		state.InstanceID, state.RunID, credentialFingerprint(token))
+	if admitErr != nil {
 		return nil, protocol.NewError(protocol.CodeInternal,
-			"refusing to send a non-idempotent write: "+err.Error())
+			"refusing to send a non-idempotent write: "+admitErr.Error())
+	}
+	if existing != nil {
+		details, _ := json.Marshal(existing)
+		return nil, &protocol.Error{
+			Code: protocol.CodeResultUnknown,
+			Message: "request id " + requestID + " already has an unreconciled write for target " +
+				target.Name + " (state " + existing.State + "); resolve it with request_status " +
+				"instead of reusing the id",
+			Retryable:     false,
+			ResultUnknown: true,
+			RequestID:     requestID,
+			Operation:     operation,
+			Target:        target.Name,
+			Details:       details,
+		}
 	}
 	result, failure := adapter.CallID(ctx, requestID, operation, params)
 	if failure == nil {
@@ -733,6 +785,11 @@ func (d *Daemon) markUnresolved(entry UnknownWrite, message string) {
 func (d *Daemon) ingest(target string, payload map[string]any) {
 	eventType, _ := payload["type"].(string)
 	category := protocol.Categorize(eventType)
+
+	// Sequence assignment, the replay ring and the fan-out are one critical
+	// section: two targets or goroutines can never deliver seq 2 before seq 1,
+	// and a page boundary taken here can never advance past an unseen event.
+	d.eventsMu.Lock()
 	sequence := d.eventSeq.Add(1)
 	event := make(map[string]any, len(payload)+6)
 	for key, value := range payload {
@@ -744,39 +801,125 @@ func (d *Daemon) ingest(target string, payload map[string]any) {
 	event["category"] = category
 	event["receivedAt"] = time.Now().UnixMilli()
 	event["target"] = target
-
-	d.eventsMu.Lock()
 	d.eventRing = append(d.eventRing, event)
 	if len(d.eventRing) > d.bufferSize {
+		for _, evicted := range d.eventRing[:len(d.eventRing)-d.bufferSize] {
+			d.recordEviction(evicted)
+		}
 		d.eventRing = d.eventRing[len(d.eventRing)-d.bufferSize:]
 	}
-	d.eventsMu.Unlock()
-
 	if d.ipcServer != nil {
 		d.ipcServer.Broadcast(category, event)
 	}
 	if d.webhook != nil {
 		d.webhook.Enqueue(event)
 	}
+	d.eventsMu.Unlock()
+}
+
+// evictedKeyLimit bounds the per-filter eviction tables. Categories and
+// dedicated-mode targets are naturally few; the cap only guards a hostile or
+// unusual peer from growing the tables without bound.
+const evictedKeyLimit = 256
+
+// rememberEvicted keeps the highest evicted sequence per key; when the table
+// is full the oldest key is replaced (a newer eviction is the more useful
+// loss evidence).
+func rememberEvicted(table map[string]int64, key string, sequence int64) {
+	if sequence <= table[key] {
+		return
+	}
+	if len(table) >= evictedKeyLimit {
+		oldestKey := ""
+		oldest := int64(1<<63 - 1)
+		for candidate, value := range table {
+			if value < oldest {
+				oldestKey, oldest = candidate, value
+			}
+		}
+		if oldest >= sequence {
+			return
+		}
+		delete(table, oldestKey)
+	}
+	table[key] = sequence
+}
+
+// recordEviction remembers what left the ring so a cursor behind the ring can
+// be told exactly which of the caller's categories/targets are unrecoverable.
+func (d *Daemon) recordEviction(event map[string]any) {
+	if d.evictedCategory == nil {
+		d.evictedCategory = map[string]int64{}
+	}
+	if d.evictedTarget == nil {
+		d.evictedTarget = map[string]int64{}
+	}
+	if d.evictedPair == nil {
+		d.evictedPair = map[string]int64{}
+	}
+	sequence, ok := event["seq"].(int64)
+	if !ok {
+		return
+	}
+	if sequence > d.evictedThrough {
+		d.evictedThrough = sequence
+	}
+	category, _ := event["category"].(string)
+	target, _ := event["target"].(string)
+	if category != "" {
+		rememberEvicted(d.evictedCategory, category, sequence)
+	}
+	if target != "" {
+		rememberEvicted(d.evictedTarget, target, sequence)
+	}
+	if category != "" && target != "" {
+		rememberEvicted(d.evictedPair, category+"\x00"+target, sequence)
+	}
 }
 
 // recentEvents mirrors the Python daemon's events method.
-func (d *Daemon) recentEvents(since int64, limit int, category string) map[string]any {
+func (d *Daemon) recentEvents(since int64, limit int, category, target string, cursorStream string) map[string]any {
 	d.eventsMu.Lock()
+	// The boundary is read under the same lock that assigns sequences: an
+	// empty page can never advance past an event that was not yet appended.
+	lastSeq := d.eventSeq.Load()
 	ring := append([]map[string]any(nil), d.eventRing...)
 	d.eventsMu.Unlock()
-	var oldest int64
-	if len(ring) > 0 {
-		if value, ok := ring[0]["seq"].(int64); ok {
-			oldest = value
+	reset := cursorStream != "" && cursorStream != d.streamID
+	if since > lastSeq {
+		// A cursor ahead of this stream can only come from a previous daemon
+		// run (or a corrupted value): report it instead of an empty non-gap
+		// page.
+		reset = true
+	}
+	if reset {
+		since = 0
+	}
+	// dropped means events the caller asked for were evicted after its
+	// cursor. The per-filter maxima keep unrelated evictions from producing
+	// false gap markers on a filtered stream.
+	dropped := false
+	if since > 0 {
+		switch {
+		case category != "" && target != "":
+			dropped = d.evictedPair[category+"\x00"+target] > since
+		case category != "":
+			dropped = d.evictedCategory[category] > since
+		case target != "":
+			dropped = d.evictedTarget[target] > since
+		default:
+			dropped = d.evictedThrough > since
 		}
 	}
-	// dropped means the ring no longer reaches the requested cursor.
-	dropped := since > 0 && oldest > 0 && oldest > since+1
 	events := make([]map[string]any, 0, len(ring))
 	for _, event := range ring {
 		if category != "" {
 			if value, _ := event["category"].(string); value != category {
+				continue
+			}
+		}
+		if target != "" {
+			if value, _ := event["target"].(string); value != target {
 				continue
 			}
 		}
@@ -796,14 +939,15 @@ func (d *Daemon) recentEvents(since int64, limit int, category string) map[strin
 		events = events[:limit]
 		truncated = true
 	}
-	next := d.eventSeq.Load()
+	next := lastSeq
 	if len(events) > 0 {
 		if value, ok := events[len(events)-1]["seq"].(int64); ok {
 			next = value
 		}
 	}
 	return map[string]any{"events": events, "next": next, "dropped": dropped,
-		"truncated": truncated, "streamId": d.streamID}
+		"truncated": truncated, "streamId": d.streamID, "reset": reset,
+		"lastSeq": lastSeq}
 }
 
 func (d *Daemon) status() map[string]any {

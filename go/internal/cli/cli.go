@@ -5,6 +5,8 @@ package cli
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -16,6 +18,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -35,6 +38,11 @@ type app struct {
 	stdout   io.Writer
 	stderr   io.Writer
 	exitCode int
+
+	// End-to-end write ids are allocated before the request leaves the CLI so
+	// a lost local reply still names the exact write.
+	requestNonce string
+	requestSeq   atomic.Uint64
 }
 
 // Main runs the CLI and returns the process exit code.
@@ -168,8 +176,30 @@ func (a *app) print(value any) {
 }
 
 func (a *app) printError(failure *protocol.Error) {
+	if failure.ResultUnknown && failure.RequestID != "" && failure.Hint == "" {
+		target := ""
+		if a.target != "" {
+			target = " --target " + a.target
+		}
+		failure.Hint = fmt.Sprintf("the write may have executed; check with `mc-agent request-status %s%s`",
+			failure.RequestID, target)
+	}
 	payload, _ := json.Marshal(map[string]any{"ok": false, "error": failure})
 	fmt.Fprintln(a.stderr, string(payload))
+}
+
+// newRequestID returns an id unique across CLI processes and runs. A caller
+// may pass its own id explicitly; otherwise writes get one automatically.
+func (a *app) newRequestID() string {
+	if a.requestNonce == "" {
+		buffer := make([]byte, 8)
+		if _, err := rand.Read(buffer); err != nil {
+			a.requestNonce = strconv.FormatInt(time.Now().UnixNano(), 36)
+		} else {
+			a.requestNonce = hex.EncodeToString(buffer)
+		}
+	}
+	return fmt.Sprintf("cli-%s-%d", a.requestNonce, a.requestSeq.Add(1))
 }
 
 // reorderInterspersed moves flags before positional arguments so a subcommand
@@ -261,7 +291,11 @@ func (a *app) connectDaemon() (*ipc.Client, *protocol.Error) {
 		}
 		return nil, protocol.NewError(protocol.CodeInternal, err.Error())
 	}
-	client, dialErr := ipc.Dial(context.Background(), address, token)
+	// Bound the connect+ping handshake: a socket that accepts but never
+	// answers ping must not hang the CLI forever.
+	dialCtx, cancelDial := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancelDial()
+	client, dialErr := ipc.Dial(dialCtx, address, token)
 	if dialErr != nil {
 		var protocolErr *protocol.Error
 		if errors.As(dialErr, &protocolErr) {
@@ -273,6 +307,11 @@ func (a *app) connectDaemon() (*ipc.Client, *protocol.Error) {
 }
 
 func (a *app) daemonCall(ctx context.Context, method string, params map[string]any) (any, *protocol.Error) {
+	return a.daemonCallID(ctx, method, params, "")
+}
+
+func (a *app) daemonCallID(ctx context.Context, method string, params map[string]any,
+	requestID string) (any, *protocol.Error) {
 	client, failure := a.connectDaemon()
 	if failure != nil {
 		return nil, failure
@@ -284,16 +323,37 @@ func (a *app) daemonCall(ctx context.Context, method string, params map[string]a
 	if a.target != "" {
 		params["target"] = a.target
 	}
-	return client.Call(ctx, method, params)
+	if requestID != "" {
+		params["requestId"] = requestID
+	}
+	return client.CallWithID(ctx, method, params, requestID)
 }
 
 func (a *app) daemonOp(ctx context.Context, operation string, params map[string]any) (any, *protocol.Error) {
+	requestID := ""
+	if protocol.WriteOperation(operation) {
+		requestID = a.newRequestID()
+	}
+	return a.daemonCallOp(ctx, operation, params, requestID)
+}
+
+func (a *app) daemonCallOp(ctx context.Context, operation string, params map[string]any,
+	requestID string) (any, *protocol.Error) {
 	client, failure := a.connectDaemon()
 	if failure != nil {
 		return nil, failure
 	}
 	defer client.Close()
-	return client.Call(ctx, operation, a.withTarget(params))
+	if params == nil {
+		params = map[string]any{}
+	}
+	if a.target != "" {
+		params["target"] = a.target
+	}
+	if requestID != "" {
+		params["requestId"] = requestID
+	}
+	return client.CallWithID(ctx, operation, params, requestID)
 }
 
 func (a *app) cmdVersion(args []string) (any, *protocol.Error) {

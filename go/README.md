@@ -126,16 +126,40 @@ credential/instance/run scope does not match, the entry stays visible as
 succeeded. If the ledger cannot be persisted, the daemon refuses to send the
 write rather than losing recovery data. A request that timed out before the
 server claimed it is cancelled and safe to retry; one that was already running
-keeps its ledger entry until the server reports the final state.
+keeps its ledger entry until the server reports the final state. A socket write
+that failed after the send attempt began is classified result-unknown (the
+partial frame may have been delivered) and also keeps its ledger entry; only a
+request the transport knows was never sent is marked retryable and removed.
+The writer slot only serializes framing/flushing, so a slow reply never blocks
+other requests.
 
-Event cursors are stored per target together with the `(instanceId, runId)`
-they belong to and are only offered back to the server with that run id, so a
-reconnected daemon can never present a previous run's high-water mark to a
-restarted game. `mc-agent events` returns the oldest events after `since`, so
-`next` (the highest delivered sequence) is a usable continuation, and reports
-`truncated: true` when the caller must ask again; `dropped` is reserved for
-buffer eviction. A target whose reader cannot drain its socket is closed so the
-next reconnect produces a machine-readable replay/gap report.
+Event cursors are a `(streamId, seq)` pair. The daemon's local sequence
+resets when the daemon restarts, so `mc-agent events --stream-id <id> --since
+<seq>` reports `reset: true` with the new `streamId` when the cursor belongs to
+another run, instead of silently returning nothing; persist both values. The
+same stream binding exists on the remote transport (bound to the game
+`instanceId`/`runId`). `mc-agent events` returns the oldest events after
+`since`, so `next` (the highest delivered sequence) is a usable continuation,
+and reports `truncated: true` when the caller must ask again; `dropped` is
+reserved for buffer eviction of events the caller actually asked for (an
+evicted unrelated category/target is not a loss for a filtered cursor) and is
+also reported as a machine-readable gap marker by `--follow`. `--follow`
+subscribes before replaying, pages the whole buffer, then switches to live
+delivery with sequence de-duplication, keeping `--category` and `--target`
+filters and emitting `{"type":"stream", "event":"gap"}` when events were lost.
+The bounded client queue is also observed after the handoff: an overflow emits
+a gap marker and replays from the last delivered sequence (so recoverable
+events arrive exactly once), or surfaces the daemon's `dropped` gap when the
+ring has already expired them. A target whose reader cannot drain its socket is
+closed so the next reconnect produces a machine-readable replay/gap report.
+
+Write calls get a stable end-to-end request id (`cli-<nonce>-<n>`, or an
+explicit `mc-agent call --request-id <id>`) before anything is sent. If the
+local IPC reply is lost, the CLI reports `resultUnknown: true` with that id
+and a `hint` to resolve it with `mc-agent request-status`, instead of
+pretending the write never happened; the id is the same one persisted in the
+daemon ledger and sent to the mod, so crash reconciliation refers to exactly
+that write.
 
 ## Webhook forwarding
 

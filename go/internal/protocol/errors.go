@@ -36,6 +36,7 @@ type Error struct {
 	RequestID     string          `json:"requestId,omitempty"`
 	Operation     string          `json:"operation,omitempty"`
 	Target        string          `json:"target,omitempty"`
+	Hint          string          `json:"hint,omitempty"`
 	Details       json.RawMessage `json:"details,omitempty"`
 }
 

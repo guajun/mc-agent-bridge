@@ -222,12 +222,17 @@ func (s *Server) acceptLoop() {
 }
 
 func (s *Server) serve(conn net.Conn) {
+	// Snapshot the mutable option fields under the lock: SetRunID can be
+	// called concurrently with an accepted connection.
+	s.mu.Lock()
+	options := s.options
+	s.mu.Unlock()
 	client := &connection{
 		conn:   conn,
 		reader: bufio.NewReader(conn),
 		writer: bufio.NewWriter(conn),
 		server: s,
-		runID:  s.options.RunID,
+		runID:  options.RunID,
 	}
 	defer conn.Close()
 
@@ -248,13 +253,13 @@ func (s *Server) serve(conn net.Conn) {
 		client.flush()
 		return
 	}
-	if s.options.Token != "" && hello.Token != s.options.Token {
+	if options.Token != "" && hello.Token != options.Token {
 		client.writeFrame(map[string]any{"type": "error", "code": "unauthorized",
 			"message": "the access credential was rejected"})
 		client.flush()
 		return
 	}
-	if s.options.SilentHello {
+	if options.SilentHello {
 		// Read until the peer gives up; never send a welcome.
 		_, _ = client.reader.ReadByte()
 		return
@@ -265,7 +270,7 @@ func (s *Server) serve(conn net.Conn) {
 	// not usable: the client gets a fresh view and an explicit loss report.
 	lost := false
 	effectiveLastSeq := hello.LastSeq
-	if hello.RunID != "" && hello.RunID != s.options.RunID {
+	if hello.RunID != "" && hello.RunID != options.RunID {
 		effectiveLastSeq = 0
 		lost = true
 	}
@@ -295,14 +300,14 @@ func (s *Server) serve(conn net.Conn) {
 		"mod":                "mc-agent-interface",
 		"modVersion":         "0.8.0-fake",
 		"minecraft":          "26.2",
-		"instanceId":         s.options.InstanceID,
-		"runId":              s.options.RunID,
+		"instanceId":         options.InstanceID,
+		"runId":              options.RunID,
 		"runStartedAtMillis": time.Now().UnixMilli(),
 		"sessionId":          fmt.Sprintf("sess_fake_%d", time.Now().UnixNano()),
 		"transport":          "fake-tls",
 		"serverTimeMillis":   time.Now().UnixMilli(),
-		"permissions":        s.options.Permissions,
-		"capabilities":       s.options.Capabilities,
+		"permissions":        options.Permissions,
+		"capabilities":       options.Capabilities,
 		"replay": map[string]any{
 			"requestedSince": hello.LastSeq,
 			"from":           effectiveLastSeq + 1,
@@ -325,7 +330,7 @@ func (s *Server) serve(conn net.Conn) {
 		s.removeConnection(client)
 		return
 	}
-	if s.options.StallRead {
+	if options.StallRead {
 		// Do not read further: the peer's write buffer fills and its write
 		// deadline decides how long that may take.
 		time.Sleep(30 * time.Second)
@@ -348,7 +353,7 @@ func (s *Server) serve(conn net.Conn) {
 		switch frameType {
 		case "request":
 			s.requests.Add(1)
-			go s.handleRequest(client, frame)
+			go s.handleRequest(client, frame, options)
 		case "ping":
 			id, _ := frame["id"].(string)
 			client.writeReply(map[string]any{"pong": true})
@@ -369,7 +374,7 @@ func (s *Server) removeConnection(client *connection) {
 	s.mu.Unlock()
 }
 
-func (s *Server) handleRequest(client *connection, frame map[string]any) {
+func (s *Server) handleRequest(client *connection, frame map[string]any, options Options) {
 	id, _ := frame["id"].(string)
 	operation, _ := frame["op"].(string)
 	params, _ := frame["params"].(map[string]any)
@@ -395,7 +400,7 @@ func (s *Server) handleRequest(client *connection, frame map[string]any) {
 		return
 	}
 	if operation == "ping" {
-		client.writeResult(id, map[string]any{"pong": true, "runId": s.options.RunID})
+		client.writeResult(id, map[string]any{"pong": true, "runId": options.RunID})
 		return
 	}
 	if strings.HasPrefix(operation, "exclusive_") {
@@ -403,7 +408,7 @@ func (s *Server) handleRequest(client *connection, frame map[string]any) {
 		return
 	}
 
-	if handler, ok := s.options.Ops[operation]; ok {
+	if handler, ok := options.Ops[operation]; ok {
 		result, failure := handler(params)
 		if failure != nil {
 			client.writeError(id, failure)

@@ -146,9 +146,16 @@ func TestRemoteCloseWithFullEventChannelIsBounded(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Never consume remote.Events(): both queues fill up.
-	for index := 0; index < 3000; index++ {
-		fake.Push("mark", map[string]any{"text": "flood"})
+	// Never consume remote.Events(): both queues fill up. Push from another
+	// goroutine so a stalled socket cannot block the test before Close.
+	go func() {
+		for index := 0; index < 3000; index++ {
+			fake.Push("mark", map[string]any{"text": "flood"})
+		}
+	}()
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) && len(remote.Events()) < 1000 {
+		time.Sleep(20 * time.Millisecond)
 	}
 	done := make(chan struct{})
 	go func() {

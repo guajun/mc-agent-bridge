@@ -273,3 +273,233 @@ func TestDaemonStopIsBoundedWhileEventsFlood(t *testing.T) {
 		t.Fatalf("daemon stop took %s with a full event pipeline", elapsed)
 	}
 }
+
+// A cursor is bound to one daemon run: after a restart the old seq is ahead
+// of the new stream and must be reported as a reset, not as "no events".
+func TestEventsCursorResetAfterDaemonRestart(t *testing.T) {
+	home := t.TempDir()
+	fake, err := fakemod.Start(fakemod.Options{Token: fakeToken})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(fake.Close)
+	h1 := startHarnessHome(t, home, fake, fakeToken, nil)
+	h1.waitForTargetConnected()
+	for index := 0; index < 5; index++ {
+		h1.fake.Push("mark", map[string]any{"text": fmt.Sprintf("before-%d", index)})
+	}
+	var first map[string]any
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		result, failure := h1.call(context.Background(), "events", map[string]any{"since": 0, "limit": 100})
+		if failure == nil {
+			first, _ = result.(map[string]any)
+			if len(first["events"].([]any)) >= 5 {
+				break
+			}
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if first == nil {
+		t.Fatal("no initial events")
+	}
+	oldStream, _ := first["streamId"].(string)
+	oldNext, _ := numberToInt64(first["next"])
+	h1.cancel()
+	if err := h1.stop(); err != nil {
+		t.Fatalf("stop daemon: %v", err)
+	}
+
+	h2 := startHarnessHome(t, home, fake, fakeToken, nil)
+	h2.waitForTargetConnected()
+	stale, failure := h2.call(context.Background(), "events",
+		map[string]any{"since": oldNext, "streamId": oldStream, "limit": 100})
+	if failure != nil {
+		t.Fatal(failure)
+	}
+	staleObject, _ := stale.(map[string]any)
+	if staleObject["reset"] != true {
+		t.Fatalf("a stale cursor must report reset: %v", staleObject)
+	}
+	if stream, _ := staleObject["streamId"].(string); stream == oldStream {
+		t.Fatalf("a restarted daemon must have a new stream id")
+	}
+	fresh, failure := h2.call(context.Background(), "events", map[string]any{"since": 0, "limit": 100})
+	if failure != nil {
+		t.Fatal(failure)
+	}
+	freshObject, _ := fresh.(map[string]any)
+	if len(freshObject["events"].([]any)) == 0 {
+		t.Fatalf("the new stream must return its buffer: %v", freshObject)
+	}
+}
+
+// The CLI follow contract: subscribe first, page the whole replay, then switch
+// to live with seq de-duplication and category filtering.
+func TestFollowHandoffAcrossPagesAndCategories(t *testing.T) {
+	h := startHarness(t, nil, nil)
+	h.waitForTargetConnected()
+	ctx := context.Background()
+	client := h.client()
+	defer client.Close()
+	if _, failure := client.Call(ctx, "subscribe", map[string]any{"events": []string{"mark"}}); failure != nil {
+		t.Fatal(failure)
+	}
+	for index := 0; index < 120; index++ {
+		h.fake.Push("mark", map[string]any{"text": fmt.Sprintf("m-%d", index)})
+	}
+	// One extra event published between replay pages proves the hand-off does
+	// not lose events that arrive after the first page.
+	pushedMidway := false
+	var replaySeqs []int64
+	since := int64(0)
+	for pages := 0; pages < 20; pages++ {
+		result, failure := client.Call(ctx, "events", map[string]any{
+			"since": since, "limit": 50, "category": "mark"})
+		if failure != nil {
+			t.Fatal(failure)
+		}
+		object, _ := result.(map[string]any)
+		events, _ := object["events"].([]any)
+		for _, entry := range events {
+			replaySeqs = append(replaySeqs, lookupSeq(entry))
+		}
+		if next, ok := numberToInt64(object["next"]); ok {
+			since = next
+		}
+		if !pushedMidway {
+			pushedMidway = true
+			h.fake.Push("mark", map[string]any{"text": "mid-handoff"})
+			h.fake.Push("game", map[string]any{"text": "must-not-arrive"})
+		}
+		if object["truncated"] != true {
+			break
+		}
+	}
+	for index := 1; index < len(replaySeqs); index++ {
+		if replaySeqs[index] <= replaySeqs[index-1] {
+			t.Fatalf("replay seqs are not increasing: %v", replaySeqs)
+		}
+	}
+	// The remaining marks arrive live after the replay pages; the hand-off
+	// must deliver each exactly once (replay overlap de-duplicated by seq) and
+	// must never deliver the game event to a mark-only subscription.
+	seen := map[int64]bool{}
+	for _, sequence := range replaySeqs {
+		seen[sequence] = true
+	}
+	last := since
+	const expectedMarks = 121 // 120 + mid-handoff
+	deadline := time.After(10 * time.Second)
+	for len(seen) < expectedMarks {
+		select {
+		case event, ok := <-client.Events():
+			if !ok {
+				t.Fatal("the IPC connection closed during the hand-off")
+			}
+			if category, _ := event.Data["category"].(string); category != "mark" {
+				t.Fatalf("a non-mark event reached a mark-only subscription: %v", event.Data)
+			}
+			sequence := lookupSeq(event.Data)
+			if sequence <= last {
+				continue // de-duplicated replay overlap
+			}
+			if seen[sequence] {
+				t.Fatalf("event seq %d was delivered twice", sequence)
+			}
+			seen[sequence] = true
+			last = sequence
+		case <-deadline:
+			t.Fatalf("hand-off lost events: got %d of %d", len(seen), expectedMarks)
+		}
+	}
+}
+
+func lookupSeq(value any) int64 {
+	object, _ := value.(map[string]any)
+	sequence, _ := numberToInt64(object["seq"])
+	return sequence
+}
+
+func numberToInt64(value any) (int64, bool) {
+	switch typed := value.(type) {
+	case float64:
+		return int64(typed), true
+	case int64:
+		return typed, true
+	case int:
+		return int64(typed), true
+	}
+	return 0, false
+}
+
+// Reusing a caller-provided request id must never overwrite or clear an
+// unreconciled write; the retry is routed to status instead of being resent.
+func TestRepeatedRequestIdPreservesUnknownLedger(t *testing.T) {
+	release := make(chan struct{})
+	fake, err := fakemod.Start(fakemod.Options{Token: fakeToken, Ops: map[string]fakemod.OpFunc{
+		"command": func(params map[string]any) (any, *protocol.Error) {
+			<-release
+			return map[string]any{"type": "cmd_ack", "detail": params["command"], "output": []any{}}, nil
+		},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(fake.Close)
+	h := startHarnessWith(t, fake, fakeToken, nil)
+	h.waitForTargetConnected()
+	ctx := context.Background()
+	envelope := func(command, requestID string) map[string]any {
+		return map[string]any{"target": "fake", "op": "command", "requestId": requestID,
+			"params": map[string]any{"command": command}, "timeoutSeconds": 0.3}
+	}
+	_, failure := h.call(ctx, "call", envelope("say first", "dup-request-1"))
+	if failure == nil || !failure.ResultUnknown || failure.RequestID != "dup-request-1" {
+		t.Fatalf("the first write must be result-unknown: %+v", failure)
+	}
+	requestsAfterFirst := fake.Requests()
+	list, callFailure := h.call(ctx, "requests", nil)
+	if callFailure != nil || !strings.Contains(fmt.Sprint(list), "dup-request-1") {
+		t.Fatalf("the ledger did not record the unknown write: %v %v", list, callFailure)
+	}
+	// Same id, different payload: rejected, not overwritten and not sent.
+	_, second := h.call(ctx, "call", envelope("say second", "dup-request-1"))
+	if second == nil || second.Code != protocol.CodeResultUnknown || second.RequestID != "dup-request-1" {
+		t.Fatalf("a repeated id must be routed to status, not resent: %+v", second)
+	}
+	if fake.Requests() != requestsAfterFirst {
+		t.Fatalf("the repeated id was sent to the game (%d -> %d)", requestsAfterFirst, fake.Requests())
+	}
+	close(release)
+	time.Sleep(300 * time.Millisecond)
+	_, third := h.call(ctx, "call", envelope("say third", "dup-request-1"))
+	if third == nil || third.Code != protocol.CodeResultUnknown {
+		t.Fatalf("the unknown record must survive the original completion: %+v", third)
+	}
+	if fake.Requests() != requestsAfterFirst {
+		t.Fatalf("the third call was sent despite the unknown record (%d -> %d)",
+			requestsAfterFirst, fake.Requests())
+	}
+
+	// Crash and recover: the reconciler resolves the entry through
+	// request_status, after which the id can be used for a new write.
+	h.cancel()
+	if err := h.stop(); err != nil {
+		t.Fatalf("stop daemon: %v", err)
+	}
+	h2 := startHarnessHome(t, h.home, fake, fakeToken, nil)
+	h2.waitForTargetConnected()
+	deadline := time.Now().Add(15 * time.Second)
+	for time.Now().Before(deadline) {
+		remaining, failure := h2.call(ctx, "requests", nil)
+		if failure == nil && !strings.Contains(fmt.Sprint(remaining), "dup-request-1") {
+			break
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	final, failure := h2.call(ctx, "call", envelope("say after", "dup-request-1"))
+	if failure != nil || final == nil {
+		t.Fatalf("the id must be reusable after reconciliation: %+v %v", final, failure)
+	}
+}
