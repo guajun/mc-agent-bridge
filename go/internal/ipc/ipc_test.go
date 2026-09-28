@@ -1,7 +1,10 @@
 package ipc_test
 
 import (
+	"bufio"
 	"context"
+	"encoding/json"
+	"net"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -156,4 +159,115 @@ func TestServerStopCancelsBlockedHandlers(t *testing.T) {
 		}
 	}
 	client.Close()
+}
+
+// A real socket EOF after the daemon read a write must keep the end-to-end
+// classification: possibly dispatched, with the request id, not a generic
+// daemon_not_running error.
+func TestEOFAfterDispatchKeepsPossiblyDispatched(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	go func() {
+		conn, err := listener.Accept()
+		if err != nil {
+			return
+		}
+		reader := bufio.NewReader(conn)
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			conn.Close()
+			return
+		}
+		var request ipc.Request
+		if json.Unmarshal([]byte(line), &request) == nil {
+			response, _ := json.Marshal(map[string]any{"type": "response", "id": request.ID,
+				"ok": true, "result": map[string]any{"pong": true}})
+			conn.Write(append(response, '\n'))
+		}
+		// Read the next request (the write) and close without replying.
+		if _, err := reader.ReadString('\n'); err == nil {
+			conn.Close()
+			return
+		}
+		conn.Close()
+	}()
+
+	client, err := ipc.Dial(context.Background(), listener.Addr().String(), "token")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, failure := client.CallWithID(context.Background(), "call",
+		map[string]any{"op": "command"}, "eof-request-1")
+	if failure == nil {
+		t.Fatal("an EOF before the reply must fail")
+	}
+	if !failure.ResultUnknown || failure.Retryable {
+		t.Fatalf("EOF after dispatch must be possibly-dispatched: %+v", failure)
+	}
+	if failure.RequestID != "eof-request-1" {
+		t.Fatalf("EOF lost the end-to-end id: %+v", failure)
+	}
+	// The connection is poisoned: the next call fails fast, not silently.
+	_, followUp := client.CallWithID(context.Background(), "call",
+		map[string]any{"op": "command"}, "eof-request-2")
+	if followUp == nil {
+		t.Fatal("a poisoned IPC connection accepted another call")
+	}
+	client.Close()
+}
+
+// More live events than the client queue capacity must not block responses.
+func TestEventOverflowDoesNotBlockResponses(t *testing.T) {
+	server, err := ipc.Start("127.0.0.1:0", "token",
+		func(ctx context.Context, method string, params map[string]any) (any, *protocol.Error) {
+			if method == "events" {
+				time.Sleep(300 * time.Millisecond)
+				return map[string]any{"events": []any{}, "next": 0,
+					"streamId": "test-stream", "truncated": false, "dropped": false}, nil
+			}
+			return map[string]any{"ok": true}, nil
+		})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Stop()
+	client, err := ipc.Dial(context.Background(), server.Address(), "token")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	if _, failure := client.Call(context.Background(), "subscribe", map[string]any{"events": []string{"*"}}); failure != nil {
+		t.Fatal(failure)
+	}
+	go func() {
+		// Pace the flood so the server's outbound queue drains: the point is
+		// the *client* queue overflowing while a response is pending, not the
+		// server dropping a slow client.
+		for index := 0; index < 600; index++ {
+			server.Broadcast("mark", map[string]any{"seq": index})
+			if index%25 == 24 {
+				time.Sleep(2 * time.Millisecond)
+			}
+		}
+	}()
+	time.Sleep(100 * time.Millisecond)
+	done := make(chan *protocol.Error, 1)
+	go func() {
+		_, failure := client.Call(context.Background(), "events", nil)
+		done <- failure
+	}()
+	select {
+	case failure := <-done:
+		if failure != nil {
+			t.Fatalf("the events response was blocked by the live queue: %v", failure)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the events response was blocked behind a full event queue")
+	}
+	if client.Dropped() == 0 {
+		t.Fatal("overflow was not counted; the queue policy silently lost events")
+	}
 }

@@ -291,7 +291,11 @@ func (a *app) connectDaemon() (*ipc.Client, *protocol.Error) {
 		}
 		return nil, protocol.NewError(protocol.CodeInternal, err.Error())
 	}
-	client, dialErr := ipc.Dial(context.Background(), address, token)
+	// Bound the connect+ping handshake: a socket that accepts but never
+	// answers ping must not hang the CLI forever.
+	dialCtx, cancelDial := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancelDial()
+	client, dialErr := ipc.Dial(dialCtx, address, token)
 	if dialErr != nil {
 		var protocolErr *protocol.Error
 		if errors.As(dialErr, &protocolErr) {

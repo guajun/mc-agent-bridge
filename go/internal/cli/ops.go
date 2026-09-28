@@ -183,43 +183,64 @@ func (a *app) cmdEvents(ctx context.Context, args []string) (any, *protocol.Erro
 	cursor := *since
 	expectedStream := *streamID
 	var lastSeq int64
+	// Replay until a pass produces no overflow: live events can be dropped by
+	// the bounded CLI queue while a replay response is in flight, so each pass
+	// re-pages from the cursor to recover them from the daemon ring. If the
+	// ring no longer holds them the daemon's own dropped flag reports the gap.
 	for {
-		result, failure := client.Call(ctx, "events", pageParams(cursor, expectedStream))
-		if failure != nil {
-			return nil, failure
-		}
-		object, _ := result.(map[string]any)
-		stream, _ := object["streamId"].(string)
-		if expectedStream == "" {
-			expectedStream = stream
-		}
-		if object["reset"] == true || (expectedStream != "" && stream != expectedStream) {
-			a.print(gapMarker(stream, 0, lastSeq, true, true))
-			expectedStream = stream
-			cursor = 0
-			lastSeq = 0
-			continue
-		}
-		if object["dropped"] == true {
-			a.print(gapMarker(stream, 0, lastSeq, true, false))
-		}
-		if events, ok := object["events"].([]any); ok {
-			for _, entry := range events {
-				a.print(entry)
-				if seq, ok := eventSeq(entry); ok && seq > lastSeq {
-					lastSeq = seq
+		for {
+			result, failure := client.Call(ctx, "events", pageParams(cursor, expectedStream))
+			if failure != nil {
+				return nil, failure
+			}
+			object, _ := result.(map[string]any)
+			stream, _ := object["streamId"].(string)
+			if expectedStream == "" {
+				expectedStream = stream
+			}
+			if object["reset"] == true || (expectedStream != "" && stream != expectedStream) {
+				a.print(gapMarker(expectedStream, 0, lastSeq, true, true))
+				expectedStream = stream
+				cursor = 0
+				lastSeq = 0
+				continue
+			}
+			if object["dropped"] == true {
+				a.print(gapMarker(stream, 0, lastSeq, true, false))
+			}
+			if events, ok := object["events"].([]any); ok {
+				for _, entry := range events {
+					a.print(entry)
+					if seq, ok := eventSeq(entry); ok && seq > lastSeq {
+						lastSeq = seq
+					}
 				}
 			}
+			if next, ok := numberAsInt64(object["next"]); ok {
+				cursor = next
+			}
+			if object["truncated"] != true {
+				break
+			}
 		}
-		if next, ok := numberAsInt64(object["next"]); ok {
-			cursor = next
-		}
-		if object["truncated"] != true {
+		overflow := client.TakeDropped()
+		if overflow == 0 {
 			break
 		}
+		// The dropped live events were ingested by the daemon (they are in its
+		// ring unless evicted, which its own dropped flag reports), so another
+		// replay pass recovers them. Record the overflow so a consumer can see
+		// why the replay is longer than the page size.
+		a.print(map[string]any{"type": "stream", "event": "gap", "data": map[string]any{
+			"streamId": expectedStream, "from": 0, "to": lastSeq,
+			"dropped": true, "reset": false, "clientDropped": overflow}})
 	}
 	a.print(map[string]any{"type": "stream", "event": "following", "data": map[string]any{
 		"streamId": expectedStream, "lastSeq": lastSeq}})
+	// Live delivery. A sequence jump is NOT evidence of loss when a category
+	// or target filter is active: unrelated events consume sequence numbers
+	// legitimately. Loss is only reported from explicit daemon/client metadata
+	// (reset/dropped/clientDropped) above.
 	for {
 		select {
 		case event, ok := <-client.Events():
@@ -234,9 +255,6 @@ func (a *app) cmdEvents(ctx context.Context, args []string) (any, *protocol.Erro
 			seq, hasSeq := eventSeq(event.Data)
 			if hasSeq && seq <= lastSeq {
 				continue // already delivered by the replay
-			}
-			if hasSeq && lastSeq > 0 && seq > lastSeq+1 {
-				a.print(gapMarker(expectedStream, lastSeq+1, seq-1, true, false))
 			}
 			a.print(event.Data)
 			if hasSeq {

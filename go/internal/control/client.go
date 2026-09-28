@@ -56,7 +56,8 @@ type Config struct {
 // routed by request id; events are delivered on Events().
 type Client struct {
 	config Config
-	conn   net.Conn
+	conn   net.Conn // the TLS connection
+	raw    net.Conn // the socket under TLS; closed directly to avoid a blocking close_notify
 	reader *bufio.Reader
 	writer *bufio.Writer
 
@@ -79,6 +80,7 @@ type Client struct {
 	done      chan struct{}
 	stop      chan struct{}
 	closeOnce sync.Once
+	stopOnce  sync.Once
 	errMu     sync.Mutex
 	err       error
 
@@ -130,6 +132,7 @@ func Dial(ctx context.Context, config Config) (*Client, *Welcome, error) {
 	client := &Client{
 		config:     config,
 		conn:       conn,
+		raw:        rawConn,
 		reader:     bufio.NewReaderSize(conn, 64*1024),
 		writer:     bufio.NewWriterSize(conn, 64*1024),
 		nonce:      newNonce(),
@@ -366,10 +369,12 @@ func (c *Client) CallWithID(ctx context.Context, id string, operation string, pa
 	if err != nil {
 		c.forget(id)
 		// A partial frame may be on the wire; the connection is poisoned for
-		// this and every later request, so terminate it instead of reusing a
-		// buffered writer that may hold half a frame. Delivery is not proven,
-		// so a non-idempotent write stays result-unknown.
-		go c.Close()
+		// this and every later request. Mark it synchronously *before* the
+		// writer slot is released so another sender cannot acquire the slot and
+		// flush the buffered remains. Delivery is not proven, so a
+		// non-idempotent write stays result-unknown.
+		c.poison()
+		releaseWrite()
 		return nil, writeAttemptFailed(operation, id, write, err)
 	}
 
@@ -463,17 +468,32 @@ func (c *Client) forget(id string) {
 	c.pendingMu.Unlock()
 }
 
+// signalStop closes stop exactly once; writers and the read loop use it as the
+// transport-failure signal.
+func (c *Client) signalStop() {
+	c.stopOnce.Do(func() { close(c.stop) })
+}
+
+// poison marks the connection failed and closes the raw socket without waiting
+// for the read loop. The raw socket is closed instead of the TLS conn because
+// tls.Conn.Close() may block for five seconds trying to write a close_notify to
+// a peer that has stopped reading, and a poisoned connection must not delay the
+// writer slot or the caller.
+func (c *Client) poison() {
+	c.signalStop()
+	socket := c.raw
+	if socket == nil {
+		socket = c.conn
+	}
+	_ = socket.SetDeadline(time.Now())
+	socket.Close()
+}
+
 // Close terminates the connection and drains the read loop. It is safe to
 // call with a full event channel and with no consumer: closing stop makes the
-// read loop abandon a blocked event delivery instead of deadlocking. The
-// deadline refuses to wait for a TLS close_notify on a socket whose peer has
-// stopped reading.
+// read loop abandon a blocked event delivery instead of deadlocking.
 func (c *Client) Close() error {
-	c.closeOnce.Do(func() {
-		_ = c.conn.SetDeadline(time.Now())
-		close(c.stop)
-		c.conn.Close()
-	})
+	c.closeOnce.Do(c.poison)
 	<-c.done
 	return nil
 }
@@ -550,7 +570,12 @@ func (c *Client) finish(cause error) {
 		c.err = cause
 	}
 	c.errMu.Unlock()
-	c.conn.Close()
+	if c.raw != nil {
+		c.raw.Close()
+	} else {
+		c.conn.Close()
+	}
+	c.signalStop()
 	c.pendingMu.Lock()
 	for id, channel := range c.pending {
 		delete(c.pending, id)

@@ -16,6 +16,7 @@ import (
 	"net"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/guajun/mc-agent-bridge/internal/protocol"
@@ -359,6 +360,8 @@ type Client struct {
 	writeToken chan struct{}
 	ioTimeout  time.Duration
 	closeOnce  sync.Once
+	stopOnce   sync.Once
+	dropped    atomic.Int64
 	errMu      sync.Mutex
 	err        error
 }
@@ -480,9 +483,12 @@ func (c *Client) CallWithID(ctx context.Context, method string, params map[strin
 	_ = c.conn.SetWriteDeadline(time.Time{})
 	release()
 	if writeErr != nil {
-		// A partial request line may be on the wire; this connection is
-		// poisoned and the caller gets a possibly-dispatched classification.
-		go c.Close()
+		// A partial request line may be on the wire; poison synchronously
+		// before freeing the writer slot so another sender cannot acquire it
+		// and flush buffered remains. The caller gets a possibly-dispatched
+		// classification.
+		c.poison()
+		release()
 		return nil, possiblyDispatched(method, requestID, writeErr)
 	}
 
@@ -535,21 +541,39 @@ func (c *Client) forget(id string) {
 	c.mu.Unlock()
 }
 
+// signalStop closes stop exactly once; it is the transport-failure signal for
+// both the read loop and pending calls.
+func (c *Client) signalStop() {
+	c.stopOnce.Do(func() { close(c.stop) })
+}
+
+// poison marks the connection failed and closes it without waiting.
+func (c *Client) poison() {
+	c.signalStop()
+	_ = c.conn.SetDeadline(time.Now())
+	c.conn.Close()
+}
+
 // Close ends the connection. It is safe with a full event channel and no
 // consumer: the independent stop closes first, so the read loop can abandon a
 // blocked delivery instead of deadlocking Close.
 func (c *Client) Close() {
-	c.closeOnce.Do(func() {
-		close(c.stop)
-		_ = c.conn.SetDeadline(time.Now())
-		c.conn.Close()
-	})
+	c.closeOnce.Do(c.poison)
 	<-c.done
 }
+
+// Dropped is the number of live events dropped because the consumer could not
+// keep up. The caller reports it as an explicit gap and re-pages the daemon
+// ring to recover them.
+func (c *Client) Dropped() int64 { return c.dropped.Load() }
+
+// TakeDropped returns and resets the overflow counter.
+func (c *Client) TakeDropped() int64 { return c.dropped.Swap(0) }
 
 func (c *Client) readLoop() {
 	defer close(c.done)
 	defer close(c.events)
+	defer c.signalStop()
 	for {
 		line, err := readLine(c.reader, MaxLineBytes)
 		if err != nil {
@@ -582,10 +606,13 @@ func (c *Client) readLoop() {
 				channel <- response{OK: envelope.OK, Result: envelope.Result, Error: envelope.Error}
 			}
 		case "event":
+			// Never block the read loop behind a full consumer queue: a
+			// blocked loop would also block response routing. Overflow is
+			// counted and the caller re-pages the daemon ring / reports a gap.
 			select {
 			case c.events <- Event{Type: "event", Event: envelope.Event, Data: envelope.Data}:
-			case <-c.stop:
-				return
+			default:
+				c.dropped.Add(1)
 			}
 		}
 	}
@@ -598,11 +625,8 @@ func (c *Client) finish(cause error) {
 	}
 	c.errMu.Unlock()
 	c.conn.Close()
-	c.mu.Lock()
-	for id, channel := range c.pending {
-		delete(c.pending, id)
-		channel <- response{OK: false, Error: protocol.NewError(protocol.CodeDaemonNotRunning,
-			"the daemon connection closed")}
-	}
-	c.mu.Unlock()
+	// Do not answer pending calls with a generic error: the transport failure
+	// must keep the end-to-end classification (possibly dispatched with a
+	// request id) that CallWithID derives from the stop signal.
+	c.signalStop()
 }

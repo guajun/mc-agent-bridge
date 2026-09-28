@@ -9,6 +9,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -618,10 +619,26 @@ func (d *Daemon) callWithID(ctx context.Context, targetName, operation string, p
 		return nil, protocol.NewError(protocol.CodeInternal,
 			"the session cannot allocate a request id; refusing to send a non-idempotent write")
 	}
-	if err := d.unknown.Record(target.Name, operation, requestID,
-		state.InstanceID, state.RunID, credentialFingerprint(token)); err != nil {
+	existing, admitErr := d.unknown.Admit(target.Name, operation, requestID,
+		state.InstanceID, state.RunID, credentialFingerprint(token))
+	if admitErr != nil {
 		return nil, protocol.NewError(protocol.CodeInternal,
-			"refusing to send a non-idempotent write: "+err.Error())
+			"refusing to send a non-idempotent write: "+admitErr.Error())
+	}
+	if existing != nil {
+		details, _ := json.Marshal(existing)
+		return nil, &protocol.Error{
+			Code: protocol.CodeResultUnknown,
+			Message: "request id " + requestID + " already has an unreconciled write for target " +
+				target.Name + " (state " + existing.State + "); resolve it with request_status " +
+				"instead of reusing the id",
+			Retryable:     false,
+			ResultUnknown: true,
+			RequestID:     requestID,
+			Operation:     operation,
+			Target:        target.Name,
+			Details:       details,
+		}
 	}
 	result, failure := adapter.CallID(ctx, requestID, operation, params)
 	if failure == nil {
