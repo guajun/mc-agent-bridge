@@ -35,7 +35,8 @@ release assets.
 
 Everything else - Windows arm64, Linux arm64, Linux musl/Alpine, macOS amd64,
 other OS/CPU pairs - is **not tested and not claimed**. The installers refuse
-those platforms explicitly rather than installing an incompatible binary.
+those platforms explicitly (the Linux installer detects musl and refuses it)
+rather than installing an incompatible binary.
 Building the Go binary for another platform is possible from source, but that
 is a source build, not a supported release.
 

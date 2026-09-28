@@ -80,7 +80,7 @@ sh install.sh --version 0.5.0 --skill-dir /path/to/skills
 | `codex` | `$CODEX_HOME/skills` or `~/.codex/skills` |
 | `claude-code` (`claude`) | `$CLAUDE_CONFIG_DIR/skills` or `~/.claude/skills` |
 | `universal` | `$XDG_CONFIG_HOME/agents/skills` or `~/.config/agents/skills` |
-| `hermes` | `$HERMES_HOME/skills` or `~/.hermes/skills` (Windows: `%LOCALAPPDATA%\hermes\skills`) |
+| `hermes` | `$HERMES_HOME/skills` (the installer requires `HERMES_HOME`; no default directory is guessed) |
 
 The installer refuses to replace an existing `minecraft-toolkit/` directory
 by default. It fails with the path and asks for `--update-skill`

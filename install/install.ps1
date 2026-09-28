@@ -1,9 +1,9 @@
 # mc-agent release installer for Windows amd64.
 #
 # Installs the Go CLI/daemon binary from a versioned GitHub release, verifies
-# the published checksum, and can install the matching Toolkit Skill into an
-# explicit harness or custom directory. It never installs Python, Go or MCP,
-# and it never silently overwrites user content.
+# the published checksum and the embedded version, and can install the matching
+# Toolkit Skill into an explicit harness or custom directory. It never installs
+# Python, Go or MCP, and it never silently overwrites user content.
 #
 #   iwr -useb https://raw.githubusercontent.com/guajun/mc-agent-bridge/v0.5.0/install/install.ps1 -OutFile install.ps1
 #   ./install.ps1 -Version 0.5.0 -SkillHarness codex
@@ -34,6 +34,9 @@ $Product = "mc-agent"
 $Repo = "guajun/mc-agent-bridge"
 $ProductVersion = "0.5.0"
 $AssetBinary = "mc-agent.exe"
+$ManifestName = "mc-agent.installed"
+$PreviousName = "mc-agent.previous.exe"
+$ManifestVersion = "2"
 
 function Fail([string]$Message) { Write-Error "error: $Message"; exit 1 }
 function Info([string]$Message) { Write-Host $Message -ForegroundColor DarkGray }
@@ -70,29 +73,117 @@ function Get-TreeHash([string]$Directory) {
     finally { $sha.Dispose() }
 }
 
+function Get-CanonicalPath([string]$Path) {
+    $full = [System.IO.Path]::GetFullPath($Path)
+    if (Test-Path -LiteralPath $full) { return (Resolve-Path -LiteralPath $full).ProviderPath }
+    $parent = Split-Path -Parent $full
+    $leaf = Split-Path -Leaf $full
+    if (-not $parent -or $parent -eq $full) { return $full }
+    return (Join-Path (Get-CanonicalPath $parent) $leaf)
+}
+
+function Assert-SafeRemoveTarget([string]$Path) {
+    if (-not $Path) { Fail "refusing to remove an empty path" }
+    if (-not (Test-Path -LiteralPath $Path)) { return }
+    $item = Get-Item -LiteralPath $Path -Force
+    if ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) {
+        Fail "refusing to remove a reparse point: $Path"
+    }
+    $canonical = (Resolve-Path -LiteralPath $Path).ProviderPath.TrimEnd("\", "/")
+    $root = [System.IO.Path]::GetPathRoot($canonical).TrimEnd("\", "/")
+    if ($canonical -eq $root) { Fail "refusing to remove the filesystem root" }
+    $homeCanonical = (Resolve-Path -LiteralPath $env:USERPROFILE).ProviderPath.TrimEnd("\", "/")
+    if ($canonical -eq $homeCanonical) { Fail "refusing to remove the home directory" }
+    if ($homeCanonical.StartsWith($canonical + "\", [System.StringComparison]::OrdinalIgnoreCase)) {
+        Fail "refusing to remove an ancestor of the home directory"
+    }
+    if ($canonical -eq (Get-CanonicalPath $InstallDir)) {
+        Fail "refusing to remove the install directory"
+    }
+    Remove-Item -LiteralPath $Path -Recurse -Force
+}
+
 function Get-ManifestValue([string]$Path, [string]$Key) {
     if (-not (Test-Path -LiteralPath $Path)) { return "" }
-    $line = Get-Content -LiteralPath $Path | Where-Object { $_.StartsWith("$Key=") } | Select-Object -First 1
+    $line = Get-Content -LiteralPath $Path -Encoding UTF8 | Where-Object { $_.StartsWith("$Key=") } | Select-Object -First 1
     if ($null -eq $line) { return "" }
     return $line.Substring($Key.Length + 1)
 }
 
-function Write-Manifest([string]$InstalledVersion, [string]$BinaryHash, [string]$Source) {
-    $lines = @(
-        "product=$Product",
-        "version=$InstalledVersion",
-        "platform=$Platform",
-        "binary_sha256=$BinaryHash",
-        "installed_at=$([DateTime]::UtcNow.ToString("yyyy-MM-ddTHH:mm:ssZ"))",
-        "source=$Source"
-    )
-    if ($script:SkillTarget -and (Test-Path -LiteralPath $script:SkillTarget)) {
-        $lines += "skill.0.dir=$script:SkillTarget"
-        $lines += "skill.0.version=$script:SkillVersion"
-        $lines += "skill.0.commit=$script:SkillCommit"
-        $lines += "skill.0.tree_sha256=$(Get-TreeHash $script:SkillTarget)"
+function Get-ManifestSkillDirs([string]$Path) {
+    if (-not (Test-Path -LiteralPath $Path)) { return @() }
+    Get-Content -LiteralPath $Path -Encoding UTF8 | Where-Object { $_ -match '^skill\.\d+\.dir=' } | ForEach-Object {
+        $_.Substring($_.IndexOf("=") + 1)
     }
-    Set-Content -LiteralPath (Join-Path $InstallDir "$Product.installed") -Value $lines -Encoding ASCII
+}
+
+function Get-ManifestSkillTree([string]$Path, [string]$Directory) {
+    if (-not (Test-Path -LiteralPath $Path)) { return "" }
+    $current = ""
+    foreach ($line in (Get-Content -LiteralPath $Path -Encoding UTF8)) {
+        if ($line -match '^skill\.(\d+)\.dir=(.*)$') {
+            $current = if ($Matches[2] -eq $Directory) { "skill.$($Matches[1]).tree_sha256" } else { "" }
+            continue
+        }
+        if ($current -and $line.StartsWith("$current=")) {
+            return $line.Substring($current.Length + 1)
+        }
+    }
+    return ""
+}
+
+function Get-ManifestSkillLines([string]$Path, [string]$SkipTarget) {
+    $lines = New-Object System.Collections.Generic.List[string]
+    if (-not (Test-Path -LiteralPath $Path)) { return $lines }
+    $skip = $false
+    foreach ($line in (Get-Content -LiteralPath $Path -Encoding UTF8)) {
+        if ($line -match '^skill\.\d+\.dir=') {
+            $dir = $line.Substring($line.IndexOf("=") + 1)
+            $skip = ($SkipTarget -and $dir -eq $SkipTarget)
+        }
+        if ($line -match '^skill\.') {
+            if (-not $skip) { $lines.Add($line) }
+            continue
+        }
+    }
+    return $lines
+}
+
+function Get-MaxSkillIndex($Lines) {
+    $max = 0
+    foreach ($line in $Lines) {
+        if ($line -match '^skill\.(\d+)\.dir=') {
+            $index = [int]$Matches[1]
+            if ($index -gt $max) { $max = $index }
+        }
+    }
+    return $max
+}
+
+function Write-Utf8Lines([string]$Path, $Lines) {
+    $encoding = New-Object System.Text.UTF8Encoding($false)
+    [System.IO.File]::WriteAllLines($Path, [string[]]$Lines, $encoding)
+}
+
+function Write-Manifest([string]$InstalledVersion, [string]$BinaryHash, [string]$Source) {
+    $lines = New-Object System.Collections.Generic.List[string]
+    $lines.Add("manifest_version=$ManifestVersion")
+    $lines.Add("product=$Product")
+    $lines.Add("version=$InstalledVersion")
+    $lines.Add("platform=$Platform")
+    $lines.Add("binary_sha256=$BinaryHash")
+    $lines.Add("installed_at=$([DateTime]::UtcNow.ToString("yyyy-MM-ddTHH:mm:ssZ"))")
+    $lines.Add("source=$Source")
+    $oldSkillLines = Get-ManifestSkillLines $Manifest $script:SkillTarget
+    foreach ($line in $oldSkillLines) { $lines.Add($line) }
+    if ($script:SkillTarget) {
+        $index = (Get-MaxSkillIndex $oldSkillLines) + 1
+        $lines.Add("skill.$index.dir=$script:SkillTarget")
+        $lines.Add("skill.$index.version=$script:SkillVersion")
+        $lines.Add("skill.$index.commit=$script:SkillCommit")
+        $lines.Add("skill.$index.tree_sha256=$(Get-TreeHash $script:SkillTarget)")
+    }
+    Write-Utf8Lines $Manifest $lines
 }
 
 function Get-SkillRoot([string]$Harness) {
@@ -100,18 +191,34 @@ function Get-SkillRoot([string]$Harness) {
         "codex" { Join-Path $(if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $env:USERPROFILE ".codex" }) "skills" }
         { $_ -in "claude", "claude-code" } { Join-Path $(if ($env:CLAUDE_CONFIG_DIR) { $env:CLAUDE_CONFIG_DIR } else { Join-Path $env:USERPROFILE ".claude" }) "skills" }
         "universal" { Join-Path $(if ($env:XDG_CONFIG_HOME) { $env:XDG_CONFIG_HOME } else { Join-Path $env:USERPROFILE ".config" }) "agents\skills" }
-        "hermes" { Join-Path $(if ($env:HERMES_HOME) { $env:HERMES_HOME } else { Join-Path $env:LOCALAPPDATA "hermes" }) "skills" }
+        "hermes" {
+            if (-not $env:HERMES_HOME) {
+                Fail "the hermes harness has no verified default directory; set HERMES_HOME or pass -SkillDir DIR"
+            }
+            Join-Path $env:HERMES_HOME "skills"
+        }
         default { Fail "unknown harness '$Harness'; use -SkillDir DIR for a custom location" }
     }
 }
 
 function Get-StateDir {
-    if ($env:MC_AGENT_HOME) { return $env:MC_AGENT_HOME }
-    return Join-Path $env:AppData "mc-agent"
+    if ($env:MC_AGENT_HOME) { return (Get-CanonicalPath $env:MC_AGENT_HOME) }
+    return (Get-CanonicalPath (Join-Path $env:AppData "mc-agent"))
+}
+
+function Get-DefaultStateDir {
+    return (Get-CanonicalPath (Join-Path $env:AppData "mc-agent"))
+}
+
+function Test-ProductStateDir([string]$Directory) {
+    if ($Directory -eq (Get-DefaultStateDir)) { return $true }
+    foreach ($marker in @("daemon.json", "targets.json", "secrets.json", "daemon.log", "records.json", "unknown_writes.json")) {
+        if (Test-Path -LiteralPath (Join-Path $Directory $marker)) { return $true }
+    }
+    return $false
 }
 
 function Fetch-Asset([string]$Name, [string]$Destination) {
-    if ($DryRun) { Info "dry-run: would download $Name"; return }
     if ($FromDir) {
         $source = Join-Path $FromDir $Name
         if (-not (Test-Path -LiteralPath $source)) { Fail "missing staged asset: $source" }
@@ -123,13 +230,12 @@ function Fetch-Asset([string]$Name, [string]$Destination) {
 }
 
 function Assert-Checksum([string]$Path, [string]$Name) {
-    if ($DryRun) { return }
     $expected = ""
     $checksums = Join-Path $Work "checksums.txt"
     if (Test-Path -LiteralPath $checksums) {
         $expected = (Get-Content -LiteralPath $checksums | ForEach-Object {
                 $parts = $_ -split "\s+", 2
-                if ($parts.Count -eq 2 -and $parts[1].Trim() -eq $Name) { $parts[0] }
+                if ($parts.Count -eq 2 -and $parts[1].Trim().TrimStart("*") -eq $Name) { $parts[0] }
             } | Select-Object -First 1)
     }
     if (-not $expected -and $Sha256) { $expected = $Sha256.ToLowerInvariant() }
@@ -138,62 +244,91 @@ function Assert-Checksum([string]$Path, [string]$Name) {
     if ($actual -ne $expected) { Fail "checksum mismatch for $Name`: expected $expected, got $actual" }
 }
 
-# ----------------------------------------------------------------- uninstall
+function Assert-BinaryVersion([string]$Path, [string]$Want) {
+    $output = & $Path version
+    if ($LASTEXITCODE -ne 0) { Fail "cannot run the extracted binary: $output" }
+    if ($output -notmatch "^mc-agent $([regex]::Escape($Want)) ") {
+        Fail "archive does not contain version $Want`: $output"
+    }
+}
+
+# ------------------------------------------------------------------- plan
+
+$InstallDir = Get-CanonicalPath $InstallDir
+$Manifest = Join-Path $InstallDir $ManifestName
+$Binary = Join-Path $InstallDir $AssetBinary
+
+if ($SkillHarness -and $SkillDir) { Fail "use either -SkillHarness or -SkillDir, not both" }
+if ($NoSkill -and ($SkillHarness -or $SkillDir)) { Fail "use either -NoSkill or a skill target, not both" }
+if ($Uninstall -and ($Archive -or $FromDir -or $SkillHarness -or $SkillDir)) {
+    Fail "-Uninstall cannot be combined with install-only options"
+}
 
 $Work = $null
 $SkillTarget = ""
 $SkillVersion = ""
 $SkillCommit = ""
 
+if ($DryRun) {
+    Info "dry-run: platform $Platform, version $Version"
+    Info "dry-run: would install $Binary (from $BaseUrl/mc-agent-$Version-windows-amd64.zip or staged input)"
+    if ($SkillDir) { Info "dry-run: would install the pinned skill into $(Get-CanonicalPath $SkillDir)\minecraft-toolkit" }
+    elseif ($SkillHarness) { Info "dry-run: would install the pinned skill into $(Get-SkillRoot $SkillHarness)\minecraft-toolkit" }
+    Info "dry-run: would write $Manifest"
+    if ($AddToPath) { Info "dry-run: would add $InstallDir to the user PATH" }
+    exit 0
+}
+
+# ----------------------------------------------------------------- uninstall
+
 if ($Uninstall) {
-    $manifest = Join-Path $InstallDir "$Product.installed"
-    $binary = Join-Path $InstallDir $AssetBinary
-    if (-not (Test-Path -LiteralPath $binary)) { Fail "no $Product binary at $binary" }
-    if ((Test-Path -LiteralPath $manifest) -and -not $Force) {
-        $recorded = Get-ManifestValue $manifest "binary_sha256"
-        if ($recorded -and (Get-Hash $binary) -ne $recorded) {
-            Fail "$binary differs from the recorded install; pass -Force to remove it anyway"
+    if ((-not (Test-Path -LiteralPath $Binary)) -and (-not (Test-Path -LiteralPath $Manifest))) {
+        Fail "no $Product installation found at $InstallDir"
+    }
+    if ((Test-Path -LiteralPath $Manifest) -and -not $Force) {
+        $recorded = Get-ManifestValue $Manifest "binary_sha256"
+        if ((Test-Path -LiteralPath $Binary) -and $recorded -and (Get-Hash $Binary) -ne $recorded) {
+            Fail "$Binary differs from the recorded install; pass -Force to remove it anyway"
         }
     }
-    if ($DryRun) { Info "dry-run: would remove $binary" }
-    else {
-        Remove-Item -LiteralPath $binary -Force
-        Remove-Item -LiteralPath (Join-Path $InstallDir "$Product.previous.exe") -Force -ErrorAction SilentlyContinue
-        Info "removed $binary"
+    elseif (-not (Test-Path -LiteralPath $Manifest) -and -not $Force) {
+        Fail "$InstallDir has no product manifest; pass -Force to remove $Binary"
     }
-    if ($RemoveSkill -and (Test-Path -LiteralPath $manifest)) {
-        $index = 0
-        while ($true) {
-            $dir = Get-ManifestValue $manifest "skill.$index.dir"
-            if (-not $dir) { break }
-            $recordedTree = Get-ManifestValue $manifest "skill.$index.tree_sha256"
+    $purgeTarget = ""
+    if ($PurgeState) {
+        $purgeTarget = Get-StateDir
+        if ((Test-Path -LiteralPath $purgeTarget) -and -not (Test-ProductStateDir $purgeTarget)) {
+            Fail "refusing -PurgeState: $purgeTarget is not a recognized $Product state directory"
+        }
+    }
+    if ($RemoveSkill -and (Test-Path -LiteralPath $Manifest)) {
+        foreach ($dir in @(Get-ManifestSkillDirs $Manifest)) {
+            $recordedTree = Get-ManifestSkillTree $Manifest $dir
             if (-not (Test-Path -LiteralPath $dir)) { Info "skill directory is already gone: $dir" }
-            elseif ($Force -or (Get-TreeHash $dir) -eq $recordedTree) {
-                if ($DryRun) { Info "dry-run: would remove $dir" }
-                else { Remove-Item -LiteralPath $dir -Recurse -Force; Info "removed skill $dir" }
+            elseif ($Force -or ($recordedTree -and (Get-TreeHash $dir) -eq $recordedTree)) {
+                Assert-SafeRemoveTarget $dir
+                Info "removed skill $dir"
             }
             else { Info "keeping modified skill directory (pass -Force to remove): $dir" }
-            $index++
         }
     }
     elseif ($RemoveSkill) { Info "no install manifest: not removing any skill directory" }
-    if (-not $DryRun) { Remove-Item -LiteralPath $manifest -Force -ErrorAction SilentlyContinue }
+    if (Test-Path -LiteralPath $Binary) { Remove-Item -LiteralPath $Binary -Force }
+    Remove-Item -LiteralPath (Join-Path $InstallDir $PreviousName) -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $Manifest -Force -ErrorAction SilentlyContinue
+    Info "removed the $Product binary from $InstallDir"
     if ($PurgeState) {
-        $state = Get-StateDir
-        if (Test-Path -LiteralPath $state) {
-            if ($DryRun) { Info "dry-run: would remove state $state" }
-            else { Remove-Item -LiteralPath $state -Recurse -Force; Info "removed state $state" }
+        if (-not (Test-Path -LiteralPath $purgeTarget)) { Info "state directory not present: $purgeTarget" }
+        else {
+            Assert-SafeRemoveTarget $purgeTarget
+            Info "removed state $purgeTarget"
         }
-        else { Info "state directory not present: $state" }
     }
     Info "uninstall complete"
     exit 0
 }
 
-# ------------------------------------------------------------------ install
-
-if ($SkillHarness -and $SkillDir) { Fail "use either -SkillHarness or -SkillDir, not both" }
-if ($NoSkill -and ($SkillHarness -or $SkillDir)) { Fail "use either -NoSkill or a skill target, not both" }
+# ------------------------------------------------------------------ stage
 
 $Work = Join-Path ([System.IO.Path]::GetTempPath()) ("mc-agent-install-" + [Guid]::NewGuid().ToString("N"))
 New-Item -ItemType Directory -Path $Work -Force | Out-Null
@@ -202,100 +337,118 @@ $ArchiveName = "$Product-$Version-windows-amd64.zip"
 try {
     if ($Archive) {
         if (-not (Test-Path -LiteralPath $Archive)) { Fail "archive not found: $Archive" }
-        if (-not $DryRun) { Copy-Item -LiteralPath $Archive -Destination (Join-Path $Work $ArchiveName) }
+        Copy-Item -LiteralPath $Archive -Destination (Join-Path $Work $ArchiveName)
         $sourceDescription = $Archive
+        if (-not $Sha256) { Info "warning: -Archive without -Sha256; skipping checksum verification" }
+        else { Assert-Checksum (Join-Path $Work $ArchiveName) $ArchiveName }
     }
     else {
         Fetch-Asset "checksums.txt" (Join-Path $Work "checksums.txt")
         Fetch-Asset $ArchiveName (Join-Path $Work $ArchiveName)
         $sourceDescription = "$BaseUrl/$ArchiveName"
-    }
-    if (-not $Archive -or $Sha256) { Assert-Checksum (Join-Path $Work $ArchiveName) $ArchiveName }
-
-    New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null
-    $existingBinary = Join-Path $InstallDir $AssetBinary
-    $existingManifest = Join-Path $InstallDir "$Product.installed"
-    if ((Test-Path -LiteralPath $existingBinary) -and -not (Test-Path -LiteralPath $existingManifest) -and -not $Force) {
-        Fail "$existingBinary exists without an install manifest; pass -Force to replace it"
+        Assert-Checksum (Join-Path $Work $ArchiveName) $ArchiveName
     }
 
-    if (-not $DryRun) {
-        $extract = Join-Path $Work "extract"
-        Expand-Archive -LiteralPath (Join-Path $Work $ArchiveName) -DestinationPath $extract -Force
-        $extracted = Join-Path $extract $AssetBinary
-        if (-not (Test-Path -LiteralPath $extracted)) { Fail "archive does not contain $AssetBinary" }
-        if (Test-Path -LiteralPath $existingBinary) {
-            Copy-Item -LiteralPath $existingBinary -Destination (Join-Path $InstallDir "$Product.previous.exe") -Force
+    $extract = Join-Path $Work "extract"
+    Expand-Archive -LiteralPath (Join-Path $Work $ArchiveName) -DestinationPath $extract -Force
+    $extracted = Join-Path $extract $AssetBinary
+    if (-not (Test-Path -LiteralPath $extracted)) { Fail "archive does not contain $AssetBinary" }
+    Assert-BinaryVersion $extracted $Version
+
+    if (Test-Path -LiteralPath $Binary) {
+        if (Test-Path -LiteralPath $Manifest) {
+            $recorded = Get-ManifestValue $Manifest "binary_sha256"
+            if ($recorded -and -not $Force -and (Get-Hash $Binary) -ne $recorded) {
+                Fail "$Binary was modified after installation; pass -Force to replace it"
+            }
         }
-        Move-Item -LiteralPath $extracted -Destination $existingBinary -Force
+        elseif (-not $Force) {
+            Fail "$Binary exists without a product manifest; pass -Force to replace it"
+        }
     }
-    else { Info "dry-run: would install $AssetBinary to $InstallDir" }
-    $newHash = if ($DryRun) { "dry-run" } else { Get-Hash $existingBinary }
-    Info "installed $Product $Version ($Platform) to $existingBinary"
-
-    # ---------------------------------------------------------------- skill
 
     if (-not $NoSkill) {
         $skillRoot = ""
-        if ($SkillDir) { $skillRoot = $SkillDir }
-        elseif ($SkillHarness) { $skillRoot = Get-SkillRoot $SkillHarness }
+        if ($SkillDir) { $skillRoot = Get-CanonicalPath $SkillDir }
+        elseif ($SkillHarness) { $skillRoot = Get-CanonicalPath (Get-SkillRoot $SkillHarness) }
         if (-not $skillRoot) {
             Info "no skill target given; pass -SkillHarness NAME or -SkillDir DIR to install the Toolkit Skill"
         }
-        elseif (-not $DryRun) {
+        else {
+            $SkillTarget = Join-Path $skillRoot "minecraft-toolkit"
+            if ((Test-Path -LiteralPath $SkillTarget) -and -not $UpdateSkill) {
+                Fail "$SkillTarget already exists; pass -UpdateSkill to replace it (a backup is kept)"
+            }
             Fetch-Asset "skill-pin.json" (Join-Path $Work "skill-pin.json")
-            $pin = Get-Content -LiteralPath (Join-Path $Work "skill-pin.json") -Raw | ConvertFrom-Json
-            $skillAsset = $pin.asset
+            $pin = Get-Content -LiteralPath (Join-Path $Work "skill-pin.json") -Raw -Encoding UTF8 | ConvertFrom-Json
+            if (-not $pin.asset) { Fail "skill-pin.json does not name a skill asset" }
             $SkillCommit = $pin.commit
-            if (-not $skillAsset) { Fail "skill-pin.json does not name a skill asset" }
-            Fetch-Asset $skillAsset (Join-Path $Work $skillAsset)
-            Assert-Checksum (Join-Path $Work $skillAsset) $skillAsset
+            Fetch-Asset $pin.asset (Join-Path $Work $pin.asset)
+            Assert-Checksum (Join-Path $Work $pin.asset) $pin.asset
             $skillExtract = Join-Path $Work "skill"
             New-Item -ItemType Directory -Path $skillExtract -Force | Out-Null
             $tarExe = Join-Path $env:SystemRoot "System32\tar.exe"
             if (-not (Test-Path -LiteralPath $tarExe)) { $tarExe = "tar" }
-            & $tarExe -xzf (Join-Path $Work $skillAsset) -C $skillExtract
+            & $tarExe -xzf (Join-Path $Work $pin.asset) -C $skillExtract
             if ($LASTEXITCODE -ne 0) { Fail "cannot extract the skill bundle (tar.exe is required)" }
-            if (-not (Test-Path -LiteralPath (Join-Path $skillExtract "minecraft-toolkit\SKILL.md"))) {
-                Fail "skill bundle is missing minecraft-toolkit/SKILL.md"
+            $skillMd = Join-Path $skillExtract "minecraft-toolkit\SKILL.md"
+            if (-not (Test-Path -LiteralPath $skillMd)) { Fail "skill bundle is missing minecraft-toolkit/SKILL.md" }
+            foreach ($line in (Get-Content -LiteralPath $skillMd -Encoding UTF8 | Select-Object -First 12)) {
+                if ($line -match '^\s*version:\s*"?([0-9][^"\s]*)"?\s*$') { $SkillVersion = $Matches[1]; break }
             }
-            $script:SkillTarget = Join-Path $skillRoot "minecraft-toolkit"
-            $frontmatter = Get-Content -LiteralPath (Join-Path $skillExtract "minecraft-toolkit\SKILL.md") | Select-Object -First 12
-            foreach ($line in $frontmatter) {
-                if ($line -match '^\s*version:\s*"?([0-9][^"\s]*)"?\s*$') { $script:SkillVersion = $Matches[1]; break }
-            }
-            if (Test-Path -LiteralPath $script:SkillTarget) {
-                if (-not $UpdateSkill) { Fail "$script:SkillTarget already exists; pass -UpdateSkill to replace it (a backup is kept)" }
-                $backup = "$script:SkillTarget.backup-" + [DateTime]::UtcNow.ToString("yyyyMMddHHmmss")
-                Copy-Item -LiteralPath $script:SkillTarget -Destination $backup -Recurse -Force
-                Info "kept a backup at $backup"
-                Remove-Item -LiteralPath $script:SkillTarget -Recurse -Force
-            }
-            New-Item -ItemType Directory -Path $skillRoot -Force | Out-Null
-            Copy-Item -LiteralPath (Join-Path $skillExtract "minecraft-toolkit") -Destination $script:SkillTarget -Recurse -Force
-            Info "installed skill $script:SkillVersion to $script:SkillTarget"
+            if (-not $SkillVersion) { Fail "cannot read the skill version from the bundle" }
         }
     }
 
-    if (-not $DryRun) { Write-Manifest $Version $newHash $sourceDescription }
+    # ------------------------------------------------------------- commit
 
-    # ----------------------------------------------------------------- PATH
+    New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null
+    if (Test-Path -LiteralPath $Binary) {
+        Copy-Item -LiteralPath $Binary -Destination (Join-Path $InstallDir $PreviousName) -Force
+    }
+    try { Move-Item -LiteralPath $extracted -Destination $Binary -Force }
+    catch {
+        if (Test-Path -LiteralPath (Join-Path $InstallDir $PreviousName)) {
+            Copy-Item -LiteralPath (Join-Path $InstallDir $PreviousName) -Destination $Binary -Force -ErrorAction SilentlyContinue
+        }
+        Fail "cannot replace $Binary; the previous binary was restored"
+    }
+    $newHash = Get-Hash $Binary
+    Info "installed $Product $Version ($Platform) to $Binary"
+
+    if ($SkillTarget) {
+        $skillBackup = ""
+        if (Test-Path -LiteralPath $SkillTarget) {
+            $skillBackup = "$SkillTarget.backup-" + [DateTime]::UtcNow.ToString("yyyyMMddHHmmss")
+            Copy-Item -LiteralPath $SkillTarget -Destination $skillBackup -Recurse -Force
+            Info "kept a backup at $skillBackup"
+            Remove-Item -LiteralPath $SkillTarget -Recurse -Force
+        }
+        New-Item -ItemType Directory -Path (Split-Path -Parent $SkillTarget) -Force | Out-Null
+        try { Copy-Item -LiteralPath (Join-Path $skillExtract "minecraft-toolkit") -Destination $SkillTarget -Recurse -Force }
+        catch {
+            if ($skillBackup -and (Test-Path -LiteralPath $skillBackup)) {
+                Move-Item -LiteralPath $skillBackup -Destination $SkillTarget -Force -ErrorAction SilentlyContinue
+            }
+            Fail "cannot install the skill to $SkillTarget; the previous copy was restored"
+        }
+        Info "installed skill $SkillVersion to $SkillTarget"
+    }
+
+    Write-Manifest $Version $newHash $sourceDescription
 
     if ($AddToPath) {
-        if ($DryRun) { Info "dry-run: would add $InstallDir to the user PATH" }
-        else {
-            $userPath = [Environment]::GetEnvironmentVariable("Path", "User")
-            if ($userPath -split ";" -notcontains $InstallDir) {
-                $updated = if ($userPath) { "$userPath;$InstallDir" } else { $InstallDir }
-                [Environment]::SetEnvironmentVariable("Path", $updated, "User")
-                Info "added $InstallDir to the user PATH (open a new shell)"
-            }
-            else { Info "$InstallDir is already on the user PATH" }
+        $userPath = [Environment]::GetEnvironmentVariable("Path", "User")
+        if ($userPath -split ";" -notcontains $InstallDir) {
+            $updated = if ($userPath) { "$userPath;$InstallDir" } else { $InstallDir }
+            [Environment]::SetEnvironmentVariable("Path", $updated, "User")
+            Info "added $InstallDir to the user PATH (open a new shell)"
         }
+        else { Info "$InstallDir is already on the user PATH" }
     }
 
-    Info "next: & '$existingBinary' version"
-    Info "      & '$existingBinary' daemon start   # then: ... doctor"
+    Info "next: & '$Binary' version"
+    Info "      & '$Binary' daemon start   # then: ... doctor"
 }
 finally {
     if ($Work -and (Test-Path -LiteralPath $Work)) { Remove-Item -LiteralPath $Work -Recurse -Force -ErrorAction SilentlyContinue }

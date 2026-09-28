@@ -8,6 +8,11 @@ on:
         required: false
         type: string
         default: ""
+      ref:
+        description: Exact git commit to build; empty uses the triggering commit
+        required: false
+        type: string
+        default: ""
     outputs:
       version:
         description: Product version that was built and verified
@@ -35,6 +40,8 @@ jobs:
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.sha }}
       - uses: actions/setup-go@v5
         with:
           go-version: "1.26.x"
@@ -64,6 +71,25 @@ jobs:
           OUTPUT=../staging/mc-agent
           [ "$GOOS" = "windows" ] && OUTPUT=../staging/mc-agent.exe
           go build -trimpath -ldflags "-s -w" -o "$OUTPUT" ./cmd/mc-agent
+      - name: build previous-version fixture for upgrade tests
+        shell: bash
+        working-directory: go
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: "0"
+        run: |
+          PREV=0.4.9-ci
+          mkdir -p ../staging-previous ../previous
+          rm -rf ../staging-source-previous
+          cp -R . ../staging-source-previous
+          sed -i "s/const Version = \"[^\"]*\"/const Version = \"$PREV\"/" ../staging-source-previous/internal/version/version.go
+          BINARY=../staging-previous/mc-agent
+          [ "$GOOS" = "windows" ] && BINARY=../staging-previous/mc-agent.exe
+          (cd ../staging-source-previous && go build -trimpath -ldflags "-s -w" -o "$BINARY" ./cmd/mc-agent)
+          python ../release/tools/build_archive.py --binary "$BINARY" --version "$PREV" \
+            --goos ${{ matrix.goos }} --goarch ${{ matrix.goarch }} --out ../previous
+          rm -rf ../staging-source-previous
       - name: verify binary version matches the manifest
         shell: bash
         run: |
@@ -89,6 +115,11 @@ jobs:
           name: mc-agent-archive-${{ matrix.goos }}-${{ matrix.goarch }}
           path: dist/*
           if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mc-agent-previous-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: previous/*
+          if-no-files-found: error
 
   package:
     name: package and verify assets
@@ -98,6 +129,8 @@ jobs:
       version: ${{ steps.resolve.outputs.version }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.sha }}
       - uses: actions/setup-go@v5
         with:
           go-version: "1.26.x"
@@ -110,15 +143,30 @@ jobs:
           pattern: mc-agent-archive-*
           path: dist
           merge-multiple: true
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: mc-agent-previous-*
+          path: previous
+          merge-multiple: true
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mc-agent-previous-assets
+          path: previous/*
+          if-no-files-found: error
       - name: resolve version and tag
         id: resolve
         shell: bash
         env:
           TAG: ${{ inputs.tag }}
+          EXPECTED_REF: ${{ inputs.ref }}
         run: |
           VERSION="$(python -c "import json;print(json.load(open('release/compatibility.json'))['productVersion'])")"
           if [ -n "$TAG" ] && [ "$TAG" != "v$VERSION" ]; then
             echo "tag $TAG does not match product version $VERSION" >&2
+            exit 1
+          fi
+          if [ -n "$EXPECTED_REF" ] && [ "$(git rev-parse HEAD)" != "$EXPECTED_REF" ]; then
+            echo "checkout $(git rev-parse HEAD) does not match the requested commit $EXPECTED_REF" >&2
             exit 1
           fi
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
@@ -140,7 +188,7 @@ jobs:
         run: |
           python release/tools/finalize_assets.py \
             --assets dist --version "${{ steps.resolve.outputs.version }}" --tag "$TAG" \
-            --commit "$GITHUB_SHA" --go-version "$(go version)" \
+            --commit "$(git rev-parse HEAD)" --go-version "$(go version)" \
             --skill-dir "skill-source/mc-agent-$SKILL_COMMIT/skills/minecraft-toolkit"
       - name: verify the published checksums
         shell: bash
@@ -162,10 +210,17 @@ jobs:
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.sha }}
       - uses: actions/download-artifact@v4
         with:
           name: mc-agent-release-assets
           path: staging
+          merge-multiple: true
+      - uses: actions/download-artifact@v4
+        with:
+          name: mc-agent-previous-assets
+          path: staging-previous
           merge-multiple: true
       - name: install acceptance (Linux/macOS)
         if: runner.os != 'Windows'
@@ -174,7 +229,8 @@ jobs:
           VERSION: ${{ needs.package.outputs.version }}
         run: |
           sh release/acceptance/install_acceptance.sh \
-            --assets staging --version "$VERSION" --work "$RUNNER_TEMP/acceptance"
+            --assets staging --previous-assets staging-previous \
+            --version "$VERSION" --work "$RUNNER_TEMP/acceptance"
       - name: install acceptance (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
@@ -182,4 +238,5 @@ jobs:
           VERSION: ${{ needs.package.outputs.version }}
         run: |
           ./release/acceptance/install_acceptance.ps1 `
-            -Assets staging -Version "$env:VERSION" -Work "$env:RUNNER_TEMP\acceptance"
+            -Assets staging -PreviousAssets staging-previous `
+            -Version "$env:VERSION" -Work "$env:RUNNER_TEMP\acceptance"

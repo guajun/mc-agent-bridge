@@ -14,30 +14,82 @@ permissions:
   contents: read
 
 jobs:
+  resolve:
+    name: resolve the reviewed tag commit
+    runs-on: ubuntu-latest
+    outputs:
+      sha: ${{ steps.resolve.outputs.sha }}
+      tag: ${{ steps.resolve.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: resolve the release tag
+        id: resolve
+        shell: bash
+        env:
+          TAG_INPUT: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          TAG="${{ github.ref_type == 'tag' && github.ref_name || inputs.tag }}"
+          [ -n "$TAG" ] || { echo "no release tag was provided" >&2; exit 1; }
+          git fetch --force --tags origin
+          git fetch origin main
+          git rev-parse --verify "refs/tags/$TAG" >/dev/null 2>&1 || { echo "tag $TAG does not exist" >&2; exit 1; }
+          SHA="$(git rev-parse "refs/tags/$TAG^{commit}")"
+          git merge-base --is-ancestor "$SHA" origin/main || {
+            echo "tag $TAG ($SHA) is not reachable from origin/main" >&2
+            exit 1
+          }
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+
   release-build:
     name: stage and verify release assets
+    needs: resolve
     uses: ./.github/workflows/release-build.yml
     with:
-      tag: ${{ github.ref_type == 'tag' && github.ref_name || inputs.tag }}
+      tag: ${{ needs.resolve.outputs.tag }}
+      ref: ${{ needs.resolve.outputs.sha }}
 
   publish:
     name: publish GitHub release
-    needs: release-build
+    needs: [resolve, release-build]
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.resolve.outputs.sha }}
+          fetch-depth: 0
       - uses: actions/download-artifact@v4
         with:
           name: mc-agent-release-assets
           path: dist
           merge-multiple: true
+      - name: verify source provenance
+        shell: bash
+        env:
+          EXPECTED_SHA: ${{ needs.resolve.outputs.sha }}
+        run: |
+          set -euo pipefail
+          HEAD_SHA="$(git rev-parse HEAD)"
+          [ "$HEAD_SHA" = "$EXPECTED_SHA" ] || { echo "checkout $HEAD_SHA != resolved $EXPECTED_SHA" >&2; exit 1; }
+          python - "$EXPECTED_SHA" <<'PY'
+          import json, sys
+          expected = sys.argv[1]
+          info = json.load(open("dist/version.json"))
+          actual = info["build"]["commit"]
+          if actual != expected:
+              raise SystemExit(f"version.json build.commit {actual} != {expected}")
+          print(f"provenance ok: {actual}")
+          PY
       - name: write release notes
         shell: bash
         env:
           VERSION: ${{ needs.release-build.outputs.version }}
-          TAG: ${{ github.ref_type == 'tag' && github.ref_name || inputs.tag }}
+          TAG: ${{ needs.resolve.outputs.tag }}
         run: |
           cat > "$RUNNER_TEMP/notes.md" <<EOF
           mc-agent ${VERSION} - Go CLI/daemon for the Minecraft Agent Toolkit.
@@ -76,9 +128,10 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAG: ${{ github.ref_type == 'tag' && github.ref_name || inputs.tag }}
+          TAG: ${{ needs.resolve.outputs.tag }}
         run: |
           gh release create "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
             --title "$TAG" \
             --notes-file "$RUNNER_TEMP/notes.md" \
             --verify-tag \
