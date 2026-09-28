@@ -47,6 +47,9 @@ type Config struct {
 	ClientName  string
 	DialTimeout time.Duration
 	IOTimeout   time.Duration
+	// DialContext overrides the raw TCP dial. Tests use it to wrap the socket
+	// (partial writes, byte counters); production leaves it nil.
+	DialContext func(ctx context.Context, network, address string) (net.Conn, error)
 }
 
 // Client is one live control connection. Requests are serialized; replies are
@@ -107,12 +110,23 @@ func Dial(ctx context.Context, config Config) (*Client, *Welcome, error) {
 		dialContext, cancel = context.WithTimeout(ctx, timeout)
 		defer cancel()
 	}
-	dialer := &tls.Dialer{Config: tlsConfig, NetDialer: &net.Dialer{Timeout: timeout}}
-	conn, err := dialer.DialContext(dialContext, "tcp", config.Address)
+	var rawConn net.Conn
+	if config.DialContext != nil {
+		rawConn, err = config.DialContext(dialContext, "tcp", config.Address)
+	} else {
+		rawConn, err = (&net.Dialer{Timeout: timeout}).DialContext(dialContext, "tcp", config.Address)
+	}
 	if err != nil {
 		return nil, nil, &protocol.Error{Code: protocol.CodeConnectionFailed,
-			Message: fmt.Sprintf("cannot reach %s over TLS: %v", config.Address, unwrapTLS(err))}
+			Message: fmt.Sprintf("cannot reach %s: %v", config.Address, unwrapTLS(err))}
 	}
+	tlsConn := tls.Client(rawConn, tlsConfig)
+	if err := tlsConn.HandshakeContext(dialContext); err != nil {
+		rawConn.Close()
+		return nil, nil, &protocol.Error{Code: protocol.CodeConnectionFailed,
+			Message: fmt.Sprintf("TLS handshake with %s failed: %v", config.Address, unwrapTLS(err))}
+	}
+	conn := net.Conn(tlsConn)
 	client := &Client{
 		config:     config,
 		conn:       conn,
@@ -300,6 +314,8 @@ func (c *Client) CallWithID(ctx context.Context, id string, operation string, pa
 			c.writeToken <- struct{}{}
 		}
 	}
+	// Safety net only: the slot is explicitly released right after Flush so a
+	// slow reply never serialises other requests behind this one.
 	defer releaseWrite()
 
 	// Cancellation between acquiring the slot and the first byte is still a
@@ -317,19 +333,44 @@ func (c *Client) CallWithID(ctx context.Context, id string, operation string, pa
 	if deadline, ok := ctx.Deadline(); ok && deadline.Before(writeDeadline) {
 		writeDeadline = deadline
 	}
-	_ = c.conn.SetWriteDeadline(writeDeadline)
+	if err := c.conn.SetWriteDeadline(writeDeadline); err != nil {
+		// Nothing has been attempted yet: still a definitely-not-sent request.
+		c.forget(id)
+		return nil, neverSent(operation, id, err)
+	}
+	// Honor ctx.Done during the actual socket write, not only via deadlines:
+	// a manual cancel with no deadline must interrupt a stalled writer. The
+	// watcher is joined before the deadline is cleared and the write slot is
+	// released, so it can never poke a later caller's socket.
+	watcherStop := make(chan struct{})
+	watcherDone := make(chan struct{})
+	go func() {
+		defer close(watcherDone)
+		select {
+		case <-ctx.Done():
+			_ = c.conn.SetWriteDeadline(time.Now())
+		case <-watcherStop:
+		}
+	}()
 	err := WriteFrame(c.writer, frame)
 	if err == nil {
 		err = c.writer.Flush()
 	}
+	close(watcherStop)
+	<-watcherDone
 	_ = c.conn.SetWriteDeadline(time.Time{})
+	// The request is framed and flushed (or failed); the writer slot is free
+	// either way and replies route by id, so other requests can proceed while
+	// this one waits.
+	releaseWrite()
 	if err != nil {
 		c.forget(id)
 		// A partial frame may be on the wire; the connection is poisoned for
 		// this and every later request, so terminate it instead of reusing a
-		// buffered writer that may hold half a frame.
+		// buffered writer that may hold half a frame. Delivery is not proven,
+		// so a non-idempotent write stays result-unknown.
 		go c.Close()
-		return nil, connectionClosed(operation, id)
+		return nil, writeAttemptFailed(operation, id, write, err)
 	}
 
 	select {
@@ -382,9 +423,24 @@ func (c *Client) CallWithID(ctx context.Context, id string, operation string, pa
 func neverSent(operation, id string, cause error) *protocol.Error {
 	return &protocol.Error{
 		Code:          protocol.CodeTimeout,
-		Message:       fmt.Sprintf("request %s was cancelled before it was sent: %v", operation, cause),
+		Message:       fmt.Sprintf("request %s was not sent: %v", operation, cause),
 		Retryable:     true,
 		ResultUnknown: false,
+		RequestID:     id,
+		Operation:     operation,
+	}
+}
+
+// writeAttemptFailed classifies a failure after the write attempt began. A
+// partial write may have delivered the request, so a non-idempotent write is
+// reported result-unknown and must not be retried by the client automatically;
+// reads are always safe to retry.
+func writeAttemptFailed(operation, id string, write bool, cause error) *protocol.Error {
+	return &protocol.Error{
+		Code:          protocol.CodeConnectionLost,
+		Message:       fmt.Sprintf("the send of request %s failed after it began: %v", operation, cause),
+		Retryable:     !write,
+		ResultUnknown: write,
 		RequestID:     id,
 		Operation:     operation,
 	}
@@ -393,8 +449,8 @@ func neverSent(operation, id string, cause error) *protocol.Error {
 func connectionClosed(operation, id string) *protocol.Error {
 	return &protocol.Error{
 		Code:          protocol.CodeConnectionLost,
-		Message:       fmt.Sprintf("the control connection closed before %s could be sent", operation),
-		Retryable:     protocol.WriteOperation(operation),
+		Message:       fmt.Sprintf("the control connection closed before %s was sent", operation),
+		Retryable:     true,
 		ResultUnknown: false,
 		RequestID:     id,
 		Operation:     operation,
