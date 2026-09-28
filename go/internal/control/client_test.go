@@ -327,3 +327,86 @@ func TestRunIDMismatchReplaysAsFreshStream(t *testing.T) {
 		t.Fatal("no event from the new run")
 	}
 }
+
+func TestPreCancelledCallSendsNothing(t *testing.T) {
+	server := startFake(t, fakemod.Options{})
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	client, _, err := control.Dial(ctx, control.Config{Address: server.Address(), Pin: server.Pin(), Token: testToken})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	cancelled, cancelCall := context.WithCancel(context.Background())
+	cancelCall()
+	_, failure := client.CallWithID(cancelled, "pre-cancelled-1", "command",
+		map[string]any{"command": "say never"})
+	if failure == nil {
+		t.Fatal("a pre-cancelled call must fail")
+	}
+	if failure.ResultUnknown || !failure.Retryable {
+		t.Fatalf("a request that was never sent is safe to retry: %+v", failure)
+	}
+	if got := server.Requests(); got != 0 {
+		t.Fatalf("the server received %d requests from a cancelled call", got)
+	}
+	// The connection is still usable and the next call really is sent.
+	if _, failure := client.Call(ctx, "ping", nil); failure != nil {
+		t.Fatalf("the connection was poisoned by cancellation: %v", failure)
+	}
+	if got := server.Requests(); got != 1 {
+		t.Fatalf("the follow-up ping was not sent (requests=%d)", got)
+	}
+}
+
+func TestDialHonorsContextDeadline(t *testing.T) {
+	server := startFake(t, fakemod.Options{SilentHello: true})
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	_, _, err := control.Dial(ctx, control.Config{
+		Address:     server.Address(),
+		Pin:         server.Pin(),
+		Token:       testToken,
+		DialTimeout: 30 * time.Second,
+	})
+	if err == nil {
+		t.Fatal("the cancelled handshake must fail")
+	}
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Fatalf("dial ignored the context deadline: %s", elapsed)
+	}
+}
+
+func TestStalledWriterHonorsIOTimeout(t *testing.T) {
+	server := startFake(t, fakemod.Options{StallRead: true})
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	client, _, err := control.Dial(ctx, control.Config{
+		Address: server.Address(), Pin: server.Pin(), Token: testToken,
+		IOTimeout: 500 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	big := make([]byte, 8*1024*1024)
+	for index := range big {
+		big[index] = 'a'
+	}
+	start := time.Now()
+	_, failure := client.CallWithID(ctx, "stalled-1", "command",
+		map[string]any{"command": string(big)})
+	if failure == nil {
+		t.Fatal("a write against a stalled reader must fail")
+	}
+	if elapsed := time.Since(start); elapsed > 5*time.Second {
+		t.Fatalf("the write deadline was not applied: %s", elapsed)
+	}
+	select {
+	case <-client.Done():
+	case <-time.After(3 * time.Second):
+		t.Fatal("a failed partial write must terminate the connection")
+	}
+}

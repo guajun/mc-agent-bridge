@@ -32,11 +32,14 @@ type UnknownWrite struct {
 	CredentialHash string `json:"credentialHash,omitempty"`
 }
 
-// unknownWrites is the bounded, persisted ledger.
+// unknownWrites is the bounded, persisted ledger. The capacity is a hard
+// admission bound: a full ledger refuses new writes before they can leave the
+// process, and existing recovery entries are never silently evicted (an
+// evicted unresolved request would be a request nobody can ever resolve).
 type unknownWrites struct {
 	path  string
 	mu    sync.Mutex
-	items map[string]*UnknownWrite
+	items map[string]UnknownWrite
 }
 
 const (
@@ -47,7 +50,7 @@ const (
 func newUnknownWrites(home string) *unknownWrites {
 	return &unknownWrites{
 		path:  filepath.Join(home, unknownWritesFile),
-		items: map[string]*UnknownWrite{},
+		items: map[string]UnknownWrite{},
 	}
 }
 
@@ -57,7 +60,9 @@ func key(target, requestID string) string {
 
 // Load reads the ledger. A missing file is empty. A corrupt file is moved
 // aside and reported so the daemon can keep running without silently losing
-// recovery data; any other read failure is returned.
+// recovery data; any other read failure is returned. Entries beyond the
+// capacity are preserved as-is (never dropped) and reported so the operator
+// can drain them.
 func (u *unknownWrites) Load() (string, error) {
 	data, err := os.ReadFile(u.path)
 	if errors.Is(err, os.ErrNotExist) {
@@ -66,7 +71,7 @@ func (u *unknownWrites) Load() (string, error) {
 	if err != nil {
 		return "", err
 	}
-	var list []*UnknownWrite
+	var list []UnknownWrite
 	if err := json.Unmarshal(data, &list); err != nil {
 		backup := fmt.Sprintf("%s.corrupt-%d", u.path, time.Now().Unix())
 		if renameErr := os.Rename(u.path, backup); renameErr != nil {
@@ -77,17 +82,22 @@ func (u *unknownWrites) Load() (string, error) {
 	u.mu.Lock()
 	defer u.mu.Unlock()
 	for _, entry := range list {
-		if entry == nil || entry.RequestID == "" {
+		if entry.RequestID == "" {
 			continue
 		}
 		u.items[key(entry.Target, entry.RequestID)] = entry
 	}
-	u.trimLocked()
+	if len(u.items) > unknownWritesCap {
+		return fmt.Sprintf(
+			"the unknown-write ledger holds %d entries, above the %d entry admission cap; "+
+				"new non-idempotent writes are refused until these are reconciled",
+			len(u.items), unknownWritesCap), nil
+	}
 	return "", nil
 }
 
 func (u *unknownWrites) saveLocked() error {
-	list := make([]*UnknownWrite, 0, len(u.items))
+	list := make([]UnknownWrite, 0, len(u.items))
 	for _, entry := range u.items {
 		list = append(list, entry)
 	}
@@ -106,41 +116,19 @@ func (u *unknownWrites) saveLocked() error {
 	return os.Rename(temporary, u.path)
 }
 
-// trimLocked caps the ledger. Oldest entries are dropped first; terminal
-// (resolved/unresolved) entries are dropped before still-unknown ones.
-func (u *unknownWrites) trimLocked() {
-	if len(u.items) <= unknownWritesCap {
-		return
-	}
-	list := make([]*UnknownWrite, 0, len(u.items))
-	for _, entry := range u.items {
-		list = append(list, entry)
-	}
-	sort.Slice(list, func(i, j int) bool {
-		terminalI := list[i].State != "unknown"
-		terminalJ := list[j].State != "unknown"
-		if terminalI != terminalJ {
-			return terminalI
-		}
-		return list[i].At.Before(list[j].At)
-	})
-	for _, entry := range list {
-		if len(u.items) <= unknownWritesCap {
-			break
-		}
-		delete(u.items, key(entry.Target, entry.RequestID))
-	}
-}
-
-// Record persists a request before it can be sent. A persistence failure is
-// returned so the caller can refuse to send instead of losing recovery data.
+// Record persists a request before it can be sent. A full ledger or a
+// persistence failure is returned so the caller refuses to send instead of
+// losing recovery data.
 func (u *unknownWrites) Record(target, operation, requestID, instanceID, runID, credentialHash string) error {
 	if requestID == "" {
 		return errors.New("refusing to track a write without a request id")
 	}
 	u.mu.Lock()
 	defer u.mu.Unlock()
-	entry := &UnknownWrite{
+	if _, exists := u.items[key(target, requestID)]; !exists && len(u.items) >= unknownWritesCap {
+		return fmt.Errorf("the unknown-write ledger is full (%d entries); reconcile it before sending", unknownWritesCap)
+	}
+	entry := UnknownWrite{
 		Target:         target,
 		Operation:      operation,
 		RequestID:      requestID,
@@ -150,38 +138,52 @@ func (u *unknownWrites) Record(target, operation, requestID, instanceID, runID, 
 		RunID:          runID,
 		CredentialHash: credentialHash,
 	}
+	previous, existed := u.items[key(target, requestID)]
 	u.items[key(target, requestID)] = entry
 	if err := u.saveLocked(); err != nil {
-		delete(u.items, key(target, requestID))
+		if existed {
+			u.items[key(target, requestID)] = previous
+		} else {
+			delete(u.items, key(target, requestID))
+		}
 		return fmt.Errorf("cannot persist the unknown-write ledger: %w", err)
 	}
 	return nil
 }
 
 // NoteUnknown refreshes the message on a still-unknown request.
-func (u *unknownWrites) NoteUnknown(target, requestID, message string) {
+func (u *unknownWrites) NoteUnknown(target, requestID, message string) error {
 	u.mu.Lock()
 	defer u.mu.Unlock()
-	entry := u.items[key(target, requestID)]
-	if entry == nil {
-		return
+	entry, exists := u.items[key(target, requestID)]
+	if !exists {
+		return nil
 	}
+	previous := entry
 	entry.State = "unknown"
 	entry.Message = message
-	_ = u.saveLocked()
+	u.items[key(target, requestID)] = entry
+	if err := u.saveLocked(); err != nil {
+		u.items[key(target, requestID)] = previous
+		return err
+	}
+	return nil
 }
 
 // MarkUnresolved keeps the entry after the server reports no record.
 func (u *unknownWrites) MarkUnresolved(target, requestID, message string) error {
 	u.mu.Lock()
 	defer u.mu.Unlock()
-	entry := u.items[key(target, requestID)]
-	if entry == nil {
+	entry, exists := u.items[key(target, requestID)]
+	if !exists {
 		return nil
 	}
+	previous := entry
 	entry.State = "unresolved"
 	entry.Message = message
+	u.items[key(target, requestID)] = entry
 	if err := u.saveLocked(); err != nil {
+		u.items[key(target, requestID)] = previous
 		return err
 	}
 	return nil
@@ -191,8 +193,8 @@ func (u *unknownWrites) MarkUnresolved(target, requestID, message string) error 
 func (u *unknownWrites) Resolve(target, requestID string) error {
 	u.mu.Lock()
 	defer u.mu.Unlock()
-	entry := u.items[key(target, requestID)]
-	if entry == nil {
+	entry, exists := u.items[key(target, requestID)]
+	if !exists {
 		return nil
 	}
 	delete(u.items, key(target, requestID))
@@ -203,11 +205,12 @@ func (u *unknownWrites) Resolve(target, requestID string) error {
 	return nil
 }
 
-// ForTarget returns the entries of one target.
-func (u *unknownWrites) ForTarget(target string) []*UnknownWrite {
+// ForTarget returns copies of one target's entries so reconciliation and
+// status readers cannot race with concurrent mutations.
+func (u *unknownWrites) ForTarget(target string) []UnknownWrite {
 	u.mu.Lock()
 	defer u.mu.Unlock()
-	var result []*UnknownWrite
+	var result []UnknownWrite
 	for _, entry := range u.items {
 		if entry.Target == target {
 			result = append(result, entry)
@@ -217,16 +220,23 @@ func (u *unknownWrites) ForTarget(target string) []*UnknownWrite {
 	return result
 }
 
-// List returns every entry, newest last.
-func (u *unknownWrites) List() []*UnknownWrite {
+// List returns copies of every entry, oldest first.
+func (u *unknownWrites) List() []UnknownWrite {
 	u.mu.Lock()
 	defer u.mu.Unlock()
-	result := make([]*UnknownWrite, 0, len(u.items))
+	result := make([]UnknownWrite, 0, len(u.items))
 	for _, entry := range u.items {
 		result = append(result, entry)
 	}
 	sort.Slice(result, func(i, j int) bool { return result[i].At.Before(result[j].At) })
 	return result
+}
+
+// Count returns the ledger size.
+func (u *unknownWrites) Count() int {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	return len(u.items)
 }
 
 // credentialFingerprint hashes a bearer token so the ledger can detect a

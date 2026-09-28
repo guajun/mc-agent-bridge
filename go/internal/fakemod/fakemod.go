@@ -22,6 +22,7 @@ import (
 	"net"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/guajun/mc-agent-bridge/internal/control"
@@ -43,6 +44,9 @@ type Options struct {
 	// SilentHello accepts the TLS connection and reads the hello but never
 	// sends a welcome, for handshake-timeout tests.
 	SilentHello bool
+	// StallRead stops reading after the welcome, so a large client write
+	// blocks on the socket and exercises write deadlines/cancellation.
+	StallRead bool
 }
 
 // Server is one fake control endpoint.
@@ -53,6 +57,7 @@ type Server struct {
 	address  string
 
 	mu          sync.Mutex
+	requests    atomic.Int64
 	seq         int64
 	writeSeq    int64
 	ring        []map[string]any
@@ -170,6 +175,9 @@ func (s *Server) DisconnectAll() {
 		c.conn.Close()
 	}
 }
+
+// Requests returns how many request frames the server has received.
+func (s *Server) Requests() int64 { return s.requests.Load() }
 
 // Push publishes a scripted event and returns its sequence number.
 func (s *Server) Push(eventType string, fields map[string]any) int64 {
@@ -317,6 +325,13 @@ func (s *Server) serve(conn net.Conn) {
 		s.removeConnection(client)
 		return
 	}
+	if s.options.StallRead {
+		// Do not read further: the peer's write buffer fills and its write
+		// deadline decides how long that may take.
+		time.Sleep(30 * time.Second)
+		s.removeConnection(client)
+		return
+	}
 
 	for {
 		payload, err := control.ReadFrame(client.reader)
@@ -332,6 +347,7 @@ func (s *Server) serve(conn net.Conn) {
 		frameType, _ := frame["type"].(string)
 		switch frameType {
 		case "request":
+			s.requests.Add(1)
 			go s.handleRequest(client, frame)
 		case "ping":
 			id, _ := frame["id"].(string)

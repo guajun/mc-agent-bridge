@@ -63,7 +63,10 @@ type Client struct {
 	nonce  string
 	nextID atomic.Uint64
 
-	writeMu sync.Mutex
+	// writeToken is a one-slot semaphore so a waiting writer can be released
+	// by cancellation instead of blocking on a mutex.
+	writeToken chan struct{}
+	ioTimeout  time.Duration
 
 	pendingMu sync.Mutex
 	pending   map[string]chan *Reply
@@ -94,6 +97,10 @@ func Dial(ctx context.Context, config Config) (*Client, *Welcome, error) {
 	if timeout == 0 {
 		timeout = 10 * time.Second
 	}
+	ioTimeout := config.IOTimeout
+	if ioTimeout <= 0 {
+		ioTimeout = 15 * time.Second
+	}
 	dialContext := ctx
 	if _, hasDeadline := ctx.Deadline(); !hasDeadline {
 		var cancel context.CancelFunc
@@ -107,16 +114,19 @@ func Dial(ctx context.Context, config Config) (*Client, *Welcome, error) {
 			Message: fmt.Sprintf("cannot reach %s over TLS: %v", config.Address, unwrapTLS(err))}
 	}
 	client := &Client{
-		config:  config,
-		conn:    conn,
-		reader:  bufio.NewReaderSize(conn, 64*1024),
-		writer:  bufio.NewWriterSize(conn, 64*1024),
-		nonce:   newNonce(),
-		pending: map[string]chan *Reply{},
-		events:  make(chan Event, 1024),
-		done:    make(chan struct{}),
-		stop:    make(chan struct{}),
+		config:     config,
+		conn:       conn,
+		reader:     bufio.NewReaderSize(conn, 64*1024),
+		writer:     bufio.NewWriterSize(conn, 64*1024),
+		nonce:      newNonce(),
+		pending:    map[string]chan *Reply{},
+		events:     make(chan Event, 1024),
+		done:       make(chan struct{}),
+		stop:       make(chan struct{}),
+		writeToken: make(chan struct{}, 1),
+		ioTimeout:  ioTimeout,
 	}
+	client.writeToken <- struct{}{}
 	name := config.ClientName
 	if name == "" {
 		name = "mc-agent"
@@ -129,13 +139,28 @@ func Dial(ctx context.Context, config Config) (*Client, *Welcome, error) {
 		RunID:    config.ExpectRunID,
 		Client:   ClientInfo{Name: name, Version: protocolVersion()},
 	}
-	// The hello/welcome exchange is bounded: after the TLS handshake the
-	// context no longer covers the socket, so both directions get a deadline.
-	if err := conn.SetWriteDeadline(time.Now().Add(timeout)); err != nil {
+	// The hello/welcome exchange is bounded by the caller's deadline and the
+	// dial timeout, whichever is shorter: after the TLS handshake the context
+	// no longer covers the socket, so both directions share one deadline and a
+	// cancellation watcher nudges the socket awake.
+	handshakeDeadline := time.Now().Add(timeout)
+	if deadline, ok := ctx.Deadline(); ok && deadline.Before(handshakeDeadline) {
+		handshakeDeadline = deadline
+	}
+	if err := conn.SetDeadline(handshakeDeadline); err != nil {
 		conn.Close()
 		return nil, nil, &protocol.Error{Code: protocol.CodeConnectionFailed,
-			Message: fmt.Sprintf("cannot arm the control write deadline: %v", err)}
+			Message: fmt.Sprintf("cannot arm the control handshake deadline: %v", err)}
 	}
+	handshakeDone := make(chan struct{})
+	defer close(handshakeDone)
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = conn.SetDeadline(time.Now())
+		case <-handshakeDone:
+		}
+	}()
 	if err := WriteFrame(client.writer, hello); err != nil {
 		conn.Close()
 		return nil, nil, &protocol.Error{Code: protocol.CodeConnectionFailed,
@@ -147,19 +172,14 @@ func Dial(ctx context.Context, config Config) (*Client, *Welcome, error) {
 			Message: fmt.Sprintf("cannot send hello: %v", err)}
 	}
 	// The welcome (or a fatal error) is the first frame.
-	if err := conn.SetReadDeadline(time.Now().Add(timeout)); err != nil {
-		conn.Close()
-		return nil, nil, &protocol.Error{Code: protocol.CodeConnectionFailed,
-			Message: fmt.Sprintf("cannot arm the control read deadline: %v", err)}
-	}
 	payload, err := ReadFrame(client.reader)
 	if err != nil {
 		conn.Close()
 		return nil, nil, &protocol.Error{Code: protocol.CodeConnectionFailed,
-			Message: fmt.Sprintf("no welcome from %s within %s: %v", config.Address, timeout, unwrapTLS(err))}
+			Message: fmt.Sprintf("no welcome from %s within the handshake deadline: %v",
+				config.Address, unwrapTLS(err))}
 	}
-	_ = conn.SetReadDeadline(time.Time{})
-	_ = conn.SetWriteDeadline(time.Time{})
+	_ = conn.SetDeadline(time.Time{})
 	var envelope struct {
 		Type string `json:"type"`
 	}
@@ -242,12 +262,16 @@ func (c *Client) CallWithID(ctx context.Context, id string, operation string, pa
 	if params == nil {
 		params = map[string]any{}
 	}
+	write := protocol.WriteOperation(operation)
+	if err := ctx.Err(); err != nil {
+		return nil, neverSent(operation, id, err)
+	}
 	replyCh := make(chan *Reply, 1)
 	c.pendingMu.Lock()
 	select {
 	case <-c.stop:
 		c.pendingMu.Unlock()
-		return nil, protocol.NewError(protocol.CodeConnectionLost, "the control connection is closed")
+		return nil, connectionClosed(operation, id)
 	default:
 	}
 	if _, exists := c.pending[id]; exists {
@@ -258,31 +282,54 @@ func (c *Client) CallWithID(ctx context.Context, id string, operation string, pa
 	c.pending[id] = replyCh
 	c.pendingMu.Unlock()
 
+	// Acquire the single write slot without making cancellation wait for a
+	// mutex: a daemon that gave up must never send the request anyway.
+	select {
+	case <-c.writeToken:
+	case <-ctx.Done():
+		c.forget(id)
+		return nil, neverSent(operation, id, ctx.Err())
+	case <-c.stop:
+		c.forget(id)
+		return nil, connectionClosed(operation, id)
+	}
+	released := false
+	releaseWrite := func() {
+		if !released {
+			released = true
+			c.writeToken <- struct{}{}
+		}
+	}
+	defer releaseWrite()
+
+	// Cancellation between acquiring the slot and the first byte is still a
+	// not-sent request; only a failed write is treated as possibly partial.
+	if err := ctx.Err(); err != nil {
+		c.forget(id)
+		return nil, neverSent(operation, id, err)
+	}
+
 	frame := Request{Type: FrameRequest, ID: id, Op: operation, Params: params}
 	if timeout, ok := params["_timeoutMillis"].(int64); ok {
 		frame.TimeoutMillis = timeout
 	}
-	// A write deadline keeps a stuck socket from holding writeMu forever and
-	// makes an expired context able to fail instead of leaking a goroutine.
-	writeDeadline := time.Now().Add(15 * time.Second)
-	c.writeMu.Lock()
+	writeDeadline := time.Now().Add(c.ioTimeout)
+	if deadline, ok := ctx.Deadline(); ok && deadline.Before(writeDeadline) {
+		writeDeadline = deadline
+	}
 	_ = c.conn.SetWriteDeadline(writeDeadline)
 	err := WriteFrame(c.writer, frame)
 	if err == nil {
 		err = c.writer.Flush()
 	}
 	_ = c.conn.SetWriteDeadline(time.Time{})
-	c.writeMu.Unlock()
 	if err != nil {
 		c.forget(id)
-		cause := protocol.NewError(protocol.CodeConnectionLost,
-			fmt.Sprintf("cannot send request %s: %v", operation, err))
-		cause.RequestID = id
-		cause.Operation = operation
-		// The frame may have been partially written; a write is never
-		// assumed safe to retry without asking the server.
-		cause.ResultUnknown = protocol.WriteOperation(operation)
-		return nil, cause
+		// A partial frame may be on the wire; the connection is poisoned for
+		// this and every later request, so terminate it instead of reusing a
+		// buffered writer that may hold half a frame.
+		go c.Close()
+		return nil, connectionClosed(operation, id)
 	}
 
 	select {
@@ -290,7 +337,7 @@ func (c *Client) CallWithID(ctx context.Context, id string, operation string, pa
 		if reply == nil {
 			return nil, &protocol.Error{Code: protocol.CodeConnectionLost,
 				Message:       "the control connection closed while waiting",
-				ResultUnknown: protocol.WriteOperation(operation),
+				ResultUnknown: write,
 				RequestID:     id, Operation: operation}
 		}
 		if reply.OK {
@@ -314,8 +361,8 @@ func (c *Client) CallWithID(ctx context.Context, id string, operation string, pa
 		return nil, &protocol.Error{
 			Code:          protocol.CodeTimeout,
 			Message:       fmt.Sprintf("no answer for %s within the deadline", operation),
-			Retryable:     !protocol.WriteOperation(operation),
-			ResultUnknown: protocol.WriteOperation(operation),
+			Retryable:     !write,
+			ResultUnknown: write,
 			RequestID:     id,
 			Operation:     operation,
 		}
@@ -325,10 +372,32 @@ func (c *Client) CallWithID(ctx context.Context, id string, operation string, pa
 			Code:          protocol.CodeConnectionLost,
 			Message:       fmt.Sprintf("the control connection closed while %s was in flight", operation),
 			Retryable:     false,
-			ResultUnknown: protocol.WriteOperation(operation),
+			ResultUnknown: write,
 			RequestID:     id,
 			Operation:     operation,
 		}
+	}
+}
+
+func neverSent(operation, id string, cause error) *protocol.Error {
+	return &protocol.Error{
+		Code:          protocol.CodeTimeout,
+		Message:       fmt.Sprintf("request %s was cancelled before it was sent: %v", operation, cause),
+		Retryable:     true,
+		ResultUnknown: false,
+		RequestID:     id,
+		Operation:     operation,
+	}
+}
+
+func connectionClosed(operation, id string) *protocol.Error {
+	return &protocol.Error{
+		Code:          protocol.CodeConnectionLost,
+		Message:       fmt.Sprintf("the control connection closed before %s could be sent", operation),
+		Retryable:     protocol.WriteOperation(operation),
+		ResultUnknown: false,
+		RequestID:     id,
+		Operation:     operation,
 	}
 }
 
@@ -340,9 +409,12 @@ func (c *Client) forget(id string) {
 
 // Close terminates the connection and drains the read loop. It is safe to
 // call with a full event channel and with no consumer: closing stop makes the
-// read loop abandon a blocked event delivery instead of deadlocking.
+// read loop abandon a blocked event delivery instead of deadlocking. The
+// deadline refuses to wait for a TLS close_notify on a socket whose peer has
+// stopped reading.
 func (c *Client) Close() error {
 	c.closeOnce.Do(func() {
+		_ = c.conn.SetDeadline(time.Now())
 		close(c.stop)
 		c.conn.Close()
 	})
