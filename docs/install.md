@@ -31,6 +31,17 @@ SHA-256 before writing anything, install the binary atomically (the previous
 binary, if any, is kept as `mc-agent.previous`) and write a manifest at
 `<install-dir>/mc-agent.installed`.
 
+They do not modify PATH unless you pass `--add-to-path` (`-AddToPath`). For the
+current shell:
+
+```bash
+export PATH="$HOME/.mc-agent/bin:$PATH"        # Linux/macOS
+```
+
+```powershell
+$env:Path = "$env:LOCALAPPDATA\mc-agent\bin;$env:Path"   # Windows
+```
+
 Default install directories:
 
 | Platform | Default | State directory |
