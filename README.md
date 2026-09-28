@@ -24,18 +24,43 @@ the only one that can snapshot entity tick order.
 See **[docs/toolkit.md](docs/toolkit.md)** for the install-and-use guide and
 the full tool reference.
 
-> **Go runtime (bridge #11) and MCP removal (bridge #12).** The product
-> CLI/daemon is the single Go binary in **[go/](go/README.md)**: `mc-agent
-> daemon ...`, `mc-agent capabilities|state|command|events|...`, the
-> authenticated same-port TLS transport plus the explicit legacy loopback
-> adapter, a token-protected local IPC boundary, an unknown-write ledger, and
-> optional signed webhooks. **MCP is removed**: there is no MCP server, no
-> `mcp` extra, no `mc-bridge mcp` subcommand, and no MCP configuration in the
-> install or smoke paths. The Python bridge in `src/mc_agent_bridge/` remains
-> the explicit legacy path (and the local fork/restore tooling until it is
-> migrated or retired); its local API client now carries the Go daemon's IPC
-> token. The per-operation migration table is in
-> [go/README.md](go/README.md#migration-matrix).
+## Install the product
+
+One Go binary, no Python, no Go toolchain and no MCP at run time. Supported and
+install-verified: Windows amd64, Linux glibc amd64, macOS arm64.
+
+```bash
+# Linux amd64 / macOS arm64
+curl -fsSL https://raw.githubusercontent.com/guajun/mc-agent-bridge/v0.5.0/install/install.sh \
+    | sh -s -- --version 0.5.0 --skill-harness codex
+```
+
+```powershell
+# Windows amd64
+iwr -useb https://raw.githubusercontent.com/guajun/mc-agent-bridge/v0.5.0/install/install.ps1 -OutFile install.ps1
+./install.ps1 -Version 0.5.0 -SkillHarness codex
+```
+
+Then `mc-agent version` and `mc-agent doctor`. Upgrade, uninstall, explicit
+Skill directories and the supported matrix are documented in
+[docs/install.md](docs/install.md) and [docs/release.md](docs/release.md).
+
+> **Go runtime (bridge #11), MCP removal (bridge #12) and release packaging
+> (bridge #13).** The product CLI/daemon is the single Go binary in
+> **[go/](go/README.md)**: `mc-agent daemon ...`,
+> `mc-agent capabilities|state|command|events|...`, the authenticated same-port
+> TLS transport plus the explicit legacy loopback adapter, a token-protected
+> local IPC boundary, an unknown-write ledger, and optional signed webhooks.
+> **MCP is removed**: there is no MCP server, no `mcp` extra, no
+> `mc-bridge mcp` subcommand, and no MCP configuration in the install or smoke
+> paths. The Python bridge in `src/mc_agent_bridge/` remains the explicit
+> legacy path (and the local fork/restore tooling until it is migrated or
+> retired); its local API client now carries the Go daemon's IPC token. The
+> per-operation migration table is in
+> [go/README.md](go/README.md#migration-matrix). Versioned archives,
+> checksums, the pinned Skill bundle and the tested OS/CPU matrix are
+> documented in [docs/release.md](docs/release.md).
+
 
 ## Why a separate daemon
 
