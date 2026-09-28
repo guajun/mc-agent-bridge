@@ -68,10 +68,11 @@ func (a *app) cmdCall(ctx context.Context, args []string) (any, *protocol.Error)
 	flags.SetOutput(io.Discard)
 	paramsJSON := flags.String("params", "", "JSON object with operation parameters")
 	timeout := flags.Float64("timeout", 0, "operation timeout in seconds")
+	requestIDFlag := flags.String("request-id", "", "stable id for a non-idempotent write")
 	var keyValues multiFlag
 	flags.Var(&keyValues, "param", "key=value parameter (repeatable)")
 	if err := flags.Parse(reorderInterspersed(rest, map[string]bool{"params": true, "timeout": true,
-		"param": true})); err != nil {
+		"param": true, "request-id": true})); err != nil {
 		return nil, protocol.NewError(protocol.CodeUsage, err.Error())
 	}
 	params := map[string]any{}
@@ -91,7 +92,17 @@ func (a *app) cmdCall(ctx context.Context, args []string) (any, *protocol.Error)
 	if *timeout > 0 {
 		envelope["timeoutSeconds"] = *timeout
 	}
-	return a.daemonCall(ctx, "call", envelope)
+	requestID := *requestIDFlag
+	if requestID != "" && len(requestID) > 128 {
+		return nil, protocol.NewError(protocol.CodeBadRequest, "request id must be 1..128 characters")
+	}
+	if requestID == "" && protocol.WriteOperation(operation) {
+		requestID = a.newRequestID()
+	}
+	if requestID != "" {
+		envelope["requestId"] = requestID
+	}
+	return a.daemonCallID(ctx, "call", envelope, requestID)
 }
 
 func parseScalar(value string) any {
@@ -120,15 +131,22 @@ func (m *multiFlag) Set(value string) error {
 }
 
 // cmdEvents replays the daemon buffer and optionally follows new events.
+//
+// The cursor is a (streamId, seq) pair: streamId binds the sequence to one
+// daemon run, so a stale cursor after a daemon restart is reported as a reset
+// instead of silently returning nothing. --follow subscribes first, pages the
+// whole replay (not just one page), then switches to live events with seq
+// de-duplication, category and target filtering, and an explicit gap marker.
 func (a *app) cmdEvents(ctx context.Context, args []string) (any, *protocol.Error) {
 	flags := flag.NewFlagSet("events", flag.ContinueOnError)
 	flags.SetOutput(io.Discard)
 	since := flags.Int64("since", 0, "last seen daemon sequence")
-	limit := flags.Int("limit", 200, "maximum events to replay")
+	limit := flags.Int("limit", 200, "maximum events per replay page")
 	category := flags.String("category", "", "category filter")
 	follow := flags.Bool("follow", false, "keep streaming new events")
+	streamID := flags.String("stream-id", "", "daemon stream id the cursor belongs to")
 	if err := flags.Parse(reorderInterspersed(args, map[string]bool{"since": true, "limit": true,
-		"category": true})); err != nil {
+		"category": true, "stream-id": true})); err != nil {
 		return nil, protocol.NewError(protocol.CodeUsage, err.Error())
 	}
 	client, failure := a.connectDaemon()
@@ -136,40 +154,123 @@ func (a *app) cmdEvents(ctx context.Context, args []string) (any, *protocol.Erro
 		return nil, failure
 	}
 	defer client.Close()
-	params := map[string]any{"since": *since, "limit": *limit}
-	if *category != "" {
-		params["category"] = *category
+
+	pageParams := func(cursor int64, cursorStream string) map[string]any {
+		params := map[string]any{"since": cursor, "limit": *limit, "streamId": cursorStream}
+		if *category != "" {
+			params["category"] = *category
+		}
+		if a.target != "" {
+			params["target"] = a.target
+		}
+		return params
 	}
-	replay, failure := client.Call(ctx, "events", params)
-	if failure != nil {
+
+	if !*follow {
+		return client.Call(ctx, "events", pageParams(*since, *streamID))
+	}
+
+	// Subscribe before replaying so nothing is lost between the snapshot and
+	// the live stream; the server confirms the subscription synchronously.
+	subscription := []string{"*"}
+	if *category != "" {
+		subscription = []string{*category}
+	}
+	if _, failure := client.Call(ctx, "subscribe", map[string]any{"events": subscription}); failure != nil {
 		return nil, failure
 	}
-	if !*follow {
-		return replay, nil
-	}
-	object, _ := replay.(map[string]any)
-	if events, ok := object["events"].([]any); ok {
-		for _, event := range events {
-			a.print(event)
+
+	cursor := *since
+	expectedStream := *streamID
+	var lastSeq int64
+	for {
+		result, failure := client.Call(ctx, "events", pageParams(cursor, expectedStream))
+		if failure != nil {
+			return nil, failure
+		}
+		object, _ := result.(map[string]any)
+		stream, _ := object["streamId"].(string)
+		if expectedStream == "" {
+			expectedStream = stream
+		}
+		if object["reset"] == true || (expectedStream != "" && stream != expectedStream) {
+			a.print(gapMarker(stream, 0, lastSeq, true, true))
+			expectedStream = stream
+			cursor = 0
+			lastSeq = 0
+			continue
+		}
+		if object["dropped"] == true {
+			a.print(gapMarker(stream, 0, lastSeq, true, false))
+		}
+		if events, ok := object["events"].([]any); ok {
+			for _, entry := range events {
+				a.print(entry)
+				if seq, ok := eventSeq(entry); ok && seq > lastSeq {
+					lastSeq = seq
+				}
+			}
+		}
+		if next, ok := numberAsInt64(object["next"]); ok {
+			cursor = next
+		}
+		if object["truncated"] != true {
+			break
 		}
 	}
-	if _, failure := client.Call(ctx, "subscribe", map[string]any{"events": []string{"*"}}); failure != nil {
-		return nil, failure
-	}
-	streamId, _ := object["streamId"].(string)
 	a.print(map[string]any{"type": "stream", "event": "following", "data": map[string]any{
-		"streamId": streamId, "next": object["next"], "dropped": object["dropped"]}})
+		"streamId": expectedStream, "lastSeq": lastSeq}})
 	for {
 		select {
 		case event, ok := <-client.Events():
 			if !ok {
 				return nil, protocol.NewError(protocol.CodeConnectionLost, "the daemon connection closed")
 			}
+			if a.target != "" {
+				if value, _ := event.Data["target"].(string); value != a.target {
+					continue
+				}
+			}
+			seq, hasSeq := eventSeq(event.Data)
+			if hasSeq && seq <= lastSeq {
+				continue // already delivered by the replay
+			}
+			if hasSeq && lastSeq > 0 && seq > lastSeq+1 {
+				a.print(gapMarker(expectedStream, lastSeq+1, seq-1, true, false))
+			}
 			a.print(event.Data)
+			if hasSeq {
+				lastSeq = seq
+			}
 		case <-ctx.Done():
 			return nil, nil
 		}
 	}
+}
+
+func gapMarker(stream string, from, to int64, dropped, reset bool) map[string]any {
+	return map[string]any{"type": "stream", "event": "gap", "data": map[string]any{
+		"streamId": stream, "from": from, "to": to, "dropped": dropped, "reset": reset}}
+}
+
+func eventSeq(value any) (int64, bool) {
+	object, ok := value.(map[string]any)
+	if !ok {
+		return 0, false
+	}
+	return numberAsInt64(object["seq"])
+}
+
+func numberAsInt64(value any) (int64, bool) {
+	switch typed := value.(type) {
+	case float64:
+		return int64(typed), true
+	case int64:
+		return typed, true
+	case int:
+		return int64(typed), true
+	}
+	return 0, false
 }
 
 // cmdConvenience maps the ergonomic subcommands onto daemon operations.
@@ -305,10 +406,15 @@ func (a *app) cmdConvenience(ctx context.Context, command string, args []string)
 	if *timeout > 0 {
 		envelope["timeoutSeconds"] = *timeout
 	}
-	return a.daemonCall(ctx, "call", envelope)
+	requestID := ""
+	if protocol.WriteOperation(operation) {
+		requestID = a.newRequestID()
+	}
+	if requestID != "" {
+		envelope["requestId"] = requestID
+	}
+	return a.daemonCallID(ctx, "call", envelope, requestID)
 }
-
-// followEvents is kept for scripts that expect a blocking stream API.
 func (a *app) followEvents(ctx context.Context) error {
 	signalCtx, cancel := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
 	defer cancel()

@@ -34,7 +34,9 @@ func (d *Daemon) dispatch(ctx context.Context, method string, params map[string]
 		since := int64Param(params, "since", 0)
 		limit := intParam(params, "limit", 200)
 		category := stringParam(params, "category")
-		return d.recentEvents(since, limit, category), nil
+		target := stringParam(params, "target")
+		cursorStream := stringParam(params, "streamId")
+		return d.recentEvents(since, limit, category, target, cursorStream), nil
 	case "requests":
 		return map[string]any{
 			"unknownWrites": d.unknown.List(),
@@ -57,7 +59,7 @@ func (d *Daemon) dispatch(ctx context.Context, method string, params map[string]
 	if protocol.KnownOperation(method) {
 		inner := make(map[string]any, len(params))
 		for key, value := range params {
-			if key == "target" {
+			if key == "target" || key == "requestId" {
 				continue
 			}
 			inner[key] = value
@@ -72,6 +74,7 @@ func (d *Daemon) dispatch(ctx context.Context, method string, params map[string]
 func (d *Daemon) route(ctx context.Context, envelope map[string]any, operation string,
 	params map[string]any) (any, *protocol.Error) {
 	targetName := stringParam(envelope, "target")
+	requestID := stringParam(envelope, "requestId")
 	if params == nil {
 		params = map[string]any{}
 	}
@@ -80,7 +83,7 @@ func (d *Daemon) route(ctx context.Context, envelope map[string]any, operation s
 		ctx, cancel = context.WithTimeout(ctx, time.Duration(timeout*float64(time.Second)))
 		defer cancel()
 	}
-	return d.call(ctx, targetName, operation, params)
+	return d.callWithID(ctx, targetName, operation, params, requestID)
 }
 
 func (d *Daemon) targetsPayload() map[string]any {

@@ -546,8 +546,17 @@ func (ts *targetSession) stop() {
 	}
 }
 
-// call routes one operation to a target session.
+// call routes one operation to a target session with a daemon-generated id.
 func (d *Daemon) call(ctx context.Context, targetName, operation string, params map[string]any) (any, *protocol.Error) {
+	return d.callWithID(ctx, targetName, operation, params, "")
+}
+
+// callWithID routes one operation. A caller-provided requestID (the CLI/IPC
+// path) becomes the end-to-end write identity: the same value is persisted in
+// the recovery ledger and sent to the mod, so a crash or a lost reply can be
+// reconciled against exactly that write.
+func (d *Daemon) callWithID(ctx context.Context, targetName, operation string, params map[string]any,
+	requestID string) (any, *protocol.Error) {
 	if params == nil {
 		params = map[string]any{}
 	}
@@ -591,6 +600,9 @@ func (d *Daemon) call(ctx context.Context, targetName, operation string, params 
 		}
 		return result, nil
 	}
+	if requestID != "" && len(requestID) > 128 {
+		return nil, protocol.NewError(protocol.CodeBadRequest, "request id must be 1..128 characters")
+	}
 
 	// Persist the request identity before it can leave the process. A crash
 	// after this point leaves a visible unknown write; a persistence failure
@@ -599,7 +611,9 @@ func (d *Daemon) call(ctx context.Context, targetName, operation string, params 
 	if tokenErr != nil && target.Transport != protocol.TransportLegacy {
 		return nil, protocol.NewError(protocol.CodeUnauthorized, tokenErr.Error())
 	}
-	requestID := adapter.NextRequestID()
+	if requestID == "" {
+		requestID = adapter.NextRequestID()
+	}
 	if requestID == "" {
 		return nil, protocol.NewError(protocol.CodeInternal,
 			"the session cannot allocate a request id; refusing to send a non-idempotent write")
@@ -743,6 +757,11 @@ func (d *Daemon) markUnresolved(entry UnknownWrite, message string) {
 func (d *Daemon) ingest(target string, payload map[string]any) {
 	eventType, _ := payload["type"].(string)
 	category := protocol.Categorize(eventType)
+
+	// Sequence assignment, the replay ring and the fan-out are one critical
+	// section: two targets or goroutines can never deliver seq 2 before seq 1,
+	// and a page boundary taken here can never advance past an unseen event.
+	d.eventsMu.Lock()
 	sequence := d.eventSeq.Add(1)
 	event := make(map[string]any, len(payload)+6)
 	for key, value := range payload {
@@ -754,27 +773,37 @@ func (d *Daemon) ingest(target string, payload map[string]any) {
 	event["category"] = category
 	event["receivedAt"] = time.Now().UnixMilli()
 	event["target"] = target
-
-	d.eventsMu.Lock()
 	d.eventRing = append(d.eventRing, event)
 	if len(d.eventRing) > d.bufferSize {
 		d.eventRing = d.eventRing[len(d.eventRing)-d.bufferSize:]
 	}
-	d.eventsMu.Unlock()
-
 	if d.ipcServer != nil {
 		d.ipcServer.Broadcast(category, event)
 	}
 	if d.webhook != nil {
 		d.webhook.Enqueue(event)
 	}
+	d.eventsMu.Unlock()
 }
 
 // recentEvents mirrors the Python daemon's events method.
-func (d *Daemon) recentEvents(since int64, limit int, category string) map[string]any {
+func (d *Daemon) recentEvents(since int64, limit int, category, target string, cursorStream string) map[string]any {
 	d.eventsMu.Lock()
+	// The boundary is read under the same lock that assigns sequences: an
+	// empty page can never advance past an event that was not yet appended.
+	lastSeq := d.eventSeq.Load()
 	ring := append([]map[string]any(nil), d.eventRing...)
 	d.eventsMu.Unlock()
+	reset := cursorStream != "" && cursorStream != d.streamID
+	if since > lastSeq {
+		// A cursor ahead of this stream can only come from a previous daemon
+		// run (or a corrupted value): report it instead of an empty non-gap
+		// page.
+		reset = true
+	}
+	if reset {
+		since = 0
+	}
 	var oldest int64
 	if len(ring) > 0 {
 		if value, ok := ring[0]["seq"].(int64); ok {
@@ -787,6 +816,11 @@ func (d *Daemon) recentEvents(since int64, limit int, category string) map[strin
 	for _, event := range ring {
 		if category != "" {
 			if value, _ := event["category"].(string); value != category {
+				continue
+			}
+		}
+		if target != "" {
+			if value, _ := event["target"].(string); value != target {
 				continue
 			}
 		}
@@ -806,14 +840,15 @@ func (d *Daemon) recentEvents(since int64, limit int, category string) map[strin
 		events = events[:limit]
 		truncated = true
 	}
-	next := d.eventSeq.Load()
+	next := lastSeq
 	if len(events) > 0 {
 		if value, ok := events[len(events)-1]["seq"].(int64); ok {
 			next = value
 		}
 	}
 	return map[string]any{"events": events, "next": next, "dropped": dropped,
-		"truncated": truncated, "streamId": d.streamID}
+		"truncated": truncated, "streamId": d.streamID, "reset": reset,
+		"lastSeq": lastSeq}
 }
 
 func (d *Daemon) status() map[string]any {
