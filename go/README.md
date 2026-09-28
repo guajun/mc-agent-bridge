@@ -5,6 +5,11 @@ harness-facing tool entry point; the daemon owns every connection to the mod
 and never runs a model or manages harness sessions. There is no MCP server and
 no Python runtime requirement.
 
+Release installs (Windows amd64, Linux glibc amd64, macOS arm64), upgrades,
+uninstall and the pinned Toolkit Skill are in
+[../docs/install.md](../docs/install.md); the supported matrix, release assets
+and boundaries are in [../docs/release.md](../docs/release.md).
+
 ```
 agent runtime  <->  mc-agent CLI  --(token-protected loopback IPC)-->
                 mc-agent daemon  --(TLS control protocol | legacy loopback)-->
@@ -137,7 +142,9 @@ next reconnect produces a machine-readable replay/gap report.
 Optional and off by default:
 
 ```bash
-mc-agent daemon start --webhook-url https://receiver.example/hook \
+# webhook flags are accepted by `daemon run` (foreground/supervised);
+# `daemon start` has no webhook flags.
+mc-agent daemon run --webhook-url https://receiver.example/hook \
     --webhook-secret "$SECRET" --webhook-events chat,game,mark,error
 ```
 
@@ -176,7 +183,7 @@ Python bridge 0.4.1 -> Go runtime:
 | `record_start`/`record_stop` | `mc-agent record-start`/`record-stop` | migrated (legacy) |
 | `fork`, `restore`, `verify`, `order`, `mc_fork`, `mc_restore` | - | **not migrated**: refused with `capability_not_supported`; local file snapshots need the daemon host to read the game's world directory. The Python bridge remains the explicit legacy path. |
 | `stop` | `mc-agent daemon stop` | migrated |
-| webhook forwarder | `daemon start --webhook-*` | migrated (same signatures and retry semantics) |
+| webhook forwarder | `daemon run --webhook-*` | migrated (same signatures and retry semantics) |
 | MCP server | - | removed: config must use the CLI |
 
 Remote operations never interpret the mod's `worldDir` (or any server path) as
