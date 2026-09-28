@@ -1,41 +1,41 @@
 # Harness-neutral Toolkit guide
 
-This is the install-and-use guide for `mc-agent-bridge` as a Toolkit: a small
-process that runs next to a Minecraft server and exposes the game over MCP or
-the CLI. It contains no model calls, no agent loop, no conversation state and
-no Harness-specific behavior, so the same install serves Hermes, Codex, Claude
-Code, a shell script, or anything else that can speak MCP or run a command.
+This is the legacy Python guide for `mc-agent-bridge` as a Toolkit. The
+product CLI/daemon is the Go binary in [go/README.md](../go/README.md); MCP was
+removed in bridge #12 and this package remains for the legacy daemon and the
+local `fork`/`restore` tooling until it is migrated or retired.
 
-MCP is the preferred structured call surface. The CLI is the fallback for
-Harnesses that only have terminal access; both call the same daemon methods and
-return the same JSON.
+A Toolkit process runs next to a Minecraft server and exposes the game over a
+small JSON surface. It contains no model calls, no agent loop, no conversation
+state and no Harness-specific behavior, so the same install serves Hermes,
+Codex, Claude Code, a shell script, or anything else that can run a command.
+
+The structured call surface is the Go CLI (`mc-agent ...`); the Python
+`mc-bridge` commands below are the legacy equivalent and call the same daemon
+methods with the same JSON shape.
 
 ```
- MCP client / CLI / loop  <->  bridge daemon  <->  server-vantage mod  <->  server
- (any Harness, no SDKs)        this repo          mc-agent-interface      (Fabric)
+    Go CLI / legacy CLI  <->  bridge daemon  <->  mod  <->  server
+    (any Harness)              (no SDKs)        mc-agent-interface (Fabric)
 ```
 
 ## 1. Requirements
 
-* Python 3.11 or newer on the machine that runs the game server.
-* The `mc-agent-interface` Fabric mod, version 0.5.x, in the same environment
-  as the server: a dedicated server, or the integrated server inside a
-  single-player client.
+* Python 3.11 or newer on the machine that runs the game server (legacy path
+  only; the Go binary has no Python requirement).
+* The `mc-agent-interface` Fabric mod, version 0.6.x+ for the legacy loopback
+  protocol, or 0.8.0+ for the authenticated same-port control transport used
+  by the Go runtime.
 * Nothing else. No model API key, no Harness SDK, no agent framework.
 
 ## 2. Install
 
 ```bash
-# core: daemon, CLI, local JSON-lines API, CLI discovery
+# legacy Python daemon, CLI, local JSON-lines API and discovery
 pip install -e /path/to/mc-agent-bridge
-
-# plus the optional MCP front-end
-pip install -e "/path/to/mc-agent-bridge[mcp]"
 ```
 
-Or, once published: `pip install "mc-agent-bridge[mcp]"`. The `[mcp]` extra
-is only needed for Harnesses that launch the MCP server; CLI-only Harnesses can
-skip it.
+The Go runtime is a single binary; see [go/README.md](../go/README.md).
 
 ## 3. Start the game endpoint
 
@@ -67,7 +67,7 @@ mc-bridge run
 ```
 
 The daemon owns the one connection to the mod and re-serves it on loopback
-(JSON-lines) for the CLI and the MCP front-end. It reads the port file on every
+(JSON-lines) for the CLI and agent loops. It reads the port file on every
 (re)connect, so starting it before the game is fine: it prints a hint and keeps
 watching until the file appears.
 
@@ -108,40 +108,28 @@ There is no public listener and nothing to expose to the Internet. Anyone who
 can reach the local API can run commands as the server's command source, so
 treat the machine as trusted.
 
-## 5. Connect a Harness over MCP
+## 5. Connect a Harness
 
-Any MCP-capable Harness launches the front-end as a stdio server. The
-configuration is always the same shape - a command plus arguments - and needs no
-Harness SDK and no API key:
+MCP was removed in bridge #12. Point the Harness at the Go CLI (see
+[go/README.md](../go/README.md)) - a Harness only needs to run commands and
+read JSON - or, for the legacy daemon, at `mc-bridge call ...` / the local
+JSON-lines API. Nothing needs a Harness SDK or an API key.
 
-```json
-{
-  "mcpServers": {
-    "minecraft": {
-      "command": "mc-bridge",
-      "args": ["mcp"],
-      "env": { "MC_AGENT_API_PORT": "8765" }
-    }
-  }
-}
-```
+If the legacy daemon runs in another shell or as a service, point the caller at
+its loopback API; if the Harness owns the daemon too, start `mc-bridge run` as
+a separate long-lived process first.
 
-If the Harness runs the daemon in another shell, keep this minimal. If the
-Harness should own the daemon too, it can start `mc-bridge run` as a separate
-long-lived process first; MCP servers are per-session, the daemon is not.
-
-At startup the front-end asks the daemon which operations the connected mod
-advertises and registers only those tools. Before the daemon answers it
-registers the documented default **server** surface: no `mc_chat`, `mc_screen`,
-`mc_connect`, `mc_world`, `mc_lan` or `mc_record_*`. That is intentional: those
-are client-vantage operations and must not be advertised as if they worked
-against a server. If you really are migrating a client-vantage setup, start the
-front-end with `mc-bridge mcp --vantage client`.
+The Go runtime filters the operation surface by the connected mod's advertised
+capabilities; the legacy daemon does the same in `capabilities`. Client-vantage
+operations (`chat`, `screen`, `connect`, `world`, `lan`, `record_*`) are never
+advertised against a server vantage; use `--vantage client` only for an
+explicit legacy client endpoint.
 
 ### Suggested first call
 
 ```text
-mc_capabilities()
+mc-agent capabilities
+# or, against the legacy daemon: mc-bridge call capabilities
 ```
 
 returns the raw CAPS list from the mod plus the filtered
@@ -175,13 +163,13 @@ boundary - request line, reply normalization, aliases - lives in
 `src/mc_agent_bridge/adapters.py`. The released mod reports the entity record
 under `player` and the ray under a separate top-level `view`; the adapter merges
 the ray into `player.view` so one accessor works for every reply shape. The
-raw mod reply is authoritative; `mc_capabilities` confirms what the connection
-serves.
+raw mod reply is authoritative; a `capabilities` call confirms what the
+connection serves.
 
-## 6. CLI fallback
+## 6. Legacy CLI
 
-Every MCP tool has a daemon method, and every daemon method has a CLI call that
-prints machine-readable JSON:
+Every daemon method has a `mc-bridge` call that prints machine-readable JSON
+(the Go CLI is the product path; the tables in `go/README.md` map each command):
 
 ```bash
 mc-bridge call status
@@ -240,7 +228,7 @@ the current connection supports.
 | `toolkit operation 'chat' is not available` | You are on the server vantage, which has no client chat/screen/connect/world/lan/record. Use `command_output` with `/say`, or run the legacy client endpoint with `--vantage client`. |
 | `requires mc-agent-interface-mod#1/#2` | The mod build predates the per-player context / context-bundle capability. Use `mc_state` for a global player list, and `mc_events` for chat; the tool appears when the mod updates. |
 | `no bridge daemon on 127.0.0.1:8765` | Start `mc-bridge run` first, or point the call at the right `--api-port`. |
-| MCP tool list lacks a tool | The connected mod does not advertise its capability. Call `mc_capabilities` and read `surface.unsupported`; see the adaptive-operations note above. |
+| MCP tool list lacks a tool | This doc's MCP front-end no longer exists (bridge #12). Use the Go CLI's `mc-agent schema`/`capabilities` and read `surface.unsupported`; see the adaptive-operations note above. |
 | `dropped: true` in an `events` reply | The ring buffer discarded events you never read. Poll more often or raise the daemon's `--buffer`. |
 | Port moves after a game restart | Expected: the mod picks the next free port. The daemon re-reads `port.txt` on every reconnect; nothing to do. |
 

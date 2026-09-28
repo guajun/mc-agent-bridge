@@ -1,7 +1,7 @@
 """Bridge daemon: the single process that owns the connection to the interface mod.
 
 The daemon is deliberately the *only* component that talks to the game. The CLI,
-the MCP server and any agent loop are all thin clients of the small JSON-lines
+any agent loop and the Go CLI are all thin clients of the small JSON-lines
 API it serves on loopback, so agent runtimes can be added, restarted or swapped
 without ever touching the Minecraft process.
 
@@ -372,7 +372,7 @@ class BridgeDaemon:
         The server vantage collects command output in the ``cmd_ack`` itself
         (and mirrors it as game events); the client vantage answers only with
         an ack, so the output is collected from the event buffer instead. One
-        method gives MCP and the CLI the same behavior.
+        method gives the legacy client and the CLI the same behavior.
         """
         command = str(params.get("command") or "").strip()
         if not command:

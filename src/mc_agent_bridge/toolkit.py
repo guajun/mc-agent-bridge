@@ -8,7 +8,7 @@ of a server-vantage session, and gates server-vantage operations (per-player
 context, chat-time context bundles) on the capability the mod advertises.
 
 Nothing here talks to the game. These are pure functions over a capability set,
-shared by the daemon, the CLI and the MCP front-end.
+shared by the daemon, the CLI and the Go runtime.
 """
 
 from __future__ import annotations
@@ -157,7 +157,7 @@ OPERATION_BY_NAME: dict[str, Operation] = {operation.name: operation for operati
 class UnsupportedCapability(RuntimeError):
     """The connected mod does not advertise a capability an operation needs.
 
-    Subclasses :class:`RuntimeError` so the local API, CLI and MCP layers keep
+    Subclasses :class:`RuntimeError` so the local API and CLI keep
     their existing error path and the message reaches the caller verbatim.
     """
 

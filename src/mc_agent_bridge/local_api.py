@@ -1,4 +1,4 @@
-"""Local JSON-lines API used by the daemon, MCP server, agent loop and CLI."""
+"""Local JSON-lines API used by the daemon, the agent loop and the CLI."""
 
 from __future__ import annotations
 
