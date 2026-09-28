@@ -282,9 +282,18 @@ func TestCloseWithFullEventChannelIsBounded(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Never consume Events(): the 1024-slot channel fills and the read loop
-	// must still be able to abandon delivery on Close.
-	for index := 0; index < 3000; index++ {
-		server.Push("mark", map[string]any{"text": "flood"})
+	// must still be able to abandon delivery on Close. The producer must run
+	// in its own goroutine: pushing from the test goroutine would block on the
+	// stalled socket before Close is ever called (the test hung on CI Windows
+	// exactly that way).
+	go func() {
+		for index := 0; index < 3000; index++ {
+			server.Push("mark", map[string]any{"text": "flood"})
+		}
+	}()
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) && len(client.Events()) < 1000 {
+		time.Sleep(20 * time.Millisecond)
 	}
 	done := make(chan error, 1)
 	go func() { done <- client.Close() }()
