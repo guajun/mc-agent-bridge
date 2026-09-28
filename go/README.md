@@ -111,11 +111,26 @@ tracks the server's `runId` and event sequence and reports:
 - `request_resolved` for a write whose outcome became known after a reconnect.
 
 Non-idempotent writes (`command`, `mark`, `snapshot`, client `chat`/`world`)
-are never resent automatically. A write whose reply is lost is recorded in
-`unknown_writes.json` and resolved with the server's `request_status` when the
-link returns; if the server has no record (for example a game restart), the
-entry stays visible as `unresolved` and the CLI reports the request id instead
-of pretending it succeeded.
+are never resent automatically. The daemon allocates a request id that is
+unique across processes, clients and reconnects (`<random nonce>-<counter>`),
+persists the request in `unknown_writes.json` **before it can leave the
+process**, and resolves it with the server's `request_status` when the link
+returns; if the server has no record (for example a game restart) or the
+credential/instance/run scope does not match, the entry stays visible as
+`unresolved` and the CLI reports the request id instead of pretending it
+succeeded. If the ledger cannot be persisted, the daemon refuses to send the
+write rather than losing recovery data. A request that timed out before the
+server claimed it is cancelled and safe to retry; one that was already running
+keeps its ledger entry until the server reports the final state.
+
+Event cursors are stored per target together with the `(instanceId, runId)`
+they belong to and are only offered back to the server with that run id, so a
+reconnected daemon can never present a previous run's high-water mark to a
+restarted game. `mc-agent events` returns the oldest events after `since`, so
+`next` (the highest delivered sequence) is a usable continuation, and reports
+`truncated: true` when the caller must ask again; `dropped` is reserved for
+buffer eviction. A target whose reader cannot drain its socket is closed so the
+next reconnect produces a machine-readable replay/gap report.
 
 ## Webhook forwarding
 
