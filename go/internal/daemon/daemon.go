@@ -55,6 +55,14 @@ type Daemon struct {
 
 	eventsMu  sync.Mutex
 	eventRing []map[string]any
+	// Eviction bookkeeping: explicit loss evidence for cursors that fell
+	// behind the ring. The per-category/target/pair maxima let a filtered
+	// cursor report dropped only when events it actually asked for are gone
+	// (an unrelated category being evicted is not a loss for that cursor).
+	evictedThrough  int64
+	evictedCategory map[string]int64
+	evictedTarget   map[string]int64
+	evictedPair     map[string]int64
 
 	streamID  string
 	eventSeq  atomic.Int64
@@ -116,16 +124,19 @@ func Run(ctx context.Context, options Options) error {
 	}
 
 	daemon := &Daemon{
-		home:           home,
-		apiAddress:     options.APIAddress,
-		bufferSize:     options.BufferSize,
-		reconnectDelay: options.ReconnectDelay,
-		logger:         options.Logger,
-		targets:        targets,
-		sessions:       map[string]*targetSession{},
-		streamID:       randomHex(16),
-		startedAt:      time.Now(),
-		stopCh:         make(chan struct{}),
+		home:            home,
+		apiAddress:      options.APIAddress,
+		bufferSize:      options.BufferSize,
+		reconnectDelay:  options.ReconnectDelay,
+		logger:          options.Logger,
+		targets:         targets,
+		sessions:        map[string]*targetSession{},
+		evictedCategory: map[string]int64{},
+		evictedTarget:   map[string]int64{},
+		evictedPair:     map[string]int64{},
+		streamID:        randomHex(16),
+		startedAt:       time.Now(),
+		stopCh:          make(chan struct{}),
 	}
 
 	if options.Fake {
@@ -792,6 +803,9 @@ func (d *Daemon) ingest(target string, payload map[string]any) {
 	event["target"] = target
 	d.eventRing = append(d.eventRing, event)
 	if len(d.eventRing) > d.bufferSize {
+		for _, evicted := range d.eventRing[:len(d.eventRing)-d.bufferSize] {
+			d.recordEviction(evicted)
+		}
 		d.eventRing = d.eventRing[len(d.eventRing)-d.bufferSize:]
 	}
 	if d.ipcServer != nil {
@@ -801,6 +815,66 @@ func (d *Daemon) ingest(target string, payload map[string]any) {
 		d.webhook.Enqueue(event)
 	}
 	d.eventsMu.Unlock()
+}
+
+// evictedKeyLimit bounds the per-filter eviction tables. Categories and
+// dedicated-mode targets are naturally few; the cap only guards a hostile or
+// unusual peer from growing the tables without bound.
+const evictedKeyLimit = 256
+
+// rememberEvicted keeps the highest evicted sequence per key; when the table
+// is full the oldest key is replaced (a newer eviction is the more useful
+// loss evidence).
+func rememberEvicted(table map[string]int64, key string, sequence int64) {
+	if sequence <= table[key] {
+		return
+	}
+	if len(table) >= evictedKeyLimit {
+		oldestKey := ""
+		oldest := int64(1<<63 - 1)
+		for candidate, value := range table {
+			if value < oldest {
+				oldestKey, oldest = candidate, value
+			}
+		}
+		if oldest >= sequence {
+			return
+		}
+		delete(table, oldestKey)
+	}
+	table[key] = sequence
+}
+
+// recordEviction remembers what left the ring so a cursor behind the ring can
+// be told exactly which of the caller's categories/targets are unrecoverable.
+func (d *Daemon) recordEviction(event map[string]any) {
+	if d.evictedCategory == nil {
+		d.evictedCategory = map[string]int64{}
+	}
+	if d.evictedTarget == nil {
+		d.evictedTarget = map[string]int64{}
+	}
+	if d.evictedPair == nil {
+		d.evictedPair = map[string]int64{}
+	}
+	sequence, ok := event["seq"].(int64)
+	if !ok {
+		return
+	}
+	if sequence > d.evictedThrough {
+		d.evictedThrough = sequence
+	}
+	category, _ := event["category"].(string)
+	target, _ := event["target"].(string)
+	if category != "" {
+		rememberEvicted(d.evictedCategory, category, sequence)
+	}
+	if target != "" {
+		rememberEvicted(d.evictedTarget, target, sequence)
+	}
+	if category != "" && target != "" {
+		rememberEvicted(d.evictedPair, category+"\x00"+target, sequence)
+	}
 }
 
 // recentEvents mirrors the Python daemon's events method.
@@ -821,14 +895,22 @@ func (d *Daemon) recentEvents(since int64, limit int, category, target string, c
 	if reset {
 		since = 0
 	}
-	var oldest int64
-	if len(ring) > 0 {
-		if value, ok := ring[0]["seq"].(int64); ok {
-			oldest = value
+	// dropped means events the caller asked for were evicted after its
+	// cursor. The per-filter maxima keep unrelated evictions from producing
+	// false gap markers on a filtered stream.
+	dropped := false
+	if since > 0 {
+		switch {
+		case category != "" && target != "":
+			dropped = d.evictedPair[category+"\x00"+target] > since
+		case category != "":
+			dropped = d.evictedCategory[category] > since
+		case target != "":
+			dropped = d.evictedTarget[target] > since
+		default:
+			dropped = d.evictedThrough > since
 		}
 	}
-	// dropped means the ring no longer reaches the requested cursor.
-	dropped := since > 0 && oldest > 0 && oldest > since+1
 	events := make([]map[string]any, 0, len(ring))
 	for _, event := range ring {
 		if category != "" {

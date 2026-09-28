@@ -120,3 +120,38 @@ func TestRecentEventsFiltersAndReset(t *testing.T) {
 		t.Fatalf("a different stream id must report a reset: %+v", otherStream)
 	}
 }
+
+// A cursor behind the ring reports dropped only when events it actually asked
+// for were evicted; unrelated categories/targets must not produce a false gap.
+func TestEvictionReportsDroppedOnlyForRequestedFilters(t *testing.T) {
+	daemon := newEventTestDaemon(t, 3)
+	daemon.ingest("t1", map[string]any{"type": "mark"}) // seq1 mark/t1
+	daemon.ingest("t1", map[string]any{"type": "chat"}) // seq2 chat/t1
+	daemon.ingest("t2", map[string]any{"type": "mark"}) // seq3 mark/t2
+	daemon.ingest("t1", map[string]any{"type": "chat"}) // seq4 chat/t1 evicts seq1
+	daemon.ingest("t2", map[string]any{"type": "mark"}) // seq5 mark/t2 evicts seq2
+	daemon.ingest("t1", map[string]any{"type": "mark"}) // seq6 mark/t1 evicts seq3
+	cases := []struct {
+		since    int64
+		category string
+		target   string
+		dropped  bool
+		reason   string
+	}{
+		{0, "mark", "", false, "cursor 0 asks for the whole ring"},
+		{2, "", "", true, "unfiltered eviction beyond the cursor"},
+		{2, "mark", "", true, "an evicted mark event was after the cursor"},
+		{2, "chat", "", false, "the evicted chat event sits at the cursor"},
+		{2, "", "t2", true, "an evicted t2 event was after the cursor"},
+		{2, "mark", "t2", true, "an evicted mark/t2 event was after the cursor"},
+		{2, "mark", "t1", false, "only a mark/t1 event at the cursor was evicted"},
+		{3, "mark", "", false, "eviction is not beyond this cursor"},
+	}
+	for _, item := range cases {
+		page := daemon.recentEvents(item.since, 100, item.category, item.target, "")
+		if page["dropped"] != item.dropped {
+			t.Fatalf("since=%d category=%q target=%q dropped=%v want %v (%s)",
+				item.since, item.category, item.target, page["dropped"], item.dropped, item.reason)
+		}
+	}
+}
