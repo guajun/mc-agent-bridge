@@ -1,3 +1,9 @@
 * text=auto
 *.jar binary
 *.png binary
+
+# Go sources are line-ending sensitive for gofmt; keep LF on every platform.
+*.go text eol=lf
+go.mod text eol=lf
+go.sum text eol=lf
+*.yml text eol=lf
