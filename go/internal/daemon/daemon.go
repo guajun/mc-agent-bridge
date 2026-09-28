@@ -82,6 +82,7 @@ type targetSession struct {
 	generation         int64
 	everConnect        bool
 	stopCh             chan struct{}
+	finished           chan struct{}
 	stopped            bool
 }
 
@@ -290,7 +291,8 @@ func (d *Daemon) startAllSessions() {
 				Target:    name,
 				Transport: target.Transport,
 			},
-			stopCh: make(chan struct{}),
+			stopCh:   make(chan struct{}),
+			finished: make(chan struct{}),
 		}
 		d.sessions[name] = targetSession
 		go targetSession.run()
@@ -298,6 +300,7 @@ func (d *Daemon) startAllSessions() {
 }
 
 func (ts *targetSession) run() {
+	defer close(ts.finished)
 	daemon := ts.daemon
 	for {
 		select {
@@ -530,9 +533,16 @@ func (ts *targetSession) stop() {
 	adapter := ts.adapter
 	ts.mu.Unlock()
 	// Close outside the lock: session Close may wait for a pump that needs
-	// this lock to record the terminal state.
+	// this lock to record the terminal state. Then join the loop so a daemon
+	// shutdown (or target reload) cannot leave a goroutine still writing the
+	// cursor/ledger after Run returns.
 	if adapter != nil {
 		adapter.Close()
+	}
+	select {
+	case <-ts.finished:
+	case <-time.After(5 * time.Second):
+		ts.daemon.logger("target %s: session loop did not stop after close", ts.target.Name)
 	}
 }
 
