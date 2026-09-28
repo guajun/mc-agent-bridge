@@ -121,7 +121,12 @@ credential/instance/run scope does not match, the entry stays visible as
 succeeded. If the ledger cannot be persisted, the daemon refuses to send the
 write rather than losing recovery data. A request that timed out before the
 server claimed it is cancelled and safe to retry; one that was already running
-keeps its ledger entry until the server reports the final state.
+keeps its ledger entry until the server reports the final state. A socket write
+that failed after the send attempt began is classified result-unknown (the
+partial frame may have been delivered) and also keeps its ledger entry; only a
+request the transport knows was never sent is marked retryable and removed.
+The writer slot only serializes framing/flushing, so a slow reply never blocks
+other requests.
 
 Event cursors are stored per target together with the `(instanceId, runId)`
 they belong to and are only offered back to the server with that run id, so a
