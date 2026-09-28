@@ -11,8 +11,9 @@ dist/
 *.log
 *.pid
 port.txt
-mc-agent/
-samples/
+# the root game-dir runtime folder only; go/cmd/mc-agent is source
+/mc-agent/
+/samples/
 
 .pytest_cache/
 .mypy_cache/

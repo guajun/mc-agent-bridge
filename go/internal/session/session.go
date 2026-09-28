@@ -49,8 +49,16 @@ type RawEvent struct {
 
 // Adapter is one live connection to one target.
 type Adapter interface {
-	// Call runs one operation. It never retries anything by itself.
+	// Call runs one operation with a fresh request id.
 	Call(ctx context.Context, operation string, params map[string]any) (any, *protocol.Error)
+	// CallID runs one operation under a caller-chosen stable id. The daemon
+	// persists that id before the request can leave the process so a crash
+	// cannot lose a possibly-executed non-idempotent write.
+	CallID(ctx context.Context, requestID, operation string, params map[string]any) (any, *protocol.Error)
+	// NextRequestID returns an id unique across processes, reconnects and
+	// clients, so two daemons sharing a credential never collide in the
+	// server's (token, request id) write ledger.
+	NextRequestID() string
 	// Events is the pushed event stream; it closes when the connection ends.
 	Events() <-chan RawEvent
 	// Done closes when the connection ends (for reconnection loops).

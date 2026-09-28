@@ -809,7 +809,7 @@ func (a *app) cmdDoctor(ctx context.Context, args []string) (any, *protocol.Erro
 				continue
 			}
 			checkCtx, cancel := context.WithTimeout(ctx, 8*time.Second)
-			adapter, dialErr := session.DialRemote(checkCtx, target, token, 0)
+			adapter, dialErr := session.DialRemote(checkCtx, target, token, 0, "")
 			cancel()
 			if dialErr != nil {
 				var protocolErr *protocol.Error

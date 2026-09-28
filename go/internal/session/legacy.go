@@ -2,10 +2,13 @@ package session
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"fmt"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/guajun/mc-agent-bridge/internal/config"
@@ -23,8 +26,12 @@ type Legacy struct {
 	state  State
 	events chan RawEvent
 	done   chan struct{}
+	stop   chan struct{}
+	closer sync.Once
 	err    error
 
+	nonce    string
+	nextID   atomic.Uint64
 	sequence int64
 	ring     []bufferedEvent
 }
@@ -59,8 +66,10 @@ func DialLegacy(ctx context.Context, target *config.Target) (*Legacy, error) {
 	session := &Legacy{
 		target: target,
 		client: client,
+		nonce:  "lg-" + legacyNonce(),
 		events: make(chan RawEvent, 1024),
 		done:   make(chan struct{}),
+		stop:   make(chan struct{}),
 		state: State{
 			Target:       target.Name,
 			Transport:    protocol.TransportLegacy,
@@ -98,7 +107,11 @@ func (l *Legacy) pump() {
 			}
 			l.state.LastSeq = seq
 			l.mu.Unlock()
-			l.events <- RawEvent{Seq: seq, Payload: payload}
+			select {
+			case l.events <- RawEvent{Seq: seq, Payload: payload}:
+			case <-l.stop:
+				return
+			}
 		case <-l.client.Done():
 			l.mu.Lock()
 			l.err = l.client.Err()
@@ -106,12 +119,25 @@ func (l *Legacy) pump() {
 			l.state.LastError = l.client.Err().Error()
 			l.mu.Unlock()
 			return
+		case <-l.stop:
+			return
 		}
 	}
 }
 
-// Call maps one operation onto the legacy line protocol.
+// NextRequestID returns an id unique across processes and reconnects.
+func (l *Legacy) NextRequestID() string {
+	return l.nonce + "-" + strconv.FormatUint(l.nextID.Add(1), 10)
+}
+
+// Call maps one operation onto the legacy line protocol with a fresh id.
 func (l *Legacy) Call(ctx context.Context, operation string, params map[string]any) (any, *protocol.Error) {
+	return l.CallID(ctx, l.NextRequestID(), operation, params)
+}
+
+// CallID maps one operation onto the legacy line protocol under a stable id.
+func (l *Legacy) CallID(ctx context.Context, requestID, operation string,
+	params map[string]any) (any, *protocol.Error) {
 	l.mu.Lock()
 	state := l.state
 	l.mu.Unlock()
@@ -142,9 +168,9 @@ func (l *Legacy) Call(ctx context.Context, operation string, params map[string]a
 	case "status":
 		return snapshotMap(state), nil
 	case "command_output":
-		return l.commandOutput(ctx, params)
+		return l.commandOutput(ctx, requestID, params)
 	case "save":
-		result, failure := l.line(ctx, "STATE")
+		result, failure := l.line(ctx, requestID, "save", "STATE")
 		if failure != nil {
 			return nil, failure
 		}
@@ -153,12 +179,17 @@ func (l *Legacy) Call(ctx context.Context, operation string, params map[string]a
 
 	line, failure := legacyLine(operation, params)
 	if failure != nil {
+		failure.RequestID = requestID
+		failure.Operation = operation
 		return nil, failure
 	}
-	return l.line(ctx, line)
+	return l.line(ctx, requestID, operation, line)
 }
 
-func (l *Legacy) line(ctx context.Context, line string) (any, *protocol.Error) {
+// line sends one legacy line and classifies its failure. A write that fails
+// after the bytes left the process is result-unknown: the legacy protocol has
+// no request ledger, so it is never assumed safe to retry.
+func (l *Legacy) line(ctx context.Context, requestID, operation, line string) (any, *protocol.Error) {
 	timeout := 30 * time.Second
 	if strings.HasPrefix(line, "SNAPSHOT") {
 		timeout = 120 * time.Second
@@ -170,16 +201,18 @@ func (l *Legacy) line(ctx context.Context, line string) (any, *protocol.Error) {
 		if strings.Contains(message, "no response") {
 			code = protocol.CodeTimeout
 		}
-		return nil, &protocol.Error{Code: code, Message: message}
+		return nil, &protocol.Error{Code: code, Message: message,
+			RequestID: requestID, Operation: operation,
+			ResultUnknown: protocol.WriteOperation(operation)}
 	}
 	if kind, _ := reply["type"].(string); kind == "error" {
 		return nil, &protocol.Error{Code: protocol.CodeGameError,
-			Message: fmt.Sprint(reply["message"])}
+			Message: fmt.Sprint(reply["message"]), RequestID: requestID, Operation: operation}
 	}
 	return reply, nil
 }
 
-func (l *Legacy) commandOutput(ctx context.Context, params map[string]any) (any, *protocol.Error) {
+func (l *Legacy) commandOutput(ctx context.Context, requestID string, params map[string]any) (any, *protocol.Error) {
 	command := stringParam(params, "command")
 	if command == "" {
 		return nil, protocol.NewError(protocol.CodeBadRequest, `command_output needs a command`)
@@ -187,7 +220,7 @@ func (l *Legacy) commandOutput(ctx context.Context, params map[string]any) (any,
 	l.mu.Lock()
 	cursor := l.sequence
 	l.mu.Unlock()
-	result, failure := l.line(ctx, "CMD "+oneLine(command))
+	result, failure := l.line(ctx, requestID, "command_output", "CMD "+oneLine(command))
 	if failure != nil {
 		return nil, failure
 	}
@@ -262,8 +295,10 @@ func (l *Legacy) State() State {
 	return copy
 }
 
-// Close ends the session.
+// Close ends the session and bounds its exit even when a consumer stopped
+// reading the event channel.
 func (l *Legacy) Close() {
+	l.closer.Do(func() { close(l.stop) })
 	l.client.Close()
 }
 
@@ -382,4 +417,12 @@ func stringValue(values map[string]any, name string) string {
 		return value
 	}
 	return ""
+}
+
+func legacyNonce() string {
+	buffer := make([]byte, 8)
+	if _, err := rand.Read(buffer); err != nil {
+		return strconv.FormatInt(time.Now().UnixNano(), 36)
+	}
+	return hex.EncodeToString(buffer)
 }

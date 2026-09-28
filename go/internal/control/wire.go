@@ -26,11 +26,15 @@ const (
 
 // Hello is the first client frame after the TLS handshake.
 type Hello struct {
-	Type     string     `json:"type"`
-	Protocol int        `json:"protocol"`
-	Token    string     `json:"token"`
-	LastSeq  int64      `json:"lastSeq"`
-	Client   ClientInfo `json:"client"`
+	Type     string `json:"type"`
+	Protocol int    `json:"protocol"`
+	Token    string `json:"token"`
+	LastSeq  int64  `json:"lastSeq"`
+	// RunID is the run the LastSeq cursor belongs to (optional). The server
+	// treats a mismatched cursor as a fresh client so a new game run's events
+	// are never skipped.
+	RunID  string     `json:"runId,omitempty"`
+	Client ClientInfo `json:"client"`
 }
 
 // ClientInfo identifies the daemon to the server (never used for auth).

@@ -40,6 +40,9 @@ type Options struct {
 	Permissions  []string
 	Ops          map[string]OpFunc
 	EventBuffer  int
+	// SilentHello accepts the TLS connection and reads the hello but never
+	// sends a welcome, for handshake-timeout tests.
+	SilentHello bool
 }
 
 // Server is one fake control endpoint.
@@ -141,6 +144,19 @@ func (s *Server) Close() {
 	}
 }
 
+// SetRunID simulates a game restart: a new run id, an empty event stream and
+// an empty write ledger, and every live connection dropped.
+func (s *Server) SetRunID(runID string) {
+	s.mu.Lock()
+	s.options.RunID = runID
+	s.seq = 0
+	s.writeSeq = 0
+	s.ring = nil
+	s.recent = map[string]map[string]any{}
+	s.mu.Unlock()
+	s.DisconnectAll()
+}
+
 // DisconnectAll closes the live control connections but keeps listening. It
 // simulates a dropped link so reconnect/reconciliation paths can be tested.
 func (s *Server) DisconnectAll() {
@@ -230,10 +246,27 @@ func (s *Server) serve(conn net.Conn) {
 		client.flush()
 		return
 	}
+	if s.options.SilentHello {
+		// Read until the peer gives up; never send a welcome.
+		_, _ = client.reader.ReadByte()
+		return
+	}
 	s.mu.Lock()
 	events := make([]map[string]any, 0, len(s.ring))
+	// A cursor from a different run (or one ahead of this run's sequence) is
+	// not usable: the client gets a fresh view and an explicit loss report.
+	lost := false
+	effectiveLastSeq := hello.LastSeq
+	if hello.RunID != "" && hello.RunID != s.options.RunID {
+		effectiveLastSeq = 0
+		lost = true
+	}
+	if effectiveLastSeq > s.seq {
+		effectiveLastSeq = 0
+		lost = true
+	}
 	for _, envelope := range s.ring {
-		if seq, _ := envelope["seq"].(int64); seq > hello.LastSeq {
+		if seq, _ := envelope["seq"].(int64); seq > effectiveLastSeq {
 			events = append(events, envelope)
 		}
 	}
@@ -242,10 +275,12 @@ func (s *Server) serve(conn net.Conn) {
 		oldest, _ = s.ring[0]["seq"].(int64)
 	}
 	newest := s.seq
+	if newest > 0 && effectiveLastSeq+1 < oldest {
+		lost = true
+	}
 	s.connections[client] = struct{}{}
 	s.mu.Unlock()
 
-	lost := newest > 0 && hello.LastSeq+1 < oldest
 	welcome := map[string]any{
 		"type":               "welcome",
 		"protocol":           protocol.ControlProtocolVersion,
@@ -262,7 +297,7 @@ func (s *Server) serve(conn net.Conn) {
 		"capabilities":       s.options.Capabilities,
 		"replay": map[string]any{
 			"requestedSince": hello.LastSeq,
-			"from":           hello.LastSeq + 1,
+			"from":           effectiveLastSeq + 1,
 			"to":             newest,
 			"lost":           lost,
 			"bufferedEvents": len(events),
