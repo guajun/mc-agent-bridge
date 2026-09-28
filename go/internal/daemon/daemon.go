@@ -63,6 +63,7 @@ type Daemon struct {
 	ipcToken  string
 	webhook   *webhook.Forwarder
 	unknown   *unknownWrites
+	cursors   *cursorStore
 	fake      *fakemod.Server
 
 	stopCh   chan struct{}
@@ -73,15 +74,15 @@ type targetSession struct {
 	daemon *Daemon
 	target *config.Target
 
-	mu          sync.Mutex
-	adapter     session.Adapter
-	state       session.State
-	lastSeq     int64
-	lastRunID   string
-	generation  int64
-	everConnect bool
-	stopCh      chan struct{}
-	stopped     bool
+	mu                 sync.Mutex
+	adapter            session.Adapter
+	state              session.State
+	lastSeq            int64
+	eventsSincePersist int
+	generation         int64
+	everConnect        bool
+	stopCh             chan struct{}
+	stopped            bool
 }
 
 // Run starts the daemon and blocks until the context ends or `stop` is called
@@ -161,7 +162,13 @@ func Run(ctx context.Context, options Options) error {
 		return err
 	}
 	daemon.unknown = newUnknownWrites(home)
-	_ = daemon.unknown.Load()
+	if message, err := daemon.unknown.Load(); err != nil {
+		return fmt.Errorf("cannot read the unknown-write ledger: %w", err)
+	} else if message != "" {
+		options.Logger("unknown-write ledger: %s", message)
+	}
+	daemon.cursors = newCursorStore(home)
+	daemon.cursors.Load()
 
 	daemon.ipcToken = randomHex(32)
 	ipcServer, err := ipc.Start(options.APIAddress, daemon.ipcToken, daemon.dispatch)
@@ -230,6 +237,9 @@ func (d *Daemon) shutdown() {
 		targetSession.stop()
 	}
 	d.sessionsMu.Unlock()
+	if err := d.cursors.Flush(); err != nil {
+		d.logger("cannot persist event cursors: %v", err)
+	}
 	if d.webhook != nil {
 		d.webhook.Stop()
 	}
@@ -306,12 +316,16 @@ func (ts *targetSession) run() {
 			}
 			continue
 		}
+		previous := daemon.cursors.Get(ts.target.Name)
 		var adapter session.Adapter
 		var err error
 		dialContext, cancelDial := context.WithTimeout(context.Background(), 15*time.Second)
 		switch ts.target.Transport {
 		case protocol.TransportRemote, protocol.TransportFake:
-			adapter, err = session.DialRemote(dialContext, ts.target, token, ts.lastSequence())
+			// The cursor is only offered together with the run it belongs to;
+			// a new run makes the server treat the client as fresh instead of
+			// silently skipping the new run's events.
+			adapter, err = session.DialRemote(dialContext, ts.target, token, previous.LastSeq, previous.RunID)
 		case protocol.TransportLegacy:
 			adapter, err = session.DialLegacy(dialContext, ts.target)
 		default:
@@ -334,8 +348,24 @@ func (ts *targetSession) run() {
 		}
 		ts.attach(adapter)
 		state := adapter.State()
-		restarted := ts.everConnect && ts.lastRunID != "" && state.RunID != "" && ts.lastRunID != state.RunID
-		ts.lastRunID = state.RunID
+		sameRun := previous.RunID != "" && state.RunID != "" && previous.RunID == state.RunID
+		restarted := ts.everConnect && previous.RunID != "" && state.RunID != "" && previous.RunID != state.RunID
+		instanceChanged := ts.everConnect && previous.InstanceID != "" && state.InstanceID != "" && previous.InstanceID != state.InstanceID
+		ts.mu.Lock()
+		if !sameRun {
+			// A different run (or no cursor) starts the sequence at zero.
+			ts.lastSeq = 0
+		}
+		ts.eventsSincePersist = 0
+		ts.mu.Unlock()
+		daemon.cursors.Set(ts.target.Name, cursor{
+			InstanceID: state.InstanceID,
+			RunID:      state.RunID,
+			LastSeq:    ts.lastSequence(),
+		})
+		if err := daemon.cursors.Flush(); err != nil {
+			daemon.logger("target %s: cannot persist the event cursor: %v", ts.target.Name, err)
+		}
 		ts.everConnect = true
 		daemon.ingest(ts.target.Name, map[string]any{
 			"type":       "bridge_connected",
@@ -345,20 +375,24 @@ func (ts *targetSession) run() {
 			"runId":      state.RunID,
 			"sessionId":  state.SessionID,
 		})
-		if restarted {
+		if restarted || instanceChanged {
 			daemon.ingest(ts.target.Name, map[string]any{
-				"type":       "game_restarted",
-				"text":       "the game run changed; no event replay crosses a restart",
-				"oldRunId":   ts.lastRunID,
-				"newRunId":   state.RunID,
-				"lostReplay": true,
+				"type":          "game_restarted",
+				"text":          "the game run changed; no event replay crosses a restart",
+				"oldRunId":      previous.RunID,
+				"newRunId":      state.RunID,
+				"oldInstanceId": previous.InstanceID,
+				"newInstanceId": state.InstanceID,
+				"lostReplay":    true,
 			})
 		}
 		if state.ReplayLost {
 			daemon.ingest(ts.target.Name, map[string]any{
-				"type": "event_gap",
-				"text": "the server could not replay every event after this reconnect",
-				"lost": true,
+				"type":  "event_gap",
+				"text":  "the server could not replay every event after this reconnect",
+				"lost":  true,
+				"runId": state.RunID,
+				"from":  ts.lastSequence() + 1,
 			})
 		}
 		daemon.reconcileUnknown(ts)
@@ -368,6 +402,17 @@ func (ts *targetSession) run() {
 			case event, ok := <-adapter.Events():
 				if !ok {
 					goto disconnected
+				}
+				last := ts.lastSequence()
+				if last > 0 && event.Seq > last+1 && event.RunID != "" && event.RunID == state.RunID {
+					daemon.ingest(ts.target.Name, map[string]any{
+						"type":  "event_gap",
+						"text":  "the event sequence jumped; events between are not available",
+						"lost":  true,
+						"runId": event.RunID,
+						"from":  last + 1,
+						"to":    event.Seq - 1,
+					})
 				}
 				ts.noteRemoteSeq(event.Seq)
 				daemon.ingest(ts.target.Name, event.Payload)
@@ -385,6 +430,7 @@ func (ts *targetSession) run() {
 		err = adapter.Err()
 		adapter.Close()
 		ts.detach()
+		ts.persistCursor()
 		message := "connection closed"
 		code := protocol.CodeConnectionLost
 		if err != nil {
@@ -452,7 +498,27 @@ func (ts *targetSession) noteRemoteSeq(seq int64) {
 		ts.lastSeq = seq
 	}
 	ts.state.LastSeq = ts.lastSeq
+	ts.eventsSincePersist++
+	persist := ts.eventsSincePersist >= 64
+	snapshot := cursor{InstanceID: ts.state.InstanceID, RunID: ts.state.RunID, LastSeq: ts.lastSeq}
 	ts.mu.Unlock()
+	if persist {
+		ts.daemon.cursors.Set(ts.target.Name, snapshot)
+		if err := ts.daemon.cursors.Flush(); err != nil {
+			ts.daemon.logger("target %s: cannot persist the event cursor: %v", ts.target.Name, err)
+		}
+	}
+}
+
+// persistCursor flushes the current run cursor after a disconnect.
+func (ts *targetSession) persistCursor() {
+	ts.mu.Lock()
+	snapshot := cursor{InstanceID: ts.state.InstanceID, RunID: ts.state.RunID, LastSeq: ts.lastSeq}
+	ts.mu.Unlock()
+	ts.daemon.cursors.Set(ts.target.Name, snapshot)
+	if err := ts.daemon.cursors.Flush(); err != nil {
+		ts.daemon.logger("target %s: cannot persist the event cursor: %v", ts.target.Name, err)
+	}
 }
 
 func (ts *targetSession) stop() {
@@ -461,10 +527,13 @@ func (ts *targetSession) stop() {
 		ts.stopped = true
 		close(ts.stopCh)
 	}
-	if ts.adapter != nil {
-		ts.adapter.Close()
-	}
+	adapter := ts.adapter
 	ts.mu.Unlock()
+	// Close outside the lock: session Close may wait for a pump that needs
+	// this lock to record the terminal state.
+	if adapter != nil {
+		adapter.Close()
+	}
 }
 
 // call routes one operation to a target session.
@@ -505,14 +574,51 @@ func (d *Daemon) call(ctx context.Context, targetName, operation string, params 
 	write := protocol.WriteOperation(operation)
 	// Local convenience operations the transport does not need to see are
 	// handled by the session adapter itself (status/capabilities/save).
-	result, failure := adapter.Call(ctx, operation, params)
-	if failure != nil {
-		if write && failure.ResultUnknown && failure.RequestID != "" {
-			d.unknown.Record(target.Name, operation, failure.RequestID, failure.Message)
+	if !write {
+		result, failure := adapter.Call(ctx, operation, params)
+		if failure != nil {
+			return nil, failure
 		}
-		return nil, failure
+		return result, nil
 	}
-	return result, nil
+
+	// Persist the request identity before it can leave the process. A crash
+	// after this point leaves a visible unknown write; a persistence failure
+	// refuses to send rather than losing recovery data.
+	token, _, tokenErr := config.Token(d.home, target)
+	if tokenErr != nil && target.Transport != protocol.TransportLegacy {
+		return nil, protocol.NewError(protocol.CodeUnauthorized, tokenErr.Error())
+	}
+	requestID := adapter.NextRequestID()
+	if requestID == "" {
+		return nil, protocol.NewError(protocol.CodeInternal,
+			"the session cannot allocate a request id; refusing to send a non-idempotent write")
+	}
+	if err := d.unknown.Record(target.Name, operation, requestID,
+		state.InstanceID, state.RunID, credentialFingerprint(token)); err != nil {
+		return nil, protocol.NewError(protocol.CodeInternal,
+			"refusing to send a non-idempotent write: "+err.Error())
+	}
+	result, failure := adapter.CallID(ctx, requestID, operation, params)
+	if failure == nil {
+		if err := d.unknown.Resolve(target.Name, requestID); err != nil {
+			d.logger("cannot clear resolved request %s: %v", requestID, err)
+		}
+		return result, nil
+	}
+	if failure.RequestID == "" {
+		failure.RequestID = requestID
+	}
+	if !failure.ResultUnknown {
+		// The server answered definitively (forbidden, bad_request, ...);
+		// the request is not pending anywhere.
+		if err := d.unknown.Resolve(target.Name, requestID); err != nil {
+			d.logger("cannot clear answered request %s: %v", requestID, err)
+		}
+	} else {
+		d.unknown.NoteUnknown(target.Name, requestID, failure.Message)
+	}
+	return nil, failure
 }
 
 func (d *Daemon) targetsSnapshot() *config.Targets {
@@ -532,26 +638,51 @@ func (d *Daemon) reconcileUnknown(ts *targetSession) {
 	if len(entries) == 0 {
 		return
 	}
+	token, _, _ := config.Token(d.home, ts.target)
+	fingerprint := credentialFingerprint(token)
 	for _, entry := range entries {
-		targetSession := ts
-		targetSession.mu.Lock()
-		adapter := targetSession.adapter
-		targetSession.mu.Unlock()
+		ts.mu.Lock()
+		adapter := ts.adapter
+		state := ts.state
+		ts.mu.Unlock()
 		if adapter == nil {
 			return
+		}
+		// A request is only resolvable against the connection that could
+		// have run it. A restarted game, a different instance or a rotated
+		// credential is reported instead of asking the wrong ledger.
+		if entry.RunID != "" && state.RunID != "" && entry.RunID != state.RunID {
+			d.markUnresolved(entry, "the request belongs to run "+entry.RunID+
+				"; the server is now run "+state.RunID)
+			continue
+		}
+		if entry.InstanceID != "" && state.InstanceID != "" && entry.InstanceID != state.InstanceID {
+			d.markUnresolved(entry, "the request belongs to instance "+entry.InstanceID+
+				"; the server is now instance "+state.InstanceID)
+			continue
+		}
+		if entry.CredentialHash != "" && fingerprint != "" && entry.CredentialHash != fingerprint {
+			d.markUnresolved(entry, "the credential changed since the request was sent")
+			continue
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 		result, failure := adapter.Call(ctx, "request_status", map[string]any{"requestId": entry.RequestID})
 		cancel()
 		if failure != nil {
+			if failure.Code == protocol.CodeCapabilityNotSupported || failure.Code == protocol.CodeNotFound {
+				d.markUnresolved(entry, "this transport cannot query the server-side request ledger")
+				continue
+			}
 			d.logger("cannot reconcile %s request %s: %s", entry.Operation, entry.RequestID, failure.Message)
 			continue
 		}
 		object, _ := result.(map[string]any)
-		state, _ := object["state"].(string)
-		switch state {
+		stateName, _ := object["state"].(string)
+		switch stateName {
 		case "completed":
-			d.unknown.Resolve(entry.Target, entry.RequestID)
+			if err := d.unknown.Resolve(entry.Target, entry.RequestID); err != nil {
+				d.logger("cannot clear resolved request %s: %v", entry.RequestID, err)
+			}
 			d.ingest(entry.Target, map[string]any{
 				"type":      "request_resolved",
 				"text":      "an earlier write completed after reconnecting",
@@ -561,7 +692,9 @@ func (d *Daemon) reconcileUnknown(ts *targetSession) {
 				"result":    object["result"],
 			})
 		case "failed":
-			d.unknown.Resolve(entry.Target, entry.RequestID)
+			if err := d.unknown.Resolve(entry.Target, entry.RequestID); err != nil {
+				d.logger("cannot clear failed request %s: %v", entry.RequestID, err)
+			}
 			d.ingest(entry.Target, map[string]any{
 				"type":      "request_resolved",
 				"text":      "an earlier write failed after reconnecting",
@@ -575,17 +708,23 @@ func (d *Daemon) reconcileUnknown(ts *targetSession) {
 		case "unknown":
 			// The server has no record (for example a game restart). Keep it
 			// visible instead of pretending it succeeded or failed.
-			d.unknown.MarkUnresolved(entry.Target, entry.RequestID,
-				"the server has no record of this request in the current run")
-			d.ingest(entry.Target, map[string]any{
-				"type":      "request_resolved",
-				"text":      "an earlier write has no server-side record after a restart; do not retry blindly",
-				"operation": entry.Operation,
-				"requestId": entry.RequestID,
-				"state":     "unresolved",
-			})
+			d.markUnresolved(entry, "the server has no record of this request in the current run")
 		}
 	}
+}
+
+// markUnresolved keeps a request visible and emits the machine-readable state.
+func (d *Daemon) markUnresolved(entry *UnknownWrite, message string) {
+	if err := d.unknown.MarkUnresolved(entry.Target, entry.RequestID, message); err != nil {
+		d.logger("cannot persist unresolved request %s: %v", entry.RequestID, err)
+	}
+	d.ingest(entry.Target, map[string]any{
+		"type":      "request_resolved",
+		"text":      message + "; do not retry blindly",
+		"operation": entry.Operation,
+		"requestId": entry.RequestID,
+		"state":     "unresolved",
+	})
 }
 
 // ------------------------------------------------------------------- events
@@ -626,16 +765,14 @@ func (d *Daemon) recentEvents(since int64, limit int, category string) map[strin
 	d.eventsMu.Lock()
 	ring := append([]map[string]any(nil), d.eventRing...)
 	d.eventsMu.Unlock()
-	var oldest any
+	var oldest int64
 	if len(ring) > 0 {
-		oldest = ring[0]["seq"]
-	}
-	dropped := false
-	if since > 0 && oldest != nil {
-		if value, ok := oldest.(int64); ok && value > since+1 {
-			dropped = true
+		if value, ok := ring[0]["seq"].(int64); ok {
+			oldest = value
 		}
 	}
+	// dropped means the ring no longer reaches the requested cursor.
+	dropped := since > 0 && oldest > 0 && oldest > since+1
 	events := make([]map[string]any, 0, len(ring))
 	for _, event := range ring {
 		if category != "" {
@@ -650,12 +787,23 @@ func (d *Daemon) recentEvents(since int64, limit int, category string) map[strin
 		}
 		events = append(events, event)
 	}
+	// Cursor pagination: always return the oldest events after the cursor so
+	// `next` is a usable continuation (the highest delivered sequence), and say
+	// explicitly when the caller must ask again instead of silently dropping
+	// the tail.
+	truncated := false
 	if limit > 0 && len(events) > limit {
-		events = events[len(events)-limit:]
+		events = events[:limit]
+		truncated = true
 	}
-	next := d.eventSeq.Load() + 1
+	next := d.eventSeq.Load()
+	if len(events) > 0 {
+		if value, ok := events[len(events)-1]["seq"].(int64); ok {
+			next = value
+		}
+	}
 	return map[string]any{"events": events, "next": next, "dropped": dropped,
-		"streamId": d.streamID}
+		"truncated": truncated, "streamId": d.streamID}
 }
 
 func (d *Daemon) status() map[string]any {

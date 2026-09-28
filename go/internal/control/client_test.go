@@ -217,3 +217,113 @@ func TestConnectionLossFailsPendingCalls(t *testing.T) {
 func writeFile(path string, data []byte) error {
 	return os.WriteFile(path, data, 0o644)
 }
+
+func TestDialTimeoutWhenServerNeverWelcomes(t *testing.T) {
+	server := startFake(t, fakemod.Options{SilentHello: true})
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	start := time.Now()
+	_, _, err := control.Dial(ctx, control.Config{
+		Address:     server.Address(),
+		Pin:         server.Pin(),
+		Token:       testToken,
+		DialTimeout: 500 * time.Millisecond,
+	})
+	if err == nil {
+		t.Fatal("a server that never sends welcome must fail the dial")
+	}
+	if elapsed := time.Since(start); elapsed > 3*time.Second {
+		t.Fatalf("dial took %s; the hello/welcome deadline did not apply", elapsed)
+	}
+}
+
+func TestRequestIDsAreUniqueAcrossClientsAndReconnects(t *testing.T) {
+	server := startFake(t, fakemod.Options{})
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	first, _, err := control.Dial(ctx, control.Config{Address: server.Address(), Pin: server.Pin(), Token: testToken})
+	if err != nil {
+		t.Fatal(err)
+	}
+	idA := first.NextRequestID()
+	idB := first.NextRequestID()
+	if idA == idB {
+		t.Fatalf("ids within one client must differ: %s", idA)
+	}
+	first.Close()
+
+	second, _, err := control.Dial(ctx, control.Config{Address: server.Address(), Pin: server.Pin(), Token: testToken})
+	if err != nil {
+		t.Fatal(err)
+	}
+	idC := second.NextRequestID()
+	second.Close()
+	if idC == idA || idC == idB {
+		t.Fatalf("a reconnect reused an id: %s vs %s/%s", idC, idA, idB)
+	}
+
+	third, _, err := control.Dial(ctx, control.Config{Address: server.Address(), Pin: server.Pin(), Token: testToken})
+	if err != nil {
+		t.Fatal(err)
+	}
+	idD := third.NextRequestID()
+	third.Close()
+	if idD == idC {
+		t.Fatalf("two client instances produced the same id: %s", idD)
+	}
+}
+
+func TestCloseWithFullEventChannelIsBounded(t *testing.T) {
+	server := startFake(t, fakemod.Options{EventBuffer: 4096})
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	client, _, err := control.Dial(ctx, control.Config{Address: server.Address(), Pin: server.Pin(), Token: testToken})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Never consume Events(): the 1024-slot channel fills and the read loop
+	// must still be able to abandon delivery on Close.
+	for index := 0; index < 3000; index++ {
+		server.Push("mark", map[string]any{"text": "flood"})
+	}
+	done := make(chan error, 1)
+	go func() { done <- client.Close() }()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Close returned %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Client.Close deadlocked with a full event channel")
+	}
+}
+
+func TestRunIDMismatchReplaysAsFreshStream(t *testing.T) {
+	server := startFake(t, fakemod.Options{RunID: "run_second", EventBuffer: 16})
+	server.Push("mark", map[string]any{"text": "new-run-1"})
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	// A cursor from a different run must not hide the new run's events.
+	client, welcome, err := control.Dial(ctx, control.Config{
+		Address: server.Address(), Pin: server.Pin(), Token: testToken,
+		LastSeq: 999, ExpectRunID: "run_first",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	if !welcome.Replay.Lost {
+		t.Fatalf("a cross-run cursor must report a gap: %+v", welcome.Replay)
+	}
+	if welcome.Replay.From != 1 {
+		t.Fatalf("replay from = %d, want the start of the new run", welcome.Replay.From)
+	}
+	select {
+	case event := <-client.Events():
+		if !event.Replay || event.Map()["text"] != "new-run-1" {
+			t.Fatalf("new run event not delivered: %+v", event)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("no event from the new run")
+	}
+}

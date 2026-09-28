@@ -34,13 +34,27 @@ type harness struct {
 // startHarness boots a fake mod, a two-target config and a real daemon.
 func startHarness(t *testing.T, scripted map[string]fakemod.OpFunc, webhookConfig *webhook.Config) *harness {
 	t.Helper()
-	home := t.TempDir()
 	fake, err := fakemod.Start(fakemod.Options{Token: fakeToken, Ops: scripted})
 	if err != nil {
 		t.Fatalf("cannot start the fake mod: %v", err)
 	}
 	t.Cleanup(fake.Close)
+	return startHarnessWith(t, fake, fakeToken, webhookConfig)
+}
 
+// startHarnessWith runs a daemon against an existing fake mod and token, in a
+// fresh private state directory.
+func startHarnessWith(t *testing.T, fake *fakemod.Server, token string, webhookConfig *webhook.Config) *harness {
+	return startHarnessHome(t, "", fake, token, webhookConfig)
+}
+
+// startHarnessHome is startHarnessWith with an optional existing state dir.
+func startHarnessHome(t *testing.T, home string, fake *fakemod.Server, token string,
+	webhookConfig *webhook.Config) *harness {
+	t.Helper()
+	if home == "" {
+		home = t.TempDir()
+	}
 	document := &config.Targets{Version: 1, Targets: map[string]*config.Target{
 		"fake": {Name: "fake", Transport: protocol.TransportRemote, Address: fake.Address(), Pin: fake.Pin()},
 		"legacy-local": {Name: "legacy-local", Transport: protocol.TransportLegacy,
@@ -49,7 +63,7 @@ func startHarness(t *testing.T, scripted map[string]fakemod.OpFunc, webhookConfi
 	if err := config.SaveTargets(home, document); err != nil {
 		t.Fatal(err)
 	}
-	secrets := &config.Secrets{Version: 1, Tokens: map[string]string{"fake": fakeToken}}
+	secrets := &config.Secrets{Version: 1, Tokens: map[string]string{"fake": token}}
 	if err := config.SaveSecrets(home, secrets); err != nil {
 		t.Fatal(err)
 	}

@@ -19,25 +19,28 @@ type Remote struct {
 	target *config.Target
 	token  string
 
-	mu      sync.Mutex
-	client  *control.Client
-	state   State
-	events  chan RawEvent
-	done    chan struct{}
-	closeMu sync.Once
-	err     error
+	mu     sync.Mutex
+	client *control.Client
+	state  State
+	events chan RawEvent
+	done   chan struct{}
+	stop   chan struct{}
+	closer sync.Once
+	err    error
 }
 
 // DialRemote connects and negotiates the control session. It is called by the
 // daemon's reconnect loop; lastSeq is the highest server event sequence seen.
-func DialRemote(ctx context.Context, target *config.Target, token string, lastSeq int64) (*Remote, error) {
+func DialRemote(ctx context.Context, target *config.Target, token string, lastSeq int64,
+	expectRunID string) (*Remote, error) {
 	client, welcome, err := control.Dial(ctx, control.Config{
-		Address:    target.Address,
-		Pin:        target.Pin,
-		CAFile:     target.CAFile,
-		ServerName: target.ServerName,
-		Token:      token,
-		LastSeq:    lastSeq,
+		Address:     target.Address,
+		Pin:         target.Pin,
+		CAFile:      target.CAFile,
+		ServerName:  target.ServerName,
+		Token:       token,
+		LastSeq:     lastSeq,
+		ExpectRunID: expectRunID,
 	})
 	if err != nil {
 		return nil, err
@@ -52,6 +55,7 @@ func DialRemote(ctx context.Context, target *config.Target, token string, lastSe
 		client: client,
 		events: make(chan RawEvent, 1024),
 		done:   make(chan struct{}),
+		stop:   make(chan struct{}),
 		state: State{
 			Target:       target.Name,
 			Transport:    protocol.TransportRemote,
@@ -88,11 +92,15 @@ func (r *Remote) pump() {
 			r.mu.Lock()
 			r.state.LastSeq = event.Seq
 			r.mu.Unlock()
-			r.events <- RawEvent{
+			select {
+			case r.events <- RawEvent{
 				Seq:     event.Seq,
 				RunID:   event.RunID,
 				Replay:  event.Replay,
 				Payload: event.Map(),
+			}:
+			case <-r.stop:
+				return
 			}
 		case <-r.client.Done():
 			r.mu.Lock()
@@ -101,21 +109,38 @@ func (r *Remote) pump() {
 			r.state.LastError = r.client.Err().Error()
 			r.mu.Unlock()
 			return
+		case <-r.stop:
+			return
 		}
 	}
 }
 
-// Call runs one operation with the documented timeout.
+// Call runs one operation with a fresh unique id.
 func (r *Remote) Call(ctx context.Context, operation string, params map[string]any) (any, *protocol.Error) {
+	return r.CallID(ctx, r.NextRequestID(), operation, params)
+}
+
+// NextRequestID returns an id unique across processes and reconnects.
+func (r *Remote) NextRequestID() string {
 	r.mu.Lock()
-	state := r.state
 	client := r.client
 	r.mu.Unlock()
-	if gate := CheckOperation(operation, state.Capabilities, state.Vantage); gate != nil {
-		return nil, gate
-	}
 	if client == nil {
-		return nil, protocol.NewError(protocol.CodeConnectionLost, "the control session is not connected")
+		return ""
+	}
+	return client.NextRequestID()
+}
+
+// CallID runs one operation under a caller-chosen stable id.
+func (r *Remote) CallID(ctx context.Context, requestID, operation string,
+	params map[string]any) (any, *protocol.Error) {
+	r.mu.Lock()
+	state := r.state
+	r.mu.Unlock()
+	if gate := CheckOperation(operation, state.Capabilities, state.Vantage); gate != nil {
+		gate.RequestID = requestID
+		gate.Operation = operation
+		return nil, gate
 	}
 	if params == nil {
 		params = map[string]any{}
@@ -142,13 +167,14 @@ func (r *Remote) Call(ctx context.Context, operation string, params map[string]a
 		snapshot := r.State()
 		return snapshotMap(snapshot), nil
 	case "save":
-		result, failure := r.call(callCtx, "state", nil)
+		result, failure := r.callWithID(callCtx, requestID, "state", nil)
 		if failure != nil {
 			return nil, failure
 		}
 		return saveFromState(result), nil
 	case "command_output":
-		result, failure := r.call(callCtx, "command", map[string]any{"command": params["command"]})
+		result, failure := r.callWithID(callCtx, requestID, "command",
+			map[string]any{"command": params["command"]})
 		if failure != nil {
 			return nil, failure
 		}
@@ -165,7 +191,7 @@ func (r *Remote) Call(ctx context.Context, operation string, params map[string]a
 		}, nil
 	}
 
-	result, failure := r.call(callCtx, operation, params)
+	result, failure := r.callWithID(callCtx, requestID, operation, params)
 	if failure != nil {
 		return nil, failure
 	}
@@ -173,20 +199,26 @@ func (r *Remote) Call(ctx context.Context, operation string, params map[string]a
 }
 
 func (r *Remote) call(ctx context.Context, operation string, params map[string]any) (any, *protocol.Error) {
+	return r.callWithID(ctx, r.NextRequestID(), operation, params)
+}
+
+func (r *Remote) callWithID(ctx context.Context, requestID, operation string,
+	params map[string]any) (any, *protocol.Error) {
 	r.mu.Lock()
 	client := r.client
 	r.mu.Unlock()
 	if client == nil {
 		return nil, protocol.NewError(protocol.CodeConnectionLost, "the control session is not connected")
 	}
-	raw, failure := client.Call(ctx, operation, params)
+	raw, failure := client.CallWithID(ctx, requestID, operation, params)
 	if failure != nil {
 		return nil, failure
 	}
 	var value any
 	if err := json.Unmarshal(raw, &value); err != nil {
-		return nil, protocol.NewError(protocol.CodeInternal,
-			fmt.Sprintf("the server sent an unreadable %s result: %v", operation, err))
+		return nil, &protocol.Error{Code: protocol.CodeInternal,
+			Message:   fmt.Sprintf("the server sent an unreadable %s result: %v", operation, err),
+			RequestID: requestID, Operation: operation}
 	}
 	return value, nil
 }
@@ -217,13 +249,13 @@ func (r *Remote) State() State {
 	return copy
 }
 
-// Close ends the session.
+// Close ends the session. It bounds the exit even with a full event channel
+// and no consumer: the pump abandons a blocked delivery when stop closes.
 func (r *Remote) Close() {
-	r.closeMu.Do(func() {
-		if r.client != nil {
-			r.client.Close()
-		}
-	})
+	r.closer.Do(func() { close(r.stop) })
+	if r.client != nil {
+		r.client.Close()
+	}
 }
 
 func snapshotMap(state State) map[string]any {

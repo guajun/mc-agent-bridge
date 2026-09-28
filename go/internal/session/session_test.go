@@ -111,7 +111,7 @@ func TestRemoteSessionClientOnlyOperationsAreRefused(t *testing.T) {
 	defer fake.Close()
 	target := &config.Target{Name: "remote", Transport: protocol.TransportRemote,
 		Address: fake.Address(), Pin: fake.Pin()}
-	adapter, err := session.DialRemote(context.Background(), target, "tok", 0)
+	adapter, err := session.DialRemote(context.Background(), target, "tok", 0, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -133,3 +133,76 @@ func TestRemoteSessionClientOnlyOperationsAreRefused(t *testing.T) {
 }
 
 var _ = time.Second
+
+func TestRemoteCloseWithFullEventChannelIsBounded(t *testing.T) {
+	fake, err := fakemod.Start(fakemod.Options{Token: "tok", EventBuffer: 4096})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fake.Close()
+	target := &config.Target{Name: "remote", Transport: protocol.TransportRemote,
+		Address: fake.Address(), Pin: fake.Pin()}
+	remote, err := session.DialRemote(context.Background(), target, "tok", 0, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Never consume remote.Events(): both queues fill up.
+	for index := 0; index < 3000; index++ {
+		fake.Push("mark", map[string]any{"text": "flood"})
+	}
+	done := make(chan struct{})
+	go func() {
+		remote.Close()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Remote.Close deadlocked with full event queues")
+	}
+}
+
+func TestLegacyWriteCancellationIsResultUnknown(t *testing.T) {
+	// The legacy server never answers CMD slow; cancel the call.
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	go func() {
+		connection, err := listener.Accept()
+		if err != nil {
+			return
+		}
+		defer connection.Close()
+		writer := bufio.NewWriter(connection)
+		writer.WriteString(`{"type":"hello","instance":"server","capabilities":["command"]}` + "\n")
+		writer.Flush()
+		reader := bufio.NewReader(connection)
+		for {
+			if _, err := reader.ReadString('\n'); err != nil {
+				return
+			}
+			// deliberately no reply
+		}
+	}()
+	target := &config.Target{Name: "legacy", Transport: protocol.TransportLegacy,
+		Address: listener.Addr().String()}
+	adapter, err := session.DialLegacy(context.Background(), target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer adapter.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	_, failure := adapter.CallID(ctx, "legacy-test-1", "command", map[string]any{"command": "slow"})
+	if failure == nil {
+		t.Fatal("the cancelled legacy write must fail")
+	}
+	if failure.RequestID != "legacy-test-1" {
+		t.Fatalf("request id lost: %+v", failure)
+	}
+	if !failure.ResultUnknown {
+		t.Fatalf("a cancelled legacy write may have run and must be result-unknown: %+v", failure)
+	}
+}
