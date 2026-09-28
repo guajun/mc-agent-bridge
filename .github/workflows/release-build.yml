@@ -83,7 +83,15 @@ jobs:
           mkdir -p ../staging-previous ../previous
           rm -rf ../staging-source-previous
           cp -R . ../staging-source-previous
-          sed -i "s/const Version = \"[^\"]*\"/const Version = \"$PREV\"/" ../staging-source-previous/internal/version/version.go
+          python - "$PREV" ../staging-source-previous/internal/version/version.go <<'PY'
+          import re, sys
+          version, path = sys.argv[1], sys.argv[2]
+          text = open(path, encoding="utf-8").read()
+          updated = re.sub(r'const Version = "[^"]*"', f'const Version = "{version}"', text)
+          if updated == text:
+              raise SystemExit("version constant not found")
+          open(path, "w", encoding="utf-8").write(updated)
+          PY
           BINARY=../staging-previous/mc-agent
           [ "$GOOS" = "windows" ] && BINARY=../staging-previous/mc-agent.exe
           (cd ../staging-source-previous && go build -trimpath -ldflags "-s -w" -o "$BINARY" ./cmd/mc-agent)
