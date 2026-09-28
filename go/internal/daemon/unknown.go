@@ -116,6 +116,42 @@ func (u *unknownWrites) saveLocked() error {
 	return os.Rename(temporary, u.path)
 }
 
+// Admit atomically claims a request id before it can be sent. When the
+// (target, id) pair already has a recovery record, a copy of that record is
+// returned and nothing is overwritten or cleared: a repeated id refers to the
+// earlier possibly-sent write, not to a new one.
+func (u *unknownWrites) Admit(target, operation, requestID, instanceID, runID,
+	credentialHash string) (*UnknownWrite, error) {
+	if requestID == "" {
+		return nil, errors.New("refusing to track a write without a request id")
+	}
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	if existing, ok := u.items[key(target, requestID)]; ok {
+		copied := existing
+		return &copied, nil
+	}
+	if len(u.items) >= unknownWritesCap {
+		return nil, fmt.Errorf("the unknown-write ledger is full (%d entries); reconcile it before sending", unknownWritesCap)
+	}
+	entry := UnknownWrite{
+		Target:         target,
+		Operation:      operation,
+		RequestID:      requestID,
+		At:             time.Now().UTC(),
+		State:          "unknown",
+		InstanceID:     instanceID,
+		RunID:          runID,
+		CredentialHash: credentialHash,
+	}
+	u.items[key(target, requestID)] = entry
+	if err := u.saveLocked(); err != nil {
+		delete(u.items, key(target, requestID))
+		return nil, fmt.Errorf("cannot persist the unknown-write ledger: %w", err)
+	}
+	return nil, nil
+}
+
 // Record persists a request before it can be sent. A full ledger or a
 // persistence failure is returned so the caller refuses to send instead of
 // losing recovery data.

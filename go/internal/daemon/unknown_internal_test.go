@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -130,5 +131,52 @@ func TestLedgerConcurrentReadersAndWriters(t *testing.T) {
 		if entry.RequestID == "" {
 			t.Fatalf("list returned an empty entry: %+v", entry)
 		}
+	}
+}
+
+// Admit must be atomic: concurrent claims of one id admit exactly one sender,
+// and an existing recovery record is never overwritten or cleared.
+func TestLedgerAdmitIsAtomicAndPreservesExisting(t *testing.T) {
+	u := newUnknownWrites(t.TempDir())
+	var admitted, blocked atomic.Int32
+	var wait sync.WaitGroup
+	for index := 0; index < 16; index++ {
+		wait.Add(1)
+		go func(id int) {
+			defer wait.Done()
+			existing, err := u.Admit("target", "command", "shared-id", "inst", "run", "cred")
+			if err != nil {
+				t.Errorf("Admit: %v", err)
+				return
+			}
+			if existing == nil {
+				admitted.Add(1)
+			} else {
+				blocked.Add(1)
+			}
+		}(index)
+	}
+	wait.Wait()
+	if admitted.Load() != 1 || blocked.Load() != 15 {
+		t.Fatalf("admitted=%d blocked=%d, want 1/15", admitted.Load(), blocked.Load())
+	}
+	existing, err := u.Admit("target", "command", "shared-id", "other-inst", "other-run", "cred")
+	if err != nil || existing == nil {
+		t.Fatalf("expected the original record back: %v %v", existing, err)
+	}
+	if existing.InstanceID != "inst" || existing.RunID != "run" {
+		t.Fatalf("the stored scope was overwritten by a later claim: %+v", existing)
+	}
+	existing.State = "mutated"
+	if u.ForTarget("target")[0].State != "unknown" {
+		t.Fatal("Admit returned a mutable pointer to the stored record")
+	}
+	// Only an explicit resolve frees the id for a new write.
+	if err := u.Resolve("target", "shared-id"); err != nil {
+		t.Fatal(err)
+	}
+	again, err := u.Admit("target", "command", "shared-id", "inst", "run", "cred")
+	if err != nil || again != nil {
+		t.Fatalf("a resolved id must be claimable again: %v %v", again, err)
 	}
 }

@@ -432,3 +432,74 @@ func numberToInt64(value any) (int64, bool) {
 	}
 	return 0, false
 }
+
+// Reusing a caller-provided request id must never overwrite or clear an
+// unreconciled write; the retry is routed to status instead of being resent.
+func TestRepeatedRequestIdPreservesUnknownLedger(t *testing.T) {
+	release := make(chan struct{})
+	fake, err := fakemod.Start(fakemod.Options{Token: fakeToken, Ops: map[string]fakemod.OpFunc{
+		"command": func(params map[string]any) (any, *protocol.Error) {
+			<-release
+			return map[string]any{"type": "cmd_ack", "detail": params["command"], "output": []any{}}, nil
+		},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(fake.Close)
+	h := startHarnessWith(t, fake, fakeToken, nil)
+	h.waitForTargetConnected()
+	ctx := context.Background()
+	envelope := func(command, requestID string) map[string]any {
+		return map[string]any{"target": "fake", "op": "command", "requestId": requestID,
+			"params": map[string]any{"command": command}, "timeoutSeconds": 0.3}
+	}
+	_, failure := h.call(ctx, "call", envelope("say first", "dup-request-1"))
+	if failure == nil || !failure.ResultUnknown || failure.RequestID != "dup-request-1" {
+		t.Fatalf("the first write must be result-unknown: %+v", failure)
+	}
+	requestsAfterFirst := fake.Requests()
+	list, callFailure := h.call(ctx, "requests", nil)
+	if callFailure != nil || !strings.Contains(fmt.Sprint(list), "dup-request-1") {
+		t.Fatalf("the ledger did not record the unknown write: %v %v", list, callFailure)
+	}
+	// Same id, different payload: rejected, not overwritten and not sent.
+	_, second := h.call(ctx, "call", envelope("say second", "dup-request-1"))
+	if second == nil || second.Code != protocol.CodeResultUnknown || second.RequestID != "dup-request-1" {
+		t.Fatalf("a repeated id must be routed to status, not resent: %+v", second)
+	}
+	if fake.Requests() != requestsAfterFirst {
+		t.Fatalf("the repeated id was sent to the game (%d -> %d)", requestsAfterFirst, fake.Requests())
+	}
+	close(release)
+	time.Sleep(300 * time.Millisecond)
+	_, third := h.call(ctx, "call", envelope("say third", "dup-request-1"))
+	if third == nil || third.Code != protocol.CodeResultUnknown {
+		t.Fatalf("the unknown record must survive the original completion: %+v", third)
+	}
+	if fake.Requests() != requestsAfterFirst {
+		t.Fatalf("the third call was sent despite the unknown record (%d -> %d)",
+			requestsAfterFirst, fake.Requests())
+	}
+
+	// Crash and recover: the reconciler resolves the entry through
+	// request_status, after which the id can be used for a new write.
+	h.cancel()
+	if err := h.stop(); err != nil {
+		t.Fatalf("stop daemon: %v", err)
+	}
+	h2 := startHarnessHome(t, h.home, fake, fakeToken, nil)
+	h2.waitForTargetConnected()
+	deadline := time.Now().Add(15 * time.Second)
+	for time.Now().Before(deadline) {
+		remaining, failure := h2.call(ctx, "requests", nil)
+		if failure == nil && !strings.Contains(fmt.Sprint(remaining), "dup-request-1") {
+			break
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	final, failure := h2.call(ctx, "call", envelope("say after", "dup-request-1"))
+	if failure != nil || final == nil {
+		t.Fatalf("the id must be reusable after reconciliation: %+v %v", final, failure)
+	}
+}

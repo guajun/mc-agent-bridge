@@ -406,6 +406,19 @@ func TestPartialWriteFailureIsResultUnknown(t *testing.T) {
 	if failure.RequestID != "partial-1" {
 		t.Fatalf("request id lost: %+v", failure)
 	}
+	// The poisoned connection is closed before the writer slot is released, so
+	// a follow-up call must fail fast and never reach the server.
+	before := server.Requests()
+	_, followUp := client.CallWithID(context.Background(), "partial-2", "command",
+		map[string]any{"command": "say again"})
+	if followUp == nil {
+		t.Fatal("a poisoned connection accepted another write")
+	}
+	time.Sleep(100 * time.Millisecond)
+	if server.Requests() != before {
+		t.Fatalf("a poisoned connection delivered another request (%d -> %d)",
+			before, server.Requests())
+	}
 }
 
 func TestConcurrentRequestsAreNotSerializedBySlowReply(t *testing.T) {
