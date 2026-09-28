@@ -381,7 +381,7 @@ if [ "$NO_SKILL" != "1" ]; then
             tar -xzf "$WORK/$SKILL_ASSET" -C "$WORK/skill"
             [ -f "$WORK/skill/minecraft-toolkit/SKILL.md" ] || die "skill bundle is missing minecraft-toolkit/SKILL.md"
             SKILL_TARGET="$SKILL_ROOT/minecraft-toolkit"
-            SKILL_VERSION="$(tr -d '\r' <"$WORK/skill/minecraft-toolkit/SKILL.md" | sed -n 's/^[[:space:]]*version:[[:space:]]*"\{0,1\}\([0-9][^"]*\)"\{0,1\}$/\1/p' | head -n 1)"
+            SKILL_VERSION="$(tr -d '\r"' <"$WORK/skill/minecraft-toolkit/SKILL.md" | awk '/^[[:space:]]*version:[[:space:]]*[0-9]/{sub(/^[[:space:]]*version:[[:space:]]*/,""); print; exit}')"
             if [ -d "$SKILL_TARGET" ]; then
                 [ "$UPDATE_SKILL" = "1" ] || die "$SKILL_TARGET already exists; pass --update-skill to replace it (a backup is kept)"
                 _backup="$SKILL_TARGET.backup-$(date -u +%Y%m%d%H%M%S)"

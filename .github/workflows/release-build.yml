@@ -43,14 +43,17 @@ jobs:
         with:
           python-version: "3.12"
       - name: format and vet
+        shell: bash
         working-directory: go
         run: |
           test -z "$(gofmt -l .)"
           go vet ./...
       - name: unit tests
+        shell: bash
         working-directory: go
         run: go test ./...
       - name: build release binary
+        shell: bash
         working-directory: go
         env:
           GOOS: ${{ matrix.goos }}
@@ -129,7 +132,7 @@ jobs:
           mkdir -p skill-source
           tar -xzf skill-source.tar.gz -C skill-source
           test -f "skill-source/mc-agent-$COMMIT/skills/minecraft-toolkit/SKILL.md"
-          echo "skill-commit=$COMMIT" >> "$GITHUB_ENV"
+          echo "SKILL_COMMIT=$COMMIT" >> "$GITHUB_ENV"
       - name: finalize version.json, checksums and the skill bundle
         shell: bash
         env:
@@ -138,7 +141,7 @@ jobs:
           python release/tools/finalize_assets.py \
             --assets dist --version "${{ steps.resolve.outputs.version }}" --tag "$TAG" \
             --commit "$GITHUB_SHA" --go-version "$(go version)" \
-            --skill-dir "skill-source/mc-agent-$skill-commit/skills/minecraft-toolkit"
+            --skill-dir "skill-source/mc-agent-$SKILL_COMMIT/skills/minecraft-toolkit"
       - name: verify the published checksums
         shell: bash
         working-directory: dist
