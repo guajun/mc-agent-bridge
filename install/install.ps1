@@ -449,6 +449,7 @@ try {
 
     Info "next: & '$Binary' version"
     Info "      & '$Binary' daemon start   # then: ... doctor"
+    exit 0
 }
 finally {
     if ($Work -and (Test-Path -LiteralPath $Work)) { Remove-Item -LiteralPath $Work -Recurse -Force -ErrorAction SilentlyContinue }

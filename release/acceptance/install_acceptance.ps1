@@ -216,3 +216,4 @@ Check "refused checksum left the binary unchanged" ((HashFile $Binary) -eq $hash
 
 if ($script:Failures -ne 0) { Write-Error "$($script:Failures) check(s) failed"; exit 1 }
 Write-Host "all release-install acceptance checks passed"
+exit 0
