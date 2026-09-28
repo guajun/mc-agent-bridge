@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 import itertools
 import json
+import os
+import sys
 from collections.abc import Awaitable, Callable
 from typing import Any
 
@@ -12,6 +14,59 @@ Handler = Callable[[str, dict[str, Any]], Awaitable[Any]]
 
 #: Payloads can be large (an entity snapshot of a busy world). See protocol.py.
 MAX_LINE_BYTES = 16 * 1024 * 1024
+
+DEFAULT_API_HOST = "127.0.0.1"
+DEFAULT_API_PORT = 8765
+ENV_HOME = "MC_AGENT_HOME"
+ENV_DAEMON_ADDR = "MC_AGENT_DAEMON_ADDR"
+ENV_IPC_TOKEN = "MC_AGENT_IPC_TOKEN"
+
+
+def default_home() -> str:
+    """The mc-agent state directory, matching the Go daemon's config.Home()."""
+    value = os.environ.get(ENV_HOME)
+    if value:
+        return os.path.abspath(value)
+    if os.name == "nt":
+        base = os.environ.get("APPDATA") or os.path.expanduser("~")
+        return os.path.join(base, "mc-agent")
+    if sys.platform == "darwin":
+        return os.path.expanduser("~/Library/Application Support/mc-agent")
+    base = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+    return os.path.join(base, "mc-agent")
+
+
+def daemon_endpoint() -> tuple[str, int, str] | None:
+    """The Go daemon's loopback address and IPC token, if one is running.
+
+    The token is read from the private state file (0600) or from
+    ``MC_AGENT_IPC_TOKEN``; it is never logged and never sent anywhere except
+    the daemon's own loopback listener.
+    """
+    address = os.environ.get(ENV_DAEMON_ADDR)
+    if address:
+        token = os.environ.get(ENV_IPC_TOKEN)
+        if token:
+            host, _, port = address.rpartition(":")
+            try:
+                return host or DEFAULT_API_HOST, int(port), token
+            except ValueError:
+                return None
+    path = os.path.join(default_home(), "daemon.json")
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (OSError, ValueError):
+        return None
+    address = str(data.get("address") or "")
+    token = str(data.get("token") or "")
+    if not address or not token:
+        return None
+    host, _, port = address.rpartition(":")
+    try:
+        return host or DEFAULT_API_HOST, int(port), token
+    except ValueError:
+        return None
 
 
 class LocalApiServer:
@@ -126,11 +181,23 @@ class LocalClient:
 
 
 class LocalApiClient:
-    """Client for the local bridge API (used by CLI, MCP and agent loops)."""
+    """Client for the local bridge API (used by CLI, agent loops and legacy front-ends).
 
-    def __init__(self, host: str = "127.0.0.1", port: int = 8765) -> None:
+    When the Go daemon is running, its loopback address and IPC token are read
+    from the private state file; every request then carries the token, which the
+    Go daemon requires. The Python bridge daemon ignores unknown request fields,
+    so the same client keeps working against it during migration.
+    """
+
+    def __init__(
+        self,
+        host: str = DEFAULT_API_HOST,
+        port: int = DEFAULT_API_PORT,
+        token: str | None = None,
+    ) -> None:
         self.host = host
         self.port = port
+        self.token = token or os.environ.get(ENV_IPC_TOKEN) or None
         self.reader: asyncio.StreamReader | None = None
         self.writer: asyncio.StreamWriter | None = None
         self._ids = itertools.count(1)
@@ -140,6 +207,12 @@ class LocalApiClient:
         self._closed = asyncio.Event()
 
     async def connect(self, retry: bool = True) -> None:
+        # Prefer the Go daemon's advertised endpoint when the caller used the
+        # historical defaults and a daemon state file is present.
+        if self.host == DEFAULT_API_HOST and self.port == DEFAULT_API_PORT:
+            endpoint = daemon_endpoint()
+            if endpoint is not None:
+                self.host, self.port, self.token = endpoint
         while True:
             try:
                 self.reader, self.writer = await asyncio.open_connection(
@@ -168,6 +241,8 @@ class LocalApiClient:
         future: asyncio.Future[Any] = asyncio.get_running_loop().create_future()
         self._pending[request_id] = future
         payload = {"id": request_id, "method": method, "params": params or {}}
+        if self.token:
+            payload["auth"] = self.token
         self.writer.write((json.dumps(payload, ensure_ascii=False) + "\n").encode("utf-8"))
         await self.writer.drain()
         try:
