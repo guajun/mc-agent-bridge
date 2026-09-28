@@ -126,7 +126,7 @@ Wait-BinaryIdle
 # ------------------------------------------------- injected commit failures
 
 if ($PreviousAssets) {
-    foreach ($fault in @("after-binary", "after-skill", "at-manifest")) {
+    foreach ($fault in @("after-binary", "after-skill", "skill-copy", "at-manifest", "manifest-write")) {
         $null = Invoke-Installer -Arguments @("-Version", $Version, "-FromDir", $Assets, "-InstallDir", $BinDir, "-SkillDir", (Join-Path $Work "skills"), "-UpdateSkill") -Fault $fault
         Check "injected $fault failure aborts the install" ($LASTEXITCODE -ne 0)
         Check "$fault`: original binary preserved" ((HashFile $Binary) -eq $baseBinaryHash)
@@ -142,6 +142,24 @@ if ($PreviousAssets) {
 else {
     Skip "injected commit-failure tests need -PreviousAssets"
 }
+
+# A real filesystem failure at the skill replacement (locked destination) must
+# take the same catch: the binary and manifest roll back, and because the
+# locked skill cannot be restored, a recovery snapshot is preserved.
+$env:MC_AGENT_RECOVERY_ROOT = Join-Path $Work "recovery"
+$lockPath = Join-Path $baseSkill "SKILL.md"
+$lock = [System.IO.File]::Open($lockPath, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::Read)
+try {
+    $null = Invoke-Installer @("-Version", $Version, "-FromDir", $Assets, "-InstallDir", $BinDir, "-SkillDir", (Join-Path $Work "skills"), "-UpdateSkill")
+    Check "locked skill destination aborts the install" ($LASTEXITCODE -ne 0)
+    Check "locked-skill failure preserved the binary" ((HashFile $Binary) -eq $baseBinaryHash)
+    Check "locked-skill failure preserved the manifest" ((HashFile $Manifest) -eq $baseManifestHash)
+}
+finally { $lock.Close() }
+Check "locked-skill failure kept the original skill" ((Get-TreeHash $baseSkill) -eq $baseSkillHash)
+$recoveryDirs = @(Get-ChildItem -LiteralPath (Join-Path $Work "recovery") -Directory -ErrorAction SilentlyContinue)
+Check "rollback failure preserved a recovery snapshot" ($recoveryDirs.Count -ge 1)
+Remove-Item Env:MC_AGENT_RECOVERY_ROOT -ErrorAction SilentlyContinue
 
 # ------------------------------------------------------------------- upgrade
 

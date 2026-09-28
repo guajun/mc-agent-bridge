@@ -520,7 +520,35 @@ fi
 # ---------------------------------------------------------------- stage
 
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/mc-agent-install.XXXXXX")"
-trap 'rm -rf "$WORK"' EXIT INT TERM
+IN_TRANSACTION=0
+RECOVERY_ROOT="${MC_AGENT_RECOVERY_ROOT:-${TMPDIR:-/tmp}}"
+
+preserve_snapshot() {
+    [ -d "$SNAPSHOT" ] || return 1
+    _recovery="$(mktemp -d "$RECOVERY_ROOT/mc-agent-recovery.XXXXXX" 2>/dev/null)" || return 1
+    if cp -R "$SNAPSHOT"/. "$_recovery"/ 2>/dev/null; then
+        info "recovery snapshot preserved at $_recovery"
+        return 0
+    fi
+    info "snapshot directory is at $SNAPSHOT"
+    return 1
+}
+
+# Any exit while the commit is in progress rolls the installation back; an
+# unexpected set -e failure takes exactly the same path as an injected one.
+transaction_cleanup() {
+    _status=$?
+    if [ "${IN_TRANSACTION:-0}" = "1" ]; then
+        IN_TRANSACTION=0
+        info "the commit did not complete; rolling back"
+        if ! rollback_commit; then
+            preserve_snapshot || info "no recovery snapshot could be saved"
+        fi
+    fi
+    rm -rf "$WORK"
+    exit "$_status"
+}
+trap transaction_cleanup EXIT INT TERM
 
 # 1. Stage and verify the binary before touching anything.
 if [ -n "$ARCHIVE" ]; then
@@ -618,46 +646,54 @@ if [ -n "$SKILL_TARGET" ] && [ -d "$SKILL_TARGET" ]; then
 fi
 
 rollback_commit() {
+    _rollback_failed=0
     if [ "$HAD_BINARY" = 1 ]; then
-        rm -f "$BINARY"
-        cp -p "$SNAPSHOT/binary" "$BINARY" || true
+        rm -f "$BINARY" || _rollback_failed=1
+        cp -p "$SNAPSHOT/binary" "$BINARY" || _rollback_failed=1
     else
-        rm -f "$BINARY"
+        rm -f "$BINARY" || _rollback_failed=1
     fi
     if [ "$HAD_MANIFEST" = 1 ]; then
-        rm -f "$MANIFEST"
-        cp -p "$SNAPSHOT/manifest" "$MANIFEST" || true
+        rm -f "$MANIFEST" || _rollback_failed=1
+        cp -p "$SNAPSHOT/manifest" "$MANIFEST" || _rollback_failed=1
     else
-        rm -f "$MANIFEST"
+        rm -f "$MANIFEST" || _rollback_failed=1
     fi
     if [ "$HAD_PREVIOUS" = 1 ]; then
-        rm -f "$PREVIOUS"
-        cp -p "$SNAPSHOT/previous" "$PREVIOUS" || true
+        rm -f "$PREVIOUS" || _rollback_failed=1
+        cp -p "$SNAPSHOT/previous" "$PREVIOUS" || _rollback_failed=1
     else
-        rm -f "$PREVIOUS"
+        rm -f "$PREVIOUS" || _rollback_failed=1
     fi
     if [ -n "$SKILL_TARGET" ]; then
-        rm -rf "$SKILL_TARGET"
+        rm -rf "$SKILL_TARGET" || _rollback_failed=1
         if [ "$HAD_SKILL" = 1 ]; then
-            mkdir -p "$SKILL_ROOT" || true
-            cp -R "$SNAPSHOT/skill" "$SKILL_TARGET" || true
+            mkdir -p "$SKILL_ROOT" || _rollback_failed=1
+            cp -R "$SNAPSHOT/skill" "$SKILL_TARGET" || _rollback_failed=1
         fi
     fi
     [ "$CREATED_INSTALL_DIR" = 1 ] && rmdir "$INSTALL_DIR" 2>/dev/null || true
+    return "$_rollback_failed"
 }
 
 die_rollback() {
+    IN_TRANSACTION=0
     info "rolling back the installation: $1"
-    rollback_commit || true
+    if ! rollback_commit; then
+        preserve_snapshot || info "no recovery snapshot could be saved"
+    fi
     die "$1"
 }
 
 inject_fault() {
     if [ "$FAULT" = "$1" ]; then
-        die_rollback "injected failure: $1"
+        # An injected failure exits like any unexpected commit failure: the
+        # EXIT trap dispatches the shared rollback path.
+        die "injected failure: $1"
     fi
 }
 
+IN_TRANSACTION=1
 mkdir -p "$INSTALL_DIR" || die "cannot create $INSTALL_DIR"
 if [ "$HAD_BINARY" = 1 ]; then
     rm -f "$PREVIOUS"
@@ -671,6 +707,11 @@ info "installed $PRODUCT $VERSION ($PLATFORM) to $BINARY"
 if [ -n "$SKILL_TARGET" ]; then
     mkdir -p "$SKILL_ROOT" || die_rollback "cannot create $SKILL_ROOT"
     rm -rf "$SKILL_TARGET" || die_rollback "cannot replace $SKILL_TARGET"
+    if [ "$FAULT" = "skill-copy" ]; then
+        # A genuine command failure at the skill-copy site, dispatched by the
+        # shared EXIT trap like any other unexpected commit failure.
+        cp -R "$WORK/missing-skill-source" "$SKILL_TARGET"
+    fi
     cp -R "$WORK/skill/minecraft-toolkit" "$SKILL_TARGET" || die_rollback "cannot install the skill to $SKILL_TARGET"
     inject_fault after-skill
     info "installed skill $SKILL_VERSION to $SKILL_TARGET"
@@ -718,6 +759,9 @@ if [ -n "$SKILL_TARGET" ] && [ "$HAD_SKILL" = 1 ]; then
         info "warning: could not keep a skill backup at $_backup"
     fi
 fi
+
+# The commit is complete; no further unexpected exit may roll it back.
+IN_TRANSACTION=0
 
 # ---------------------------------------------------------------- PATH
 

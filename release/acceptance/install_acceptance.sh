@@ -152,7 +152,7 @@ wait_binary_idle
 # ------------------------------------------------- injected commit failures
 
 if [ -n "$PREVIOUS_ASSETS" ]; then
-    for fault in after-binary after-skill at-manifest; do
+    for fault in after-binary after-skill skill-copy at-manifest; do
         if MC_AGENT_INSTALL_FAULT=$fault sh "$INSTALLER" --version "$VERSION" --from-dir "$ASSETS" \
             --install-dir "$BIN_DIR" --skill-dir "$WORK/skills" --update-skill >/dev/null 2>&1; then
             check "injected $fault failure aborts the install" 1

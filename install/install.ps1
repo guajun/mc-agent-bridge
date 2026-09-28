@@ -491,53 +491,95 @@ try {
     if ($hadSkill) { Copy-Item -LiteralPath $script:SkillTarget -Destination (Join-Path $snapshot "skill") -Recurse -Force }
 
     function Remove-IfExists([string]$Path) {
-        if ($Path -and (Test-Path -LiteralPath $Path)) { Remove-Item -LiteralPath $Path -Recurse -Force }
+        if ($Path -and (Test-Path -LiteralPath $Path)) { Remove-Item -LiteralPath $Path -Recurse -Force -ErrorAction Stop }
     }
 
     function Invoke-Rollback {
         Remove-IfExists $Binary
-        if ($hadBinary) { Copy-Item -LiteralPath (Join-Path $snapshot "binary") -Destination $Binary -Force }
+        if ($hadBinary) { Copy-Item -LiteralPath (Join-Path $snapshot "binary") -Destination $Binary -Force -ErrorAction Stop }
         Remove-IfExists $Manifest
-        if ($hadManifest) { Copy-Item -LiteralPath (Join-Path $snapshot "manifest") -Destination $Manifest -Force }
+        if ($hadManifest) { Copy-Item -LiteralPath (Join-Path $snapshot "manifest") -Destination $Manifest -Force -ErrorAction Stop }
         Remove-IfExists $Previous
-        if ($hadPrevious) { Copy-Item -LiteralPath (Join-Path $snapshot "previous") -Destination $Previous -Force }
+        if ($hadPrevious) { Copy-Item -LiteralPath (Join-Path $snapshot "previous") -Destination $Previous -Force -ErrorAction Stop }
         if ($script:SkillTarget) {
-            Remove-IfExists $script:SkillTarget
+            $skillError = $false
+            try { Remove-IfExists $script:SkillTarget } catch { $skillError = $true }
             if ($hadSkill) {
-                New-Item -ItemType Directory -Path (Split-Path -Parent $script:SkillTarget) -Force | Out-Null
-                Copy-Item -LiteralPath (Join-Path $snapshot "skill") -Destination $script:SkillTarget -Recurse -Force
+                New-Item -ItemType Directory -Path $script:SkillTarget -Force | Out-Null
+                # Restore entry by entry so a partially deleted directory is
+                # rebuilt even when one locked file cannot be overwritten (a
+                # locked file still holds the original content).
+                foreach ($entry in @(Get-ChildItem -LiteralPath (Join-Path $snapshot "skill") -Force)) {
+                    try {
+                        Copy-Item -LiteralPath $entry.FullName -Destination (Join-Path $script:SkillTarget $entry.Name) -Recurse -Force -ErrorAction Stop
+                    }
+                    catch { $skillError = $true }
+                }
             }
+            if ($skillError) { throw "the previous skill could not be fully restored" }
         }
         if ($createdInstallDir) { Remove-Item -LiteralPath $InstallDir -Force -ErrorAction SilentlyContinue }
     }
 
-    function Die-Rollback([string]$Message) {
-        Info "rolling back the installation: $Message"
-        Invoke-Rollback
-        Fail $Message
+    function Save-RecoverySnapshot {
+        $root = if ($env:MC_AGENT_RECOVERY_ROOT) { $env:MC_AGENT_RECOVERY_ROOT } else { Join-Path $env:LOCALAPPDATA "mc-agent\recovery" }
+        New-Item -ItemType Directory -Path $root -Force | Out-Null
+        $destination = Join-Path $root ("snapshot-" + [DateTime]::UtcNow.ToString("yyyyMMddHHmmss") + "-" + [Guid]::NewGuid().ToString("N").Substring(0, 8))
+        Copy-Item -LiteralPath $snapshot -Destination $destination -Recurse -Force
+        return $destination
     }
 
-    New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null
-    if ($hadBinary) {
-        Remove-IfExists $Previous
-        Copy-Item -LiteralPath $Binary -Destination $Previous -Force
-    }
-    Remove-IfExists $Binary
-    Copy-Item -LiteralPath $extracted -Destination $Binary -Force
-    if ($Fault -eq "after-binary") { Die-Rollback "injected failure: after-binary" }
-    $newHash = Get-Hash $Binary
-    Info "installed $Product $Version ($Platform) to $Binary"
+    # Every mutation lives inside one try/catch: any cmdlet or filesystem
+    # failure - including the injected ones - restores the snapshot and, if
+    # that rollback also fails, preserves the snapshot and rethrows the
+    # original error.
+    try {
+        New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null
+        if ($hadBinary) {
+            Remove-IfExists $Previous
+            Copy-Item -LiteralPath $Binary -Destination $Previous -Force -ErrorAction Stop
+        }
+        Remove-IfExists $Binary
+        Copy-Item -LiteralPath $extracted -Destination $Binary -Force -ErrorAction Stop
+        if ($Fault -eq "after-binary") { throw "injected failure: after-binary" }
+        $newHash = Get-Hash $Binary
+        Info "installed $Product $Version ($Platform) to $Binary"
 
-    if ($script:SkillTarget) {
-        New-Item -ItemType Directory -Path (Split-Path -Parent $script:SkillTarget) -Force | Out-Null
-        Remove-IfExists $script:SkillTarget
-        Copy-Item -LiteralPath (Join-Path $skillExtract "minecraft-toolkit") -Destination $script:SkillTarget -Recurse -Force
-        if ($Fault -eq "after-skill") { Die-Rollback "injected failure: after-skill" }
-        Info "installed skill $script:SkillVersion to $script:SkillTarget"
-    }
+        if ($script:SkillTarget) {
+            New-Item -ItemType Directory -Path (Split-Path -Parent $script:SkillTarget) -Force | Out-Null
+            Remove-IfExists $script:SkillTarget
+            if ($Fault -eq "skill-copy") {
+                # A genuine cmdlet failure at the skill-copy site, handled by
+                # the ordinary catch below.
+                Copy-Item -LiteralPath (Join-Path $Work "missing-skill-source") -Destination $script:SkillTarget -Recurse -Force -ErrorAction Stop
+            }
+            Copy-Item -LiteralPath (Join-Path $skillExtract "minecraft-toolkit") -Destination $script:SkillTarget -Recurse -Force -ErrorAction Stop
+            if ($Fault -eq "after-skill") { throw "injected failure: after-skill" }
+            Info "installed skill $script:SkillVersion to $script:SkillTarget"
+        }
 
-    Write-Manifest $Version $newHash $sourceDescription
-    if ($Fault -eq "at-manifest") { Die-Rollback "injected failure: at-manifest" }
+        Write-Manifest $Version $newHash $sourceDescription
+        if ($Fault -eq "at-manifest") { throw "injected failure: at-manifest" }
+        if ($Fault -eq "manifest-write") {
+            # A genuine filesystem failure at the manifest site.
+            Write-Utf8Lines (Join-Path $Work "missing-directory\manifest") @("x")
+        }
+    }
+    catch {
+        $originalError = $_
+        $rollbackFailed = $false
+        $rollbackDetail = ""
+        try { Invoke-Rollback }
+        catch { $rollbackFailed = $true; $rollbackDetail = $_ }
+        if ($rollbackFailed) {
+            try {
+                $recovery = Save-RecoverySnapshot
+                Info "rollback failed ($($rollbackDetail.Exception.Message)); recovery snapshot preserved at $recovery"
+            }
+            catch { Info "rollback failed and no recovery snapshot could be saved: $($_.Exception.Message)" }
+        }
+        throw $originalError.Exception
+    }
 
     # Keep a user-visible backup of the replaced skill (best effort).
     if ($script:SkillTarget -and $hadSkill) {
