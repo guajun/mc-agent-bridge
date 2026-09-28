@@ -1,0 +1,40 @@
+{
+  "product": "mc-agent",
+  "productVersion": "0.5.0",
+  "controlProtocol": 1,
+  "modMinVersion": "0.8.0",
+  "compatibility": {
+    "minecraftServer": "26.2",
+    "fabricLoader": "0.19.5",
+    "fabricApi": "0.161.0",
+    "java": 25
+  },
+  "supportedPlatforms": [
+    {
+      "goos": "windows",
+      "goarch": "amd64",
+      "archive": "zip",
+      "runner": "windows-latest",
+      "label": "Windows 10/11 amd64"
+    },
+    {
+      "goos": "linux",
+      "goarch": "amd64",
+      "archive": "tar.gz",
+      "runner": "ubuntu-latest",
+      "label": "Linux glibc amd64"
+    },
+    {
+      "goos": "darwin",
+      "goarch": "arm64",
+      "archive": "tar.gz",
+      "runner": "macos-14",
+      "label": "macOS 14+ arm64 (Apple silicon)"
+    }
+  ],
+  "unsupported": {
+    "platforms": "Windows arm64, Linux arm64, Linux musl/Alpine, macOS amd64 and any other OS/CPU pair are not built, packaged or tested by this release line. The mod itself is Java and platform-independent as long as Minecraft runs.",
+    "proxy": "Only byte-transparent TCP relaying is within the tested boundary. The control transport is a TLS connection accepted on the same port as the game listener; a proxy that forwards the raw byte stream does not need to understand Minecraft or the control protocol. Minecraft-aware or TLS-terminating proxies were not tested and are not claimed: a proxy that inspects, rewrites or terminates the Minecraft/TLS stream can break the certificate pin and the connection classification.",
+    "daemonPlacement": "Remote means a control address reachable over TCP. The daemon host never interprets a remote server's world path as a local path; snapshot/fork/restore stay on the game host path."
+  }
+}

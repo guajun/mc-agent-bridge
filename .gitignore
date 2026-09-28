@@ -19,3 +19,6 @@ port.txt
 .mypy_cache/
 .idea/
 .vscode/
+
+# release build staging (binaries are never committed)
+staging/

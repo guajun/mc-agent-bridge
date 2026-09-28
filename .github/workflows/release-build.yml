@@ -1,0 +1,182 @@
+name: release build
+
+on:
+  workflow_call:
+    inputs:
+      tag:
+        description: Release tag (vX.Y.Z) to verify; empty for pull-request staging
+        required: false
+        type: string
+        default: ""
+    outputs:
+      version:
+        description: Product version that was built and verified
+        value: ${{ jobs.package.outputs.version }}
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: build (${{ matrix.goos }}/${{ matrix.goarch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            goos: linux
+            goarch: amd64
+          - runner: windows-latest
+            goos: windows
+            goarch: amd64
+          - runner: macos-14
+            goos: darwin
+            goarch: arm64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26.x"
+          cache-dependency-path: go/go.sum
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: format and vet
+        working-directory: go
+        run: |
+          test -z "$(gofmt -l .)"
+          go vet ./...
+      - name: unit tests
+        working-directory: go
+        run: go test ./...
+      - name: build release binary
+        working-directory: go
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: "0"
+        run: |
+          mkdir -p ../staging
+          OUTPUT=../staging/mc-agent
+          [ "$GOOS" = "windows" ] && OUTPUT=../staging/mc-agent.exe
+          go build -trimpath -ldflags "-s -w" -o "$OUTPUT" ./cmd/mc-agent
+      - name: verify binary version matches the manifest
+        shell: bash
+        run: |
+          VERSION="$(python -c "import json;print(json.load(open('release/compatibility.json'))['productVersion'])")"
+          BINARY="./staging/mc-agent"
+          [ -f ./staging/mc-agent.exe ] && BINARY="./staging/mc-agent.exe"
+          ACTUAL="$("$BINARY" version)"
+          case "$ACTUAL" in
+            "mc-agent $VERSION "*) echo "binary version ok: $ACTUAL" ;;
+            *) echo "binary version mismatch: $ACTUAL (expected mc-agent $VERSION)" >&2; exit 1 ;;
+          esac
+      - name: package archive
+        shell: bash
+        run: |
+          VERSION="$(python -c "import json;print(json.load(open('release/compatibility.json'))['productVersion'])")"
+          BINARY="./staging/mc-agent"
+          [ -f ./staging/mc-agent.exe ] && BINARY="./staging/mc-agent.exe"
+          python release/tools/build_archive.py \
+            --binary "$BINARY" --version "$VERSION" \
+            --goos ${{ matrix.goos }} --goarch ${{ matrix.goarch }} --out dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mc-agent-archive-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: dist/*
+          if-no-files-found: error
+
+  package:
+    name: package and verify assets
+    needs: build
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.resolve.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26.x"
+          cache-dependency-path: go/go.sum
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: mc-agent-archive-*
+          path: dist
+          merge-multiple: true
+      - name: resolve version and tag
+        id: resolve
+        shell: bash
+        env:
+          TAG: ${{ inputs.tag }}
+        run: |
+          VERSION="$(python -c "import json;print(json.load(open('release/compatibility.json'))['productVersion'])")"
+          if [ -n "$TAG" ] && [ "$TAG" != "v$VERSION" ]; then
+            echo "tag $TAG does not match product version $VERSION" >&2
+            exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+      - name: fetch the pinned skill source
+        shell: bash
+        run: |
+          COMMIT="$(python -c "import json;print(json.load(open('release/skill-pin.json'))['commit'])")"
+          echo "skill commit: $COMMIT"
+          curl -fsSL -o skill-source.tar.gz "https://github.com/guajun/mc-agent/archive/$COMMIT.tar.gz"
+          mkdir -p skill-source
+          tar -xzf skill-source.tar.gz -C skill-source
+          test -f "skill-source/mc-agent-$COMMIT/skills/minecraft-toolkit/SKILL.md"
+          echo "skill-commit=$COMMIT" >> "$GITHUB_ENV"
+      - name: finalize version.json, checksums and the skill bundle
+        shell: bash
+        env:
+          TAG: ${{ inputs.tag }}
+        run: |
+          python release/tools/finalize_assets.py \
+            --assets dist --version "${{ steps.resolve.outputs.version }}" --tag "$TAG" \
+            --commit "$GITHUB_SHA" --go-version "$(go version)" \
+            --skill-dir "skill-source/mc-agent-$skill-commit/skills/minecraft-toolkit"
+      - name: verify the published checksums
+        shell: bash
+        working-directory: dist
+        run: sha256sum -c checksums.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mc-agent-release-assets
+          path: dist/*
+          if-no-files-found: error
+
+  acceptance:
+    name: release-install acceptance (${{ matrix.runner }})
+    needs: package
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-latest, windows-latest, macos-14]
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: mc-agent-release-assets
+          path: staging
+          merge-multiple: true
+      - name: install acceptance (Linux/macOS)
+        if: runner.os != 'Windows'
+        shell: bash
+        env:
+          VERSION: ${{ needs.package.outputs.version }}
+        run: |
+          sh release/acceptance/install_acceptance.sh \
+            --assets staging --version "$VERSION" --work "$RUNNER_TEMP/acceptance"
+      - name: install acceptance (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          VERSION: ${{ needs.package.outputs.version }}
+        run: |
+          ./release/acceptance/install_acceptance.ps1 `
+            -Assets staging -Version "$env:VERSION" -Work "$env:RUNNER_TEMP\acceptance"

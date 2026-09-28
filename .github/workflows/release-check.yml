@@ -1,0 +1,27 @@
+name: release check
+
+on:
+  pull_request:
+    paths:
+      - "go/**"
+      - "install/**"
+      - "release/**"
+      - ".github/workflows/release-build.yml"
+      - ".github/workflows/release-check.yml"
+  push:
+    branches: [main, "codex/**"]
+    paths:
+      - "go/**"
+      - "install/**"
+      - "release/**"
+      - ".github/workflows/release-build.yml"
+      - ".github/workflows/release-check.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  release-build:
+    name: stage and verify release assets
+    uses: ./.github/workflows/release-build.yml

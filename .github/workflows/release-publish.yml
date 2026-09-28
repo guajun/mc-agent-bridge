@@ -1,0 +1,85 @@
+name: release publish
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing tag to release (vX.Y.Z)
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  release-build:
+    name: stage and verify release assets
+    uses: ./.github/workflows/release-build.yml
+    with:
+      tag: ${{ github.ref_type == 'tag' && github.ref_name || inputs.tag }}
+
+  publish:
+    name: publish GitHub release
+    needs: release-build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: mc-agent-release-assets
+          path: dist
+          merge-multiple: true
+      - name: write release notes
+        shell: bash
+        env:
+          VERSION: ${{ needs.release-build.outputs.version }}
+          TAG: ${{ github.ref_type == 'tag' && github.ref_name || inputs.tag }}
+        run: |
+          cat > "$RUNNER_TEMP/notes.md" <<EOF
+          mc-agent ${VERSION} - Go CLI/daemon for the Minecraft Agent Toolkit.
+
+          One binary, no Python runtime and no MCP. Pair it with the
+          mc-agent-interface Fabric mod 0.8.0+ on Minecraft 26.2
+          (Fabric loader 0.19.5, Fabric API 0.161.0, Java 25).
+
+          Assets: per-platform archives (binary only), checksums.txt,
+          version.json (product / control protocol / compatibility / hashes) and
+          the Toolkit Skill bundle built from the pinned mc-agent commit in
+          skill-pin.json.
+
+          Verify and install:
+
+          \`\`\`bash
+          # Linux amd64 / macOS arm64
+          curl -fsSL https://raw.githubusercontent.com/guajun/mc-agent-bridge/${TAG}/install/install.sh \\
+              | sh -s -- --version ${VERSION} --skill-harness codex
+          \`\`\`
+
+          \`\`\`powershell
+          # Windows amd64
+          iwr -useb https://raw.githubusercontent.com/guajun/mc-agent-bridge/${TAG}/install/install.ps1 -OutFile install.ps1
+          ./install.ps1 -Version ${VERSION} -SkillHarness codex
+          \`\`\`
+
+          Supported and tested: Windows amd64, Linux glibc amd64, macOS arm64.
+          Other platforms and Minecraft-aware proxies are unsupported; see
+          docs/release.md in the repository for the exact boundary.
+
+          Every asset was built and install-verified by the release workflow on
+          its advertised runner.
+          EOF
+      - name: create the release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_type == 'tag' && github.ref_name || inputs.tag }}
+        run: |
+          gh release create "$TAG" \
+            --title "$TAG" \
+            --notes-file "$RUNNER_TEMP/notes.md" \
+            --verify-tag \
+            dist/*
