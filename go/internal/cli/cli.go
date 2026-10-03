@@ -238,6 +238,11 @@ func (a *app) printUsage() {
 
 Usage: mc-agent [--home DIR] [--target NAME] [--pretty] <command> [args]
 
+Discovery:
+  version                  human-readable product/protocol/mod versions
+  --pretty version         the same compatibility information as JSON
+  help                     this text on stderr
+
 Daemon:
   daemon run [--fake] [--api-address ADDR] [--buffer N] [--reconnect-delay DURATION]
   daemon start [...]        run detached and wait for readiness
@@ -256,8 +261,13 @@ Calls:
   chat | screen | connect | world | lan | record-start | record-stop   (legacy client vantage)
   events [--since N] [--limit N] [--category C] [--follow] | requests | doctor
 
-Every command prints one JSON value; errors go to stderr with a stable code and
-exit code. There is no MCP path and no Python requirement.`)
+Finite data commands print one JSON value on stdout. Exceptions: version prints
+text (use --pretty version for JSON); help prints text on stderr and exits 0; events --follow
+streams JSON values; daemon run stays in the foreground without a final result.
+Errors use JSON on stderr with a stable code and non-zero exit code; usage
+failures may also print help text; invoking without a command prints only help
+and exits 2.
+There is no MCP path and no Python requirement.`)
 }
 
 // ---------------------------------------------------------------- daemon IPC
