@@ -58,6 +58,7 @@ installer prints the exact `version` and `doctor` commands to run next.
 
 ```bash
 mc-agent version     # mc-agent 0.5.0 (control protocol 1, mod >= 0.8.0)
+mc-agent --pretty version  # JSON compatibility information for scripts
 mc-agent doctor      # version + state + configured targets
 ```
 

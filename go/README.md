@@ -74,9 +74,15 @@ config directory + `/mc-agent`). `--home` does the same per command.
 | `exclusive-*` | daemon | leases from mc-agent#6 |
 | `chat`, `screen`, `connect`, `world`, `lan`, `record-*` | legacy client vantage | client GUI operations |
 
-Every command prints one JSON value on stdout; errors go to stderr as
+Finite data commands print one JSON value on stdout. `version` defaults to text;
+use `mc-agent --pretty version` for JSON with `version`, `controlProtocol`,
+`modMinVersion`, and runtime metadata. `help` prints text on stderr,
+`events --follow` streams JSON values, and `daemon run` stays in the foreground
+without a final result. Errors go to stderr as
 `{"ok":false,"error":{...}}` with a stable `code` and process exit code
 (2 usage, 3 target, 4 connection, 5 auth, 6 capability, 7 timeout/unknown).
+Usage failures may also print help text on stderr; invoking without a command
+prints only help and exits 2. Do not assume all stderr is a single JSON value.
 
 ## Transports
 
