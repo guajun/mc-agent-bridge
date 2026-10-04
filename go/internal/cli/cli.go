@@ -274,6 +274,9 @@ change runtime state through save maintenance. Such save effects are an accepted
 boundary. For save-sensitive experiments, fork an earlier clean baseline using
 appropriate tooling, advance the branch, and verify the required conditions;
 this does not guarantee reproduction of every intermediate state.
+In-flight piston and exact random continuation are not guaranteed; where applicable,
+start movement after branching a stationary baseline. Known experiment limits:
+https://guajun.github.io/mc-agent/known-limitations/
 There is no MCP path and no Python requirement.`)
 }
 
