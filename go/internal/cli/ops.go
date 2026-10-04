@@ -368,14 +368,28 @@ func (a *app) cmdConvenience(ctx context.Context, command string, args []string)
 		"interval": true, "ttl": true})); err != nil {
 		return nil, protocol.NewError(protocol.CodeUsage, err.Error())
 	}
+	if command == "entities" || command == "snapshot" {
+		var radiusUsed bool
+		flags.Visit(func(f *flag.Flag) {
+			if f.Name == "radius" {
+				radiusUsed = true
+			}
+		})
+		if radiusUsed {
+			return nil, protocol.NewError(protocol.CodeUsage, "radius filtering was removed; use --dimension and filter NBT locally or use a game command")
+		}
+		if len(flags.Args()) != 0 {
+			return nil, protocol.NewError(protocol.CodeUsage, command+" accepts flags only")
+		}
+	}
 	positional := flags.Args()
 	operation := command
 	params := map[string]any{}
 	switch command {
 	case "state", "snapshots", "save", "screen", "record-stop":
 	case "entities":
-		if *radius > 0 {
-			params["radius"] = *radius
+		if *dimension != "" {
+			params["dimension"] = *dimension
 		}
 	case "player":
 		if len(positional) == 0 {
@@ -434,9 +448,6 @@ func (a *app) cmdConvenience(ctx context.Context, command string, args []string)
 		}
 		params["ticks"] = value
 	case "snapshot":
-		if *radius > 0 {
-			params["radius"] = *radius
-		}
 		if *name != "" {
 			params["name"] = *name
 		}

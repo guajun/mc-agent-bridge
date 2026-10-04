@@ -197,7 +197,7 @@ func schemaFor(operation string) (map[string]any, *protocol.Error) {
 	case "player":
 		add("player", "string", "player name or UUID", false)
 	case "entities":
-		add("radius", "number", "optional radius around the first player; 0 means everything", false)
+		add("dimension", "string", "dimension id, defaults to minecraft:overworld", false)
 	case "context":
 		add("contextId", "string", "chat-time context id", true)
 	case "command", "command_output":
@@ -224,9 +224,8 @@ func schemaFor(operation string) (map[string]any, *protocol.Error) {
 		add("port", "integer", "LAN port; 0 picks one", false)
 		add("mode", "string", "online or offline", false)
 	case "snapshot":
-		add("radius", "number", "entity radius; 0 means everything", false)
 		add("name", "string", "snapshot directory name", false)
-		add("dimension", "string", "dimension id, defaults to the primary level", false)
+		add("dimension", "string", "dimension id, defaults to minecraft:overworld", false)
 	case "request_status":
 		add("requestId", "string", "the request id to resolve", true)
 	case "exclusive_acquire", "exclusive_renew":

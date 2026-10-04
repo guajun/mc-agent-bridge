@@ -45,7 +45,7 @@ func startLegacy(t *testing.T) string {
 			case strings.HasPrefix(line, "CHAT "):
 				writer.WriteString(`{"type":"chat_ack","detail":"sent"}` + "\n")
 			case strings.HasPrefix(line, "SNAPSHOT"):
-				writer.WriteString(`{"type":"snapshot_ack","id":"s1","entities":2}` + "\n")
+				writer.WriteString(`{"type":"snapshot_ack","schema":"entity-nbt/1","id":"s1","entities":2}` + "\n")
 			default:
 				writer.WriteString(`{"type":"error","message":"unknown ` + line + `"}` + "\n")
 			}
@@ -80,12 +80,8 @@ func TestLegacySessionMappingAndGating(t *testing.T) {
 	if _, failure = adapter.Call(ctx, "chat", map[string]any{"message": "hello"}); failure != nil {
 		t.Fatal(failure)
 	}
-	result, failure = adapter.Call(ctx, "snapshot", map[string]any{"radius": 8.0})
-	if failure != nil {
-		t.Fatal(failure)
-	}
-	if object, _ := result.(map[string]any); object["entities"].(float64) != 2 {
-		t.Fatalf("snapshot = %v", result)
+	if _, failure = adapter.Call(ctx, "snapshot", map[string]any{"name": "s1"}); failure == nil || failure.Code != protocol.CodeCapabilityNotSupported {
+		t.Fatalf("old/client snapshot must not be treated as new server NBT: %v", failure)
 	}
 
 	// Capability gate: entities is not advertised.
@@ -133,6 +129,51 @@ func TestRemoteSessionClientOnlyOperationsAreRefused(t *testing.T) {
 }
 
 var _ = time.Second
+
+func TestRemoteEntityNbtContractAndRadiusRejection(t *testing.T) {
+	const nbt = `{Motion:[0.1d,0.0d,0.0d],Health:10.0f}`
+	fake, err := fakemod.Start(fakemod.Options{Token: "tok", Ops: map[string]fakemod.OpFunc{
+		"entities": func(params map[string]any) (any, *protocol.Error) {
+			if _, exists := params["radius"]; exists {
+				return nil, protocol.NewError(protocol.CodeBadRequest, "radius filtering was removed")
+			}
+			if params["dimension"] != "minecraft:the_nether" {
+				return nil, protocol.NewError(protocol.CodeBadRequest, "dimension was not forwarded")
+			}
+			return map[string]any{"type": "entities", "schema": "entity-nbt/1", "dimension": params["dimension"], "orderHash": "fixture-hash", "entities": []any{map[string]any{"order": 0, "uuid": "fixture", "type": "minecraft:cow", "pos": []float64{1, 2, 3}, "vel": []float64{0.1, 0, 0}, "nbt": nbt, "passengers": []string{}, "vehicle": nil, "restorable": true}}}, nil
+		},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fake.Close()
+	target := &config.Target{Name: "remote", Transport: protocol.TransportRemote, Address: fake.Address(), Pin: fake.Pin()}
+	adapter, err := session.DialRemote(context.Background(), target, "tok", 0, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer adapter.Close()
+	for _, op := range []string{"entities", "snapshot"} {
+		result, failure := adapter.Call(context.Background(), op, map[string]any{"dimension": "minecraft:the_nether"})
+		if failure != nil {
+			t.Fatal(failure)
+		}
+		object := result.(map[string]any)
+		if object["schema"] != "entity-nbt/1" || object["dimension"] != "minecraft:the_nether" {
+			t.Fatalf("%s: %v", op, object)
+		}
+		if op == "entities" {
+			record := object["entities"].([]any)[0].(map[string]any)
+			if record["nbt"] != nbt || record["order"] != float64(0) || record["restorable"] != true {
+				t.Fatalf("lost NBT/order: %v", record)
+			}
+		}
+
+		if _, failure := adapter.Call(context.Background(), op, map[string]any{"radius": 0}); failure == nil || failure.Code != protocol.CodeBadRequest {
+			t.Fatalf("%s accepted removed radius: %v", op, failure)
+		}
+	}
+}
 
 func TestRemoteCloseWithFullEventChannelIsBounded(t *testing.T) {
 	fake, err := fakemod.Start(fakemod.Options{Token: "tok", EventBuffer: 4096})

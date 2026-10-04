@@ -255,9 +255,9 @@ Targets:
   target list|show <name>|remove <name>|use <name>|reload
 Calls:
   capabilities | schema [op] | call <op> [--params JSON] [--timeout SECONDS]
-  status | state | player <name|uuid> | entities [--radius N] | context <id>
+  status | state | player <name|uuid> | entities [--dimension ID] | context <id>
   command <line> | command-output <line> [--wait SECONDS] | mark <text>
-  wait <ticks> | save | snapshot [...] | snapshots
+  wait <ticks> | save | snapshot [--name NAME] [--dimension ID] | snapshots
   chat | screen | connect | world | lan | record-start | record-stop   (legacy client vantage)
   events [--since N] [--limit N] [--category C] [--follow] | requests | doctor
 
