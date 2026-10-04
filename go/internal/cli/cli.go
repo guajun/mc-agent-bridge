@@ -267,6 +267,13 @@ streams JSON values; daemon run stays in the foreground without a final result.
 Errors use JSON on stderr with a stable code and non-zero exit code; usage
 failures may also print help text; invoking without a command prints only help
 and exits 2.
+Research boundary (Minecraft 26.2): entities/snapshot capture entity NBT and tick
+order, not a full world or runtime checkpoint. Go world fork/restore is not yet
+supported. save reads metadata; command "save-all" performs a game save and can
+change runtime state through save maintenance. Such save effects are an accepted
+boundary. For save-sensitive experiments, fork an earlier clean baseline using
+appropriate tooling, advance the branch, and verify the required conditions;
+this does not guarantee reproduction of every intermediate state.
 There is no MCP path and no Python requirement.`)
 }
 
