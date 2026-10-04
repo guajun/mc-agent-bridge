@@ -313,14 +313,14 @@ func legacyLine(operation string, params map[string]any) (string, *protocol.Erro
 	case "state":
 		return "STATE", nil
 	case "entities":
-		radius := numberParam(params, "radius", 0)
-		if radius < 0 {
-			return badRequest("radius cannot be negative")
+		if _, exists := params["radius"]; exists {
+			return badRequest("radius filtering was removed; use dimension and filter NBT locally")
 		}
-		if radius == 0 {
-			return "ENTITIES", nil
+		dimension := stringParam(params, "dimension")
+		if dimension != "" {
+			return "ENTITIES " + oneLine(dimension), nil
 		}
-		return "ENTITIES " + strconv.FormatFloat(radius, 'f', -1, 64), nil
+		return "ENTITIES", nil
 	case "player":
 		identifier := firstNonEmpty(params, "player", "uuid", "name", "id")
 		if identifier == "" {
@@ -386,14 +386,17 @@ func legacyLine(operation string, params map[string]any) (string, *protocol.Erro
 	case "record_stop":
 		return "SAMPLE_STOP", nil
 	case "snapshot":
-		name := stringParam(params, "name")
-		radius := numberParam(params, "radius", 0)
-		line := "SNAPSHOT"
-		if radius > 0 {
-			line += " " + strconv.FormatFloat(radius, 'f', -1, 64)
+		if _, exists := params["radius"]; exists {
+			return badRequest("radius filtering was removed; snapshot captures the dimension")
 		}
+		name := stringParam(params, "name")
+		dimension := stringParam(params, "dimension")
+		line := "SNAPSHOT"
 		if name != "" {
 			line += " " + oneLine(name)
+		}
+		if dimension != "" {
+			line += " " + oneLine(dimension)
 		}
 		return line, nil
 	case "snapshots":

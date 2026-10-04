@@ -91,8 +91,8 @@ func Start(options Options) (*Server, error) {
 		options.RunID = "run_fake0001"
 	}
 	if options.Capabilities == nil {
-		options.Capabilities = []string{"state", "entities", "player", "player:view", "command",
-			"context", "wait", "mark", "snapshot", "events:game", "events:chat"}
+		options.Capabilities = []string{"state", "entities", "entities:nbt", "player", "player:view", "command",
+			"context", "wait", "mark", "snapshot", "snapshot:entity-nbt", "events:game", "events:chat"}
 	}
 	if options.Permissions == nil {
 		options.Permissions = []string{"read", "write"}
@@ -430,6 +430,25 @@ func (s *Server) handleRequest(client *connection, frame map[string]any, options
 		result["worldDir"] = "C:\\fakemod\\world"
 		result["levelName"] = "fake-world"
 		result["tick"] = s.seq
+	}
+	if operation == "entities" || operation == "snapshot" {
+		if _, present := params["radius"]; present {
+			client.writeError(id, protocol.NewError(protocol.CodeBadRequest, "radius filtering was removed"))
+			return
+		}
+		dimension, _ := params["dimension"].(string)
+		if dimension == "" {
+			dimension = "minecraft:overworld"
+		}
+		result["schema"] = "entity-nbt/1"
+		result["dimension"] = dimension
+		result["playersSkipped"] = 0
+		result["orderHash"] = "e3b0c44298fc1c14"
+		if operation == "entities" {
+			result["entities"] = []any{}
+		} else {
+			result["entities"] = 0
+		}
 	}
 	s.completeWrite(client, id, operation, result)
 }

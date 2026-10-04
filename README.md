@@ -433,3 +433,20 @@ subscriptions, non-chat triggers).
 ## License
 
 MIT
+
+## Entity NBT capture
+
+`mc-agent entities [--dimension minecraft:overworld]` is an authoritative
+server-only read of non-player NBT in tick order. It requires the Mod's explicit
+`entities:nbt` capability (Mod 0.9.0); older Mods/client projections are refused
+rather than presented as NBT. `snapshot --name NAME [--dimension ID]` writes
+the same records on the game host (requires `snapshot:entity-nbt`). Both default to overworld and remove the
+implicit first-player radius; `--radius` is rejected even at zero. Use vanilla
+commands or local analysis for ordinary filtering. `record-start --radius`
+remains a separate legacy client sampling operation.
+
+NBT records use `schema: entity-nbt/1`, retain the order/type/position/passenger
+information required for sequential summon, and retain `vel` for existing
+fidelity tools. Entity ID/yaw/pitch projections are removed. Inline captures
+are subject to the negotiated frame limit (8 MiB default); they do not include
+world files, non-ticking entities, or a complete hot-fork guarantee.

@@ -64,6 +64,20 @@ func TestCapabilityAliasesAndWriteDetection(t *testing.T) {
 	}
 }
 
+func TestEntityNbtCapabilitiesCannotBeInferredFromLegacy(t *testing.T) {
+	for _, op := range []string{"entities", "snapshot"} {
+		definition := operationByName[op]
+		for _, caps := range [][]string{nil, {"entities", "snapshot"}} {
+			if len(MissingCapabilities(definition, caps)) == 0 {
+				t.Fatalf("%s accepted legacy capabilities %v", op, caps)
+			}
+		}
+		if len(MissingCapabilities(definition, []string{"entities:nbt", "snapshot:entity-nbt"})) != 0 {
+			t.Fatalf("%s rejected NBT contract", op)
+		}
+	}
+}
+
 func TestErrorExitCodes(t *testing.T) {
 	cases := map[string]int{
 		"":                         0,

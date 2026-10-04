@@ -57,7 +57,7 @@ var Operations = []Operation{
 	{Name: "state", Description: "World/server state and the online player list.", Requires: []string{"state"}},
 	{Name: "player", Description: "Server-side context for one player: identity, position, rotation, view target.",
 		Requires: []string{"player"}},
-	{Name: "entities", Description: "Entities the instance ticks, in tick order.", Requires: []string{"entities"}},
+	{Name: "entities", Description: "Non-player entity NBT and tick order for a dimension (default overworld).", Requires: []string{"entities:nbt"}, Vantage: VantageServer},
 	{Name: "command", Description: "Run a command as the mod's command source.", Requires: []string{"command"}, Write: true},
 	{Name: "command_output", Description: "Run a command and collect the answer it produced.", Requires: []string{"command"}, Write: true},
 	{Name: "chat", Description: "Send a chat message as the client-vantage player.", Requires: []string{"chat"}, Write: true, Vantage: VantageClient},
@@ -72,7 +72,7 @@ var Operations = []Operation{
 	{Name: "events", Description: "Replay buffered events since a cursor."},
 	{Name: "context", Description: "Retrieve a chat-time player context bundle by its context id.", Requires: []string{"context"}},
 	{Name: "save", Description: "World-save metadata reported by STATE: level, world directory, players.", Requires: []string{"state"}},
-	{Name: "snapshot", Description: "Write the entity set in tick order to the instance's disk.", Requires: []string{"snapshot"}, Write: true},
+	{Name: "snapshot", Description: "Write the entity set in tick order to the instance's disk.", Requires: []string{"snapshot:entity-nbt"}, Write: true, Vantage: VantageServer},
 	{Name: "snapshots", Description: "List the snapshots already on the connected instance.", Requires: []string{"snapshot"}},
 	{Name: "fork", Description: "Freeze, snapshot, copy the world files, resume.",
 		Requires: []string{"snapshot", "command"}, Write: true,
@@ -118,7 +118,7 @@ var CapabilityAliases = map[string][]string{
 // HasCapability reports whether a capability is advertised, accepting aliases.
 func HasCapability(capabilities []string, name string) bool {
 	if capabilities == nil {
-		return true // legacy mod: unknown, so do not gate
+		return name != "entities:nbt" && name != "snapshot:entity-nbt" // new NBT schema requires an explicit advertisement
 	}
 	aliases, ok := CapabilityAliases[name]
 	if !ok {
@@ -136,9 +136,6 @@ func HasCapability(capabilities []string, name string) bool {
 
 // MissingCapabilities returns the required tokens the mod does not advertise.
 func MissingCapabilities(operation Operation, capabilities []string) []string {
-	if capabilities == nil {
-		return nil
-	}
 	var missing []string
 	for _, required := range operation.Requires {
 		if !HasCapability(capabilities, required) {
