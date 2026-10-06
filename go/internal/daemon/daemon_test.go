@@ -192,12 +192,14 @@ func TestDaemonCallsEventsAndTargetSelection(t *testing.T) {
 		t.Fatalf("command output = %v", result)
 	}
 
-	// Events: subscribe, push from the mod, receive over the IPC.
+	// Subscribe only to the category under test: background connection events
+	// may arrive at any time and do not establish a mark-delivery failure.
 	client := h.client()
 	defer client.Close()
-	if _, failure = client.Call(ctx, "subscribe", map[string]any{"events": []string{"*"}}); failure != nil {
+	if _, failure = client.Call(ctx, "subscribe", map[string]any{"events": []string{"mark"}}); failure != nil {
 		t.Fatal(failure)
 	}
+	h.fake.Push("game", map[string]any{"text": "unrelated-event"})
 	h.fake.Push("mark", map[string]any{"text": "from-fake"})
 	select {
 	case event := <-client.Events():
