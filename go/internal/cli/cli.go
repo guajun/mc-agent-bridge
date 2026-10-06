@@ -274,8 +274,11 @@ change runtime state through save maintenance. Such save effects are an accepted
 boundary. For save-sensitive experiments, fork an earlier clean baseline using
 appropriate tooling, advance the branch, and verify the required conditions;
 this does not guarantee reproduction of every intermediate state.
-In-flight piston and exact random continuation are not guaranteed; where applicable,
-start movement after branching a stationary baseline. Known experiment limits:
+For piston, fluid and randomness-dependent machines, stop the mechanism and let
+updates settle before save/fork; restore and verify, then restart in the branch.
+Running-state and exact random continuation are not guaranteed. A verified entity
+generation recipe/circuit may replace existing-order capture when the task permits.
+Known experiment limits and combinable state/recovery labels:
 https://guajun.github.io/mc-agent/known-limitations/
 There is no MCP path and no Python requirement.`)
 }
