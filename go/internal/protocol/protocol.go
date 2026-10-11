@@ -63,7 +63,7 @@ var Operations = []Operation{
 	{Name: "chat", Description: "Send a chat message as the client-vantage player.", Requires: []string{"chat"}, Write: true, Vantage: VantageClient},
 	{Name: "record_start", Description: "Start per-tick entity sampling (client vantage).", Requires: []string{"record"}, Write: true, Vantage: VantageClient},
 	{Name: "record_stop", Description: "Stop the running sampling session (client vantage).", Requires: []string{"record"}, Write: true, Vantage: VantageClient},
-	{Name: "wait", Description: "Block until the game advanced N ticks.", Requires: []string{"wait"}},
+	{Name: "wait", Description: "Wait for N tick callbacks on the connected vantage. Server tick callbacks continue during tick freeze; completion does not guarantee level gametime advanced.", Requires: []string{"wait"}},
 	{Name: "screen", Description: "Current client GUI screen (client vantage only).", Requires: []string{"screen"}, Vantage: VantageClient},
 	{Name: "mark", Description: "Annotate the event stream with a text marker.", Requires: []string{"mark"}, Write: true},
 	{Name: "connect", Description: "Join a server (client vantage only).", Requires: []string{"connect"}, Write: true, Vantage: VantageClient},

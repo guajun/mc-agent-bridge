@@ -66,13 +66,19 @@ config directory + `/mc-agent`). `--home` does the same per command.
 | `command <line>` | `command` | write; returns `writeSeq` |
 | `command-output <line>` | `command` | command plus collected output |
 | `mark <text>` | `mark` | write; annotates the event stream |
-| `wait <ticks>` | `wait` | blocks until the game advanced |
+| `wait <ticks>` | `wait` | waits for tick callbacks on the connected vantage; server freeze does not guarantee level gametime progression |
 | `save`, `snapshots` | `state`, `snapshot` | world/snapshot metadata |
 | `snapshot [...]` | `snapshot` | write; the game host writes the files |
 | `events [--since N] [--follow]` | daemon | replay buffer and live stream |
 | `requests`, `request-status <id>` | daemon | unknown-write ledger and lookup |
 | `exclusive-*` | daemon | leases from mc-agent#6 |
 | `chat`, `screen`, `connect`, `world`, `lan`, `record-*` | legacy client vantage | client GUI operations |
+
+`wait <ticks>` counts callbacks on the connected vantage, not elapsed wall-clock
+seconds. Server callbacks continue while `tick freeze` holds level simulation,
+so completion does not guarantee level `gametime` advanced. Client-vantage waits
+count client callbacks. `command-output --wait SECONDS` instead controls a
+wall-clock output collection window; it does not wait for game ticks.
 
 Finite data commands print one JSON value on stdout. `version` defaults to text;
 use `mc-agent --pretty version` for JSON with `version`, `controlProtocol`,
