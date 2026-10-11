@@ -203,7 +203,7 @@ func schemaFor(operation string) (map[string]any, *protocol.Error) {
 	case "command", "command_output":
 		add("command", "string", "command line without a leading slash", true)
 		if operation == "command_output" {
-			add("wait", "number", "seconds to collect command output from game events", false)
+			add("wait", "number", "wall-clock seconds to collect command output from game events; separate from the wait operation's tick callbacks", false)
 		}
 	case "chat":
 		add("message", "string", "chat text", true)
@@ -215,7 +215,7 @@ func schemaFor(operation string) (map[string]any, *protocol.Error) {
 	case "mark":
 		add("text", "string", "marker text", false)
 	case "wait":
-		add("ticks", "integer", "ticks to wait", true)
+		add("ticks", "integer", "connected-vantage tick callbacks to wait for; server freeze does not guarantee level gametime progression", true)
 	case "connect":
 		add("address", "string", "host:port", true)
 	case "world":
